@@ -19,6 +19,101 @@ SEVERITY_BADGES = {
 }
 
 
+def _build_summary_with_llm(
+    aibom: AIBOM,
+    findings: List[Finding],
+    llm_usage: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build summary dict, adding llm_invocation_patterns when available."""
+    summary: Dict[str, Any] = {
+        "component_count": len(aibom.components),
+        "model_count": len(aibom.models),
+        "dataflow_count": len(aibom.dataflows),
+        "finding_count": len(findings),
+        "mcp_server_count": len(aibom.mcp_servers),
+        "agent_framework_count": len(aibom.agent_frameworks),
+    }
+    if llm_usage:
+        lp = _build_llm_invocation_patterns(llm_usage)
+        if lp:
+            summary["llm_invocation_pattern_count"] = lp["pattern_count"]
+            summary["llm_total_call_sites"] = lp["total_call_sites"]
+    return summary
+
+
+def _build_provider_summary(
+    findings: List[Finding],
+    llm_usage: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Build provider summary from llm_usage when available, else from findings."""
+    if llm_usage:
+        by_provider: Dict[str, Dict[str, Any]] = {}
+        for pattern, usage in llm_usage.items():
+            if isinstance(usage, dict):
+                provider = usage.get("provider", "unknown")
+            else:
+                provider = getattr(usage, "provider", "unknown") or "unknown"
+            if provider not in by_provider:
+                by_provider[provider] = {"count": 0, "files": set()}
+            count = usage.get("call_sites", 0) if isinstance(usage, dict) else getattr(usage, "call_sites", 0)
+            files = usage.get("files", []) if isinstance(usage, dict) else getattr(usage, "files", [])
+            by_provider[provider]["count"] += count
+            by_provider[provider]["files"].update(files)
+        display = {"openai": "OpenAI", "anthropic": "Anthropic", "cohere": "Cohere", "client": "Client (generic)"}
+        return [
+            {
+                "provider": p,
+                "display_name": display.get(p, p.replace("_", " ").title()),
+                "count": v["count"],
+                "example_files": sorted(v["files"])[:3],
+            }
+            for p, v in sorted(by_provider.items(), key=lambda x: -x[1]["count"])
+        ]
+    return [
+        {"provider": s.provider, "display_name": s.display_name, "count": s.count, "example_files": s.example_files}
+        for s in summarize_providers(findings_to_detections(findings or []))
+    ]
+
+
+def _build_llm_invocation_patterns(llm_usage: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Build llm_invocation_patterns section from llm_usage."""
+    if not llm_usage:
+        return None
+    total_sites = 0
+    patterns = []
+    for pattern, usage in llm_usage.items():
+        if isinstance(usage, dict):
+            call_sites = usage.get("call_sites", 0)
+            files = usage.get("files", [])
+            provider = usage.get("provider", "unknown")
+        else:
+            call_sites = getattr(usage, "call_sites", 0)
+            files = getattr(usage, "files", [])
+            provider = getattr(usage, "provider", "unknown") or "unknown"
+        total_sites += call_sites
+        patterns.append(
+            {"pattern": pattern, "call_sites": call_sites, "files": files, "provider": provider}
+        )
+    return {
+        "pattern_count": len(llm_usage),
+        "total_call_sites": total_sites,
+        "patterns": sorted(patterns, key=lambda p: -p["call_sites"]),
+    }
+
+
+def _format_pattern_display_name(pattern: str, provider: str) -> str:
+    """Human-readable label: e.g. 'openai.ChatCompletion.create' -> 'OpenAI ChatCompletion'."""
+    if provider and provider != "unknown":
+        display_provider = {"openai": "OpenAI", "anthropic": "Anthropic", "cohere": "Cohere"}.get(
+            provider, provider.replace("_", " ").title()
+        )
+        rest = pattern.split(".", 1)[-1] if "." in pattern else pattern
+        if rest and rest != pattern:
+            return f"{display_provider} {rest.rsplit('.', 1)[0] if '.' in rest else rest}"
+        return display_provider
+    return pattern
+
+
 def to_risk_report_json(
     aibom: AIBOM,
     policy: PolicyReport | None,
@@ -28,6 +123,8 @@ def to_risk_report_json(
     sensitive_exposures: Optional[Any] = None,
     model_supply_chain: Optional[Any] = None,
     prompt_injection_risks: Optional[Any] = None,
+    llm_usage: Optional[Dict[str, Any]] = None,
+    repo_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build an Enterprise Risk Report JSON document.
@@ -42,25 +139,22 @@ def to_risk_report_json(
         model_supply_chain,
         prompt_injection_risks,
         dataflow_analysis,
+        repo_type=repo_type,
     )
     arch_dict = architecture_result.to_dict() if architecture_result else {"architecture_types": ["Unknown"], "components": [], "confidence": "low"}
     report: Dict[str, Any] = {
         "repo": str(aibom.repo_path),
+        "repo_type": repo_type or "application",
         "risk_score": {
             "score": risk_result.total_score,
             "risk_level": risk_result.risk_level,
+            "repo_type": repo_type or "application",
+            "raw_score": risk_result.raw_score,
             "contributing_factors": risk_result.contributing_factors,
             "breakdown": {d.name: {"score": d.score, "max": d.max_score, "contributing_factors": d.contributing_factors} for d in risk_result.dimensions},
             "breakdown_chart": risk_result._chart_lines(),
         },
-        "summary": {
-            "component_count": len(aibom.components),
-            "model_count": len(aibom.models),
-            "dataflow_count": len(aibom.dataflows),
-            "finding_count": len(findings),
-            "mcp_server_count": len(aibom.mcp_servers),
-            "agent_framework_count": len(aibom.agent_frameworks),
-        },
+        "summary": _build_summary_with_llm(aibom, findings, llm_usage),
         "findings": [
             {
                 "id": f.id,
@@ -75,15 +169,8 @@ def to_risk_report_json(
             if f.category != FindingCategory.SEMANTIC
         ],
         "architecture": arch_dict,
-        "provider_summary": [
-            {
-                "provider": s.provider,
-                "display_name": s.display_name,
-                "count": s.count,
-                "example_files": s.example_files,
-            }
-            for s in summarize_providers(findings_to_detections(findings or []))
-        ],
+        "provider_summary": _build_provider_summary(findings, llm_usage),
+        "llm_invocation_patterns": _build_llm_invocation_patterns(llm_usage),
         "mcp_servers": [
             {
                 "id": m.id,
@@ -107,7 +194,12 @@ def to_risk_report_json(
             for m in aibom.models
         ],
         "dataflows": [
-            {"flow_type": getattr(df, "flow_type", None), "diagram": df.to_mermaid(layout="LR")}
+            {
+                "flow_type": getattr(df, "flow_type", None),
+                "diagram": df.to_mermaid(layout="LR"),
+                "example_files": getattr(df, "example_files", [])[:5],
+                "occurrence_count": getattr(df, "occurrence_count", 1),
+            }
             for df in aibom.dataflows
         ],
     }
@@ -163,6 +255,8 @@ def to_risk_report_markdown(
     sensitive_exposures: Optional[Any] = None,
     model_supply_chain: Optional[Any] = None,
     prompt_injection_risks: Optional[Any] = None,
+    llm_usage: Optional[Dict[str, Any]] = None,
+    repo_type: Optional[str] = None,
 ) -> str:
     """
     Build a human-readable Enterprise Risk Report in Markdown, including
@@ -176,6 +270,9 @@ def to_risk_report_markdown(
     arch = architecture_result
     lines.append("")
     lines.append(f"**Repository:** `{aibom.repo_path}`")
+    lines.append(f"**Repository type:** {repo_type or 'application'}")
+    if repo_type and repo_type != "application":
+        lines.append(f"*(Risk score adjusted for {repo_type}.)*")
     lines.append("")
 
     # Risk score with 5-dimension breakdown
@@ -188,11 +285,15 @@ def to_risk_report_markdown(
         model_supply_chain,
         prompt_injection_risks,
         dataflow_analysis,
+        repo_type=repo_type,
     )
     lines.append("## Risk Assessment")
     lines.append("")
     risk_emoji = {"High": "🔴", "Medium": "🟠", "Low": "🟢", "Minimal": "✅"}
-    lines.append(f"**Risk score:** {risk_emoji.get(risk_result.risk_level, '')} **{risk_result.risk_level}** ({risk_result.total_score}/100)")
+    score_line = f"**Risk score:** {risk_emoji.get(risk_result.risk_level, '')} **{risk_result.risk_level}** ({risk_result.total_score}/100)"
+    if risk_result.raw_score is not None and risk_result.repo_type:
+        score_line += f" *(adjusted from {risk_result.raw_score} for {risk_result.repo_type})*"
+    lines.append(score_line)
     lines.append("")
     lines.append("### AI Risk Breakdown")
     lines.append("")
@@ -210,6 +311,7 @@ def to_risk_report_markdown(
     # Table of contents (for reports with multiple sections)
     detections = findings_to_detections(findings)
     provider_summaries = summarize_providers(detections)
+    llm_patterns = _build_llm_invocation_patterns(llm_usage)
     toc_sections = ["Risk Assessment", "Executive Summary"]
     if arch:
         toc_sections.append("AI Architecture")
@@ -221,7 +323,9 @@ def to_risk_report_markdown(
         toc_sections.append("AI Model Supply Chain Risks")
     if prompt_injection_risks:
         toc_sections.append("Prompt Injection Exposure")
-    if provider_summaries:
+    if llm_patterns:
+        toc_sections.append("LLM Invocation Patterns")
+    elif provider_summaries:
         toc_sections.append("Provider Usage Summary")
     if findings:
         toc_sections.append("What We Found")
@@ -265,6 +369,10 @@ def to_risk_report_markdown(
         summary_parts.append(f"**{len(aibom.agent_frameworks)}** agent framework(s): {', '.join(aibom.agent_frameworks)}.")
     if n_dataflows > 0:
         summary_parts.append(f"**{n_dataflows}** high-level AI flow pattern(s) detected.")
+    if llm_patterns:
+        summary_parts.append(
+            f"**LLM invocation patterns:** {llm_patterns['pattern_count']} pattern(s), {llm_patterns['total_call_sites']} total call site(s)."
+        )
     if findings:
         by_cat = {}
         for f in findings:
@@ -400,8 +508,38 @@ def to_risk_report_markdown(
         lines.append("---")
         lines.append("")
 
-    # Provider Usage Summary (inference calls grouped by provider)
-    if provider_summaries:
+    # LLM Invocation Patterns (deduplicated) - compact, cap display to reduce noise
+    if llm_patterns:
+        _MAX_PATTERNS = 12
+        _MAX_FILES_PER_PATTERN = 3
+        patterns_list = llm_patterns["patterns"]
+        shown = patterns_list[:_MAX_PATTERNS]
+        omitted = patterns_list[_MAX_PATTERNS:]
+        omitted_sites = sum(p["call_sites"] for p in omitted)
+        omitted_count = len(omitted)
+
+        lines.append("## LLM Invocation Patterns")
+        lines.append("")
+        lines.append(f"**{llm_patterns['pattern_count']}** patterns, **{llm_patterns['total_call_sites']}** total call sites.")
+        lines.append("")
+        lines.append("| Pattern | Call sites | Files |")
+        lines.append("|---------|------------|-------|")
+        for p in shown:
+            display = _format_pattern_display_name(p["pattern"], p.get("provider", "unknown"))
+            if len(display) > 45:
+                display = display[:42] + "…"
+            ex = ", ".join(f"`{f}`" for f in p["files"][:_MAX_FILES_PER_PATTERN]) or "—"
+            if len(p["files"]) > _MAX_FILES_PER_PATTERN:
+                ex += f" (+{len(p['files']) - _MAX_FILES_PER_PATTERN})"
+            if len(ex) > 55:
+                ex = ex[:52] + "…"
+            lines.append(f"| {display} | {p['call_sites']} | {ex} |")
+        if omitted_count:
+            lines.append(f"| *+{omitted_count} more pattern(s), {omitted_sites} call site(s)* | | |")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    elif provider_summaries:
         lines.append("## Provider Usage Summary")
         lines.append("")
         for s in provider_summaries:
@@ -499,19 +637,50 @@ def to_risk_report_markdown(
     if aibom.dataflows:
         lines.append("## AI Architecture Flows")
         lines.append("")
-        lines.append(f"{n_dataflows} high-level AI flow pattern(s) detected (LLM, embeddings, vector stores, agents). ")
-        lines.append("Diagrams use left-to-right layout with semantic nodes:")
+        lines.append("How data moves through AI components in this codebase. Each diagram shows a **semantic pattern**: ")
+        lines.append("the logical path from data sources → embeddings → vector stores → retrieval → LLM inference (or agents).")
         lines.append("")
-        for idx, df in enumerate(aibom.dataflows[:5], start=1):
-            title = df.flow_type if getattr(df, "flow_type", None) else f"Flow {idx}"
-            lines.append(f"### {title}")
-            lines.append("")
+        total_occurrences = sum(getattr(df, "occurrence_count", 1) for df in aibom.dataflows)
+        lines.append(f"**{len(aibom.dataflows)}** distinct pattern(s) across **{total_occurrences}** file(s).")
+        lines.append("")
+        # Summary table
+        lines.append("| Pattern | Files | Example locations |")
+        lines.append("|---------|-------|-------------------|")
+        for df in aibom.dataflows[:8]:
+            ft = getattr(df, "flow_type", None) or "Other"
+            cnt = getattr(df, "occurrence_count", 1)
+            ex = getattr(df, "example_files", [])
+            ex_str = ", ".join(f"`{f}`" for f in ex[:2]) if ex else "—"
+            if len(ex_str) > 50:
+                ex_str = ex_str[:47] + "..."
+            lines.append(f"| {ft} | {cnt} | {ex_str} |")
+        if len(aibom.dataflows) > 8:
+            lines.append(f"| *... and {len(aibom.dataflows) - 8} more* | | |")
+        lines.append("")
+        # Diagrams for distinct patterns (deduplicated by flow_type when same structure)
+        seen_signatures: set = set()
+        for df in aibom.dataflows:
+            sig = (df.flow_type, tuple(n.kind for n in df.nodes))
+            if sig in seen_signatures:
+                continue
+            seen_signatures.add(sig)
+            if len(seen_signatures) > 5:
+                break
+            title = df.flow_type or "AI Flow"
+            cnt = getattr(df, "occurrence_count", 1)
+            header = f"{title} — {cnt} file(s)" if cnt > 1 else title
+            lines.append(f"### {header}")
+            ex = getattr(df, "example_files", [])
+            if ex:
+                lines.append(f"*Example: `{ex[0]}`*")
+                lines.append("")
             lines.append("```mermaid")
             lines.append(df.to_mermaid(layout="LR"))
             lines.append("```")
             lines.append("")
-        if n_dataflows > 5:
-            lines.append(f"*... and {n_dataflows - 5} more flow pattern(s) omitted.*")
+        remaining = len(aibom.dataflows) - len(seen_signatures)
+        if remaining > 0:
+            lines.append(f"*{remaining} additional pattern(s) omitted.*")
             lines.append("")
 
     if policy is not None:

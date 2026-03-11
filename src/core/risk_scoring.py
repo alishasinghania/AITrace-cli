@@ -47,6 +47,8 @@ class RiskScoreResult:
     risk_level: str
     dimensions: List[RiskDimension]
     contributing_factors: List[str] = field(default_factory=list)
+    raw_score: Optional[int] = None  # Before repo_type multiplier, when applied
+    repo_type: Optional[str] = None  # When multiplier was applied
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -100,6 +102,7 @@ def compute_risk_score(
     model_supply_chain: Optional[Any] = None,
     prompt_injection_risks: Optional[Any] = None,
     dataflow_analysis: Optional[Any] = None,
+    repo_type: Optional[str] = None,
 ) -> RiskScoreResult:
     """
     Compute AI security risk across five dimensions.
@@ -257,7 +260,18 @@ def compute_risk_score(
     )
 
     # Total (capped at 100)
-    total = sum(d.score for d in dimensions)
+    raw_total = sum(d.score for d in dimensions)
+    raw_total = min(raw_total, 100)
+    total = raw_total
+
+    # Repo-type multiplier to reduce false positives
+    applied_repo_type: Optional[str] = None
+    if repo_type == "library":
+        total = int(raw_total * 0.4)
+        applied_repo_type = "library"
+    elif repo_type == "framework":
+        total = int(raw_total * 0.5)
+        applied_repo_type = "framework"
     total = min(total, 100)
 
     # Contributing factors (top-level)
@@ -266,9 +280,14 @@ def compute_risk_score(
         all_factors.extend(d.contributing_factors)
     all_factors = list(dict.fromkeys(all_factors))  # dedupe, preserve order
 
+    if applied_repo_type:
+        all_factors.append(f"Repository type: {applied_repo_type} (score {raw_total} → {total})")
+
     return RiskScoreResult(
         total_score=total,
         risk_level=_risk_level_from_score(total),
         dimensions=dimensions,
         contributing_factors=all_factors,
+        raw_score=raw_total if applied_repo_type else None,
+        repo_type=applied_repo_type,
     )

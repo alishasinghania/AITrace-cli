@@ -23,6 +23,20 @@ from .detectors import (
 )
 from .models import AIBOM
 
+# Blocklist: evidence that is noise, not meaningful AI architecture (applied at detection merge)
+_ARCH_COMPONENT_BLOCKLIST = (
+    "b64encode", "b64decode", ".encode", ".decode",
+    "api_instance.", "api_client.", "taskrequestbody", "agentapi",
+    "Config: classic", "Config: benchmark", "Config: forge",
+    "agbenchmark_config",
+    "self._", "_get_", "_create_", "embeddingmodelresponse", "modelresponse",
+    "kwargs", "with_retry", "validate_skill", "run_pipeline", "redis.pipeline",
+    "embeddingmodelinfo", "discord.embed", "model file: classic",
+    "api_instance.create_agent_task",
+    "asyncio.create_task", "tree.create_node", "create_schema", "create_agent_card",
+    "finetune_embeddings", "nudge.",  # product-specific, noisy
+)
+
 
 @dataclass
 class ArchitectureResult:
@@ -90,11 +104,12 @@ def infer_architecture(repo_root: Path, aibom: AIBOM) -> ArchitectureResult:
                 **(dr.details or {}),
             }
 
-    # Dedupe components
+    # Dedupe and filter to meaningful components only (noise reduction at detection)
     seen_comp = set()
     unique_components: List[str] = []
     for c in all_components:
-        if c not in seen_comp:
+        c_lower = c.lower()
+        if c not in seen_comp and not any(bl in c_lower for bl in _ARCH_COMPONENT_BLOCKLIST):
             seen_comp.add(c)
             unique_components.append(c)
 

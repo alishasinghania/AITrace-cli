@@ -16,8 +16,10 @@ from typing import List, Optional, Set
 from .base import DetectionResult
 from ._ast_utils import get_call_target, get_call_target_chain, scan_ast
 
+# Exclude generic "encode" (str.encode, base64.b64encode) — use embedding-specific patterns
 EMBEDDING_PATTERNS = {
-    "embed", "encode", "get_embedding", "embedding", "embeddings",
+    "embed", "get_embedding", "embedding", "embeddings", "embed_documents",
+    "embed_query", "embed_text", "encode_documents",
     "OpenAIEmbeddings", "CohereEmbeddings", "VoyageEmbeddings",
     "HuggingFaceEmbeddings", "VertexAIEmbeddings", "BedrockEmbeddings",
 }
@@ -35,6 +37,11 @@ LLM_PATTERNS = {
     "ChatOpenAI", "ChatAnthropic", "ChatVertexAI", "BedrockChat",
     "OpenAI", "Anthropic", "Cohere", "openai", "anthropic", "vertexai",
 }
+# Chain must contain a known LLM provider to avoid matching generic create/invoke
+LLM_CHAIN_KEYWORDS = {"openai", "anthropic", "cohere", "vertexai", "generativeai", "bedrock", "mistral", "litellm", "chat", "completion", "messages"}
+# Embedding evidence: require provider or known embedding class (exclude internal helpers)
+EMBEDDING_CHAIN_KEYWORDS = {"openai", "cohere", "voyage", "vertexai", "bedrock", "huggingface", "embedding", "embed", "from_pretrained"}
+EMBEDDING_EVIDENCE_BLOCKLIST = {"kwargs", "retry", "_get_", "_create_", "response", "modelresponse"}
 
 
 def _norm(s: str) -> str:
@@ -66,8 +73,12 @@ def detect_rag(repo_root: Path) -> DetectionResult:
         full = ".".join(chain) if chain else target
 
         if _matches(target, EMBEDDING_PATTERNS) and full not in seen:
-            seen.add(full)
-            embeddings.append(full)
+            full_lower = full.lower()
+            if not any(bl in full_lower for bl in EMBEDDING_EVIDENCE_BLOCKLIST):
+                chain_str = ".".join(c.lower() for c in chain)
+                if any(kw in chain_str for kw in EMBEDDING_CHAIN_KEYWORDS):
+                    seen.add(full)
+                    embeddings.append(full)
         elif _matches(target, VECTOR_STORE_PATTERNS) and full not in seen:
             seen.add(full)
             vector_stores.append(full)
@@ -75,8 +86,10 @@ def detect_rag(repo_root: Path) -> DetectionResult:
             seen.add(full)
             retrievals.append(full)
         elif _matches(target, LLM_PATTERNS) and full not in seen:
-            seen.add(full)
-            llms.append(full)
+            chain_lower = set(c.lower() for c in chain)
+            if chain_lower & LLM_CHAIN_KEYWORDS:
+                seen.add(full)
+                llms.append(full)
 
     scan_ast(repo_root, visit)
 

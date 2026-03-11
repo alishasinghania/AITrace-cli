@@ -35,6 +35,9 @@ MODEL_LOAD_PATTERNS: List[Tuple[List[str], str, str]] = [
 # Known trustworthy HuggingFace orgs (lower risk)
 KNOWN_HF_ORGS = {"facebook", "meta-ai", "google", "microsoft", "openai", "anthropic", "stabilityai", "runwayml", "bigscience", "huggingface", "bert", "t5", "gpt2", "roberta", "distilbert", "albert", "electra", "deberta"}
 
+# Clearly not model IDs (document types, class names, variable placeholders)
+MODEL_ID_BLOCKLIST = {"fileheader", "model_name", "modelloader"}
+
 # URL patterns for classification
 URL_PATTERNS = {
     "huggingface": re.compile(r"huggingface\.co|hf\.co", re.I),
@@ -179,6 +182,8 @@ class _ModelLoadVisitor(ast.NodeVisitor):
 
             for mid in model_ids:
                 if not mid or len(mid) > 500:
+                    continue
+                if mid.lower().strip() in MODEL_ID_BLOCKLIST:
                     continue
                 src_type, risk = _classify_source(mid)
                 self.sources.append(ModelSource(

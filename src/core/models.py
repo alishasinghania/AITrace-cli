@@ -86,6 +86,24 @@ class Finding:
 
 
 @dataclass
+class LLMPatternUsage:
+    """Deduplicated LLM invocation pattern with call sites and files."""
+
+    pattern: str
+    call_sites: int
+    files: List[str]
+    provider: str = ""  # e.g. "openai", "anthropic" for display
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pattern": self.pattern,
+            "call_sites": self.call_sites,
+            "files": self.files,
+            "provider": self.provider,
+        }
+
+
+@dataclass
 class DataFlowNode:
     id: str
     label: str
@@ -106,6 +124,8 @@ class DataFlowGraph:
     nodes: List[DataFlowNode] = field(default_factory=list)
     edges: List[DataFlowEdge] = field(default_factory=list)
     flow_type: Optional[str] = None  # e.g. "RAG", "Direct LLM", "Embedding Pipeline"
+    example_files: List[str] = field(default_factory=list)  # sample file paths for context
+    occurrence_count: int = 1  # how many files/flows contributed to this pattern
 
     def _escape_mermaid_label(self, s: str) -> str:
         return s.replace('"', "&quot;")

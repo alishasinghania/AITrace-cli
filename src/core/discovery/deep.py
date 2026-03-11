@@ -20,6 +20,12 @@ from ..models import (
 MODEL_EXTENSIONS = {".pt", ".bin", ".safetensors", ".onnx", ".pb"}
 CONFIG_FILENAMES = {"config.json", "model_config.json"}
 MCP_CONFIG_PATHS = (".cursor/mcp.json", "mcp.json", ".mcp.json")
+# Path parts that indicate non-model .bin files (Flutter/Dart, etc.)
+MODEL_BIN_EXCLUDE = {"build", "web", "assets", "assetmanifest", "asset_manifest"}
+# Known index/graph .bin filenames (HNSW, not model weights)
+MODEL_BIN_NAME_EXCLUDE = {"data_level0.bin", "length.bin", "link_lists.bin", "header.bin"}
+# Config paths to skip (benchmark, test fixtures)
+CONFIG_PATH_EXCLUDE = {"benchmark", "classic", "forge", "agbenchmark", "original_autogpt"}
 
 
 @dataclass
@@ -63,8 +69,14 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
             continue
         rel = path.relative_to(repo_root)
 
-        # Model binaries
+        # Model binaries (exclude build artifacts like AssetManifest.bin)
         if path.suffix.lower() in MODEL_EXTENSIONS:
+            if path.suffix.lower() == ".bin":
+                rel_parts = set(p.lower() for p in rel.parts)
+                if rel_parts & MODEL_BIN_EXCLUDE or "assetmanifest" in rel.name.lower():
+                    continue
+                if rel.name.lower() in MODEL_BIN_NAME_EXCLUDE:
+                    continue
             size = None
             try:
                 size = path.stat().st_size
@@ -93,8 +105,10 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                 )
             )
 
-        # Config files
+        # Config files (skip benchmark/test configs)
         if rel.name in CONFIG_FILENAMES:
+            if set(rel.parts) & CONFIG_PATH_EXCLUDE:
+                continue
             try:
                 config = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):

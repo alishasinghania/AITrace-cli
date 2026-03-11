@@ -13,6 +13,7 @@ from .discovery import discover_deep, discover_semantic, discover_surface
 from .discovery.surface import AGENT_PACKAGES
 from .models import AIBOM, Finding, PolicyReport
 from .policy import evaluate_policy, load_policy
+from .repo_classifier import classify_repository
 
 
 @dataclass
@@ -24,6 +25,8 @@ class AnalysisResult:
     sensitive_exposures: Optional[SensitiveExposureResult] = None
     model_supply_chain: Optional[ModelSupplyChainResult] = None
     prompt_injection_risks: Optional[PromptInjectionResult] = None
+    llm_usage: Optional[dict] = None  # Dict[str, LLMPatternUsage] - deduplicated patterns
+    repo_type: str = "application"  # "application" | "library" | "framework"
 
 
 class AITraceEngine:
@@ -69,6 +72,7 @@ class AITraceEngine:
         sensitive_exposures = analyze_sensitive_exposures(self.repo_root)
         model_supply_chain = analyze_model_supply_chain(self.repo_root)
         prompt_injection_risks = analyze_prompt_injection(self.repo_root)
+        repo_type = classify_repository(self.repo_root)
 
         return AnalysisResult(
             aibom=aibom,
@@ -78,5 +82,7 @@ class AITraceEngine:
             sensitive_exposures=sensitive_exposures,
             model_supply_chain=model_supply_chain,
             prompt_injection_risks=prompt_injection_risks,
+            llm_usage=semantic.llm_usage,
+            repo_type=repo_type,
         )
 

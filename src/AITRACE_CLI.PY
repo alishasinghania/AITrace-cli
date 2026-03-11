@@ -105,6 +105,8 @@ def scan(
             result.sensitive_exposures,
             result.model_supply_chain,
             result.prompt_injection_risks,
+            result.llm_usage,
+            result.repo_type,
         )
         (out_path / "aitrace-risk-report.json").write_text(
             json.dumps(risk_json, indent=2),
@@ -128,6 +130,8 @@ def scan(
             result.sensitive_exposures,
             result.model_supply_chain,
             result.prompt_injection_risks,
+            result.llm_usage,
+            result.repo_type,
         )
         (out_path / "aitrace-risk-report.md").write_text(risk_md, encoding="utf-8")
         typer.echo("Wrote Enterprise Risk Report (Markdown).")

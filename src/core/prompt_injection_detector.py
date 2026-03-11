@@ -263,7 +263,7 @@ class _PromptInjectionVisitor(ast.NodeVisitor):
                 if isinstance(arg, ast.Name):
                     arg_name = arg.id
                     receiver_name = chain[0] if chain else ""
-                    is_agent = receiver_name in self.agent_vars or not self.agent_vars
+                    is_agent = receiver_name in self.agent_vars
                     if is_agent and (
                         arg_name in self.user_input_vars or self._var_looks_like_user_input(arg_name)
                     ):

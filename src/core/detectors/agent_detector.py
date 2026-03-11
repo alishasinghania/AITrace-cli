@@ -13,25 +13,27 @@ from typing import List, Optional, Set
 from .base import DetectionResult
 from ._ast_utils import get_call_target, get_call_target_chain, scan_ast
 
-# LangChain / LangGraph
+# LangChain / LangGraph – use specific patterns; avoid generic "invoke", "Agent", "Task"
 LANGCHAIN_PATTERNS = {
     "create_react_agent", "create_agent", "AgentExecutor", "initialize_agent",
-    "ConversationalAgent", "Tool", "load_tools",
+    "ConversationalAgent", "load_tools",
 }
 LANGGRAPH_PATTERNS = {
-    "StateGraph", "StateGraphCompiled", "MessagesState", "add_node",
-    "add_edge", "invoke", "langgraph",
+    "StateGraph", "StateGraphCompiled", "MessagesState", "langgraph",
 }
-# Semantic Kernel
+# add_node/add_edge only when chain suggests LangGraph (not networkx)
+LANGGRAPH_CHAIN_PATTERNS = {"add_node", "add_edge"}
+LANGGRAPH_CHAIN_REQUIRED = {"langgraph", "langchain", "stategraph"}
+# Semantic Kernel – avoid generic "Skill" alone (matches validate_skill_tree, etc.)
 SEMANTIC_KERNEL_PATTERNS = {
-    "Kernel", "KernelBuilder", "SemanticFunction", "Skill", "SkillCollection",
+    "Kernel", "KernelBuilder", "SemanticFunction", "SkillCollection",
     "OpenAIChatCompletion", "register_completion_service", "invoke_async",
     "create_semantic_function", "PromptTemplateConfig",
 }
-# CrewAI
+SEMANTIC_KERNEL_REQUIRED_FOR_SKILL = {"kernel", "semantic", "skill"}
+# CrewAI – avoid generic "Agent", "Task", "Crew"; keep framework-specific
 CREWAI_PATTERNS = {
-    "CrewAgent", "Crew", "Agent", "Task", "CrewAgent", "crew", "kickoff",
-    "create_crew", "create_agent",
+    "CrewAgent", "crew", "kickoff", "create_crew", "create_agent",
 }
 # AutoGen
 AUTOGEN_PATTERNS = {
@@ -57,10 +59,24 @@ def _matches(target: str, patterns: Set[str]) -> bool:
 def _classify(target: str, chain: List[str]) -> Optional[str]:
     """Return framework name if target matches."""
     chain_lower = [c.lower() for c in chain]
+    chain_str = ".".join(chain_lower)
+    chain_set = set(chain_lower)
     # Skip obvious non-AI patterns
     if target.lower() in ("compile", "load", "read", "get", "find") and len(chain) <= 1:
         return None
-    if "detect_" in target.lower() or "re." in ".".join(chain_lower):
+    if "detect_" in target.lower() or "re." in chain_str:
+        return None
+    # Skip generic REST/API client patterns (api_instance, AgentApi, TaskRequestBody)
+    if any(p in chain_str for p in ("api_instance", "api_client", "agentapi", "taskrequestbody")):
+        return None
+    # create_node: only LangGraph/StateGraph, not generic tree (tree.create_node)
+    if "create_node" in target.lower():
+        if not (chain_set & LANGGRAPH_CHAIN_REQUIRED):
+            return None
+    # add_node/add_edge: only LangGraph, not networkx (nx.add_node, nt.add_node)
+    if _matches(target, LANGGRAPH_CHAIN_PATTERNS):
+        if chain_set & LANGGRAPH_CHAIN_REQUIRED:
+            return "LangGraph"
         return None
     if _matches(target, LANGGRAPH_PATTERNS):
         return "LangGraph"

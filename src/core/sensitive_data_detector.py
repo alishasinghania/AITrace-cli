@@ -29,6 +29,13 @@ SENSITIVE_KEYWORDS: Dict[str, str] = {
     "email": "high",
     "phone": "high",
 }
+# Variable names that are safe despite substring matches (LLM API params, OAuth fields)
+SENSITIVE_BLOCKLIST: Set[str] = {
+    "max_tokens", "min_tokens", "n_tokens", "num_tokens",
+    "input_tokens", "output_tokens", "completion_tokens", "prompt_tokens",
+    "expires_at", "expires_in", "issued_at",
+    "all_messages",  # conversation history, not secrets
+}
 
 # LLM sink patterns: (chain_pattern, sink_label)
 SINK_PATTERNS: List[tuple] = [
@@ -50,6 +57,8 @@ SINK_INDICATORS = {"openai", "anthropic", "cohere", "vertexai", "bedrock", "mist
 
 def _var_contains_sensitive(name: str) -> Optional[str]:
     """Return risk level if variable name contains a sensitive keyword."""
+    if name in SENSITIVE_BLOCKLIST:
+        return None
     n = name.lower().replace("_", "")
     for kw, risk in SENSITIVE_KEYWORDS.items():
         if kw.replace("_", "") in n or kw in name.lower():
@@ -166,10 +175,12 @@ class _SensitiveVisitor(ast.NodeVisitor):
             risk = _var_contains_sensitive(t)
             if risk:
                 self.sensitive_vars.add(t)
-            else:
-                refs = _names_in_expr(node.value)
-                if refs & self.sensitive_vars:
-                    self.sensitive_vars.update(targets)
+        else:
+            refs = _names_in_expr(node.value)
+            if refs & self.sensitive_vars:
+                for t in targets:
+                    if t not in SENSITIVE_BLOCKLIST:
+                        self.sensitive_vars.add(t)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -178,7 +189,7 @@ class _SensitiveVisitor(ast.NodeVisitor):
             for arg in node.args:
                 refs = _names_in_expr(arg)
                 for r in refs:
-                    if r in self.sensitive_vars:
+                    if r in self.sensitive_vars and r not in SENSITIVE_BLOCKLIST:
                         risk = _var_contains_sensitive(r) or "high"
                         self.exposures.append(SensitiveExposure(
                             variable=r,
@@ -191,7 +202,7 @@ class _SensitiveVisitor(ast.NodeVisitor):
             for kw in node.keywords:
                 refs = _names_in_expr(kw.value)
                 for r in refs:
-                    if r in self.sensitive_vars:
+                    if r in self.sensitive_vars and r not in SENSITIVE_BLOCKLIST:
                         risk = _var_contains_sensitive(r) or "high"
                         self.exposures.append(SensitiveExposure(
                             variable=r,
