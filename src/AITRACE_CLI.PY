@@ -7,7 +7,7 @@ from typing import List, Optional
 
 import typer
 
-from core.architecture_detector import detect_architecture, scan_from_aibom
+from core.architecture_inference import infer_architecture
 from core.cli_support import find_default_policy, resolve_repo_path
 from core.engine import AITraceEngine
 from core.exporters import (
@@ -83,8 +83,7 @@ def scan(
     out_path = Path(out_dir).expanduser().resolve()
     out_path.mkdir(parents=True, exist_ok=True)
 
-    scan = scan_from_aibom(result.aibom.components, result.aibom.agent_frameworks, result.findings)
-    architecture_result = detect_architecture(scan)
+    architecture_result = infer_architecture(result.aibom.repo_path, result.aibom)
 
     if OutputFormat.CYCLONEDX in formats:
         cdx = to_cyclonedx_json(result.aibom, architecture_result)
@@ -97,7 +96,16 @@ def scan(
         typer.echo("Wrote SPDX document.")
 
     if OutputFormat.RISK_JSON in formats or OutputFormat.RISK_MD in formats:
-        risk_json = to_risk_report_json(result.aibom, result.policy_report, result.findings, architecture_result)
+        risk_json = to_risk_report_json(
+            result.aibom,
+            result.policy_report,
+            result.findings,
+            architecture_result,
+            result.dataflow_analysis,
+            result.sensitive_exposures,
+            result.model_supply_chain,
+            result.prompt_injection_risks,
+        )
         (out_path / "aitrace-risk-report.json").write_text(
             json.dumps(risk_json, indent=2),
             encoding="utf-8",
@@ -111,7 +119,16 @@ def scan(
         typer.echo("Wrote findings (JSON).")
 
     if OutputFormat.RISK_MD in formats:
-        risk_md = to_risk_report_markdown(result.aibom, result.policy_report, result.findings, architecture_result)
+        risk_md = to_risk_report_markdown(
+            result.aibom,
+            result.policy_report,
+            result.findings,
+            architecture_result,
+            result.dataflow_analysis,
+            result.sensitive_exposures,
+            result.model_supply_chain,
+            result.prompt_injection_risks,
+        )
         (out_path / "aitrace-risk-report.md").write_text(risk_md, encoding="utf-8")
         typer.echo("Wrote Enterprise Risk Report (Markdown).")
 

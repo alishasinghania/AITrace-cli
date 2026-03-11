@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from ..models import AIBOM, Component, MCPServer, ModelArtifact
 
 if TYPE_CHECKING:
-    from ..architecture_detector import ArchitectureResult
+    from ..architecture_inference import ArchitectureResult
 
 
 def _component_to_spdx(c: Component) -> Dict[str, Any]:

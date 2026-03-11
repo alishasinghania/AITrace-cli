@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from .dataflow_analyzer import DataFlowAnalysisResult, analyze_dataflows
+from .model_supply_chain_analyzer import ModelSupplyChainResult, analyze_model_supply_chain
+from .prompt_injection_detector import PromptInjectionResult, analyze_prompt_injection
+from .sensitive_data_detector import SensitiveExposureResult, analyze_sensitive_exposures
 from .discovery import DeepDiscoveryResult, SemanticDiscoveryResult, SurfaceDiscoveryResult
 from .discovery import discover_deep, discover_semantic, discover_surface
 from .discovery.surface import AGENT_PACKAGES
@@ -16,6 +20,10 @@ class AnalysisResult:
     aibom: AIBOM
     findings: List[Finding]
     policy_report: Optional[PolicyReport] = None
+    dataflow_analysis: Optional[DataFlowAnalysisResult] = None
+    sensitive_exposures: Optional[SensitiveExposureResult] = None
+    model_supply_chain: Optional[ModelSupplyChainResult] = None
+    prompt_injection_risks: Optional[PromptInjectionResult] = None
 
 
 class AITraceEngine:
@@ -57,5 +65,18 @@ class AITraceEngine:
             policy_config = load_policy(policy_path)
             policy_report = evaluate_policy(policy_config, aibom, all_findings)
 
-        return AnalysisResult(aibom=aibom, findings=all_findings, policy_report=policy_report)
+        dataflow_analysis = analyze_dataflows(self.repo_root)
+        sensitive_exposures = analyze_sensitive_exposures(self.repo_root)
+        model_supply_chain = analyze_model_supply_chain(self.repo_root)
+        prompt_injection_risks = analyze_prompt_injection(self.repo_root)
+
+        return AnalysisResult(
+            aibom=aibom,
+            findings=all_findings,
+            policy_report=policy_report,
+            dataflow_analysis=dataflow_analysis,
+            sensitive_exposures=sensitive_exposures,
+            model_supply_chain=model_supply_chain,
+            prompt_injection_risks=prompt_injection_risks,
+        )
 

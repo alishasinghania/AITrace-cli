@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..models import AIBOM, Finding, FindingCategory, PolicyReport, Severity
+from ..risk_scoring import compute_risk_score
 
 if TYPE_CHECKING:
-    from ..architecture_detector import ArchitectureResult
+    from ..architecture_inference import ArchitectureResult
 from .component_diagram import to_ai_component_mermaid
 from .provider_summary import findings_to_detections, summarize_providers
 
@@ -18,42 +19,40 @@ SEVERITY_BADGES = {
 }
 
 
-def _compute_risk_score(findings: List[Finding], n_models: int, policy_passed: bool | None) -> Tuple[int, str]:
-    """Return (score 0-100, label). Higher score = higher risk."""
-    weights = {Severity.CRITICAL: 25, Severity.HIGH: 15, Severity.MEDIUM: 8, Severity.LOW: 3, Severity.INFO: 1}
-    score = sum(weights.get(f.severity, 5) for f in findings)
-    score += min(n_models * 5, 20)  # Models add up to 20 points
-    if policy_passed is False:
-        score += 15
-    score = min(score, 100)
-    if score >= 70:
-        label = "High"
-    elif score >= 40:
-        label = "Medium"
-    elif score >= 15:
-        label = "Low"
-    else:
-        label = "Minimal"
-    return score, label
-
-
 def to_risk_report_json(
     aibom: AIBOM,
     policy: PolicyReport | None,
     findings: List[Finding] | None = None,
     architecture_result: Optional["ArchitectureResult"] = None,
+    dataflow_analysis: Optional[Any] = None,
+    sensitive_exposures: Optional[Any] = None,
+    model_supply_chain: Optional[Any] = None,
+    prompt_injection_risks: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Build an Enterprise Risk Report JSON document.
     """
     findings = findings or []
-    risk_score, risk_label = _compute_risk_score(
-        findings, len(aibom.models), policy.passed if policy else None
+    risk_result = compute_risk_score(
+        aibom,
+        findings,
+        policy,
+        architecture_result,
+        sensitive_exposures,
+        model_supply_chain,
+        prompt_injection_risks,
+        dataflow_analysis,
     )
     arch_dict = architecture_result.to_dict() if architecture_result else {"architecture_types": ["Unknown"], "components": [], "confidence": "low"}
     report: Dict[str, Any] = {
         "repo": str(aibom.repo_path),
-        "risk_score": {"score": risk_score, "label": risk_label},
+        "risk_score": {
+            "score": risk_result.total_score,
+            "risk_level": risk_result.risk_level,
+            "contributing_factors": risk_result.contributing_factors,
+            "breakdown": {d.name: {"score": d.score, "max": d.max_score, "contributing_factors": d.contributing_factors} for d in risk_result.dimensions},
+            "breakdown_chart": risk_result._chart_lines(),
+        },
         "summary": {
             "component_count": len(aibom.components),
             "model_count": len(aibom.models),
@@ -107,8 +106,20 @@ def to_risk_report_json(
             }
             for m in aibom.models
         ],
-        "dataflows": [df.to_mermaid() for df in aibom.dataflows],
+        "dataflows": [
+            {"flow_type": getattr(df, "flow_type", None), "diagram": df.to_mermaid(layout="LR")}
+            for df in aibom.dataflows
+        ],
     }
+
+    if dataflow_analysis is not None:
+        report["ai_data_flow_analysis"] = dataflow_analysis.to_dict()
+    if sensitive_exposures is not None:
+        report["sensitive_exposures"] = sensitive_exposures.to_dict()
+    if model_supply_chain is not None:
+        report["model_supply_chain"] = model_supply_chain.to_dict()
+    if prompt_injection_risks is not None:
+        report["prompt_injection_risks"] = prompt_injection_risks.to_dict()
 
     if policy is not None:
         report["policy"] = policy.to_dict()
@@ -148,6 +159,10 @@ def to_risk_report_markdown(
     policy: PolicyReport | None,
     findings: List[Finding] | None = None,
     architecture_result: Optional["ArchitectureResult"] = None,
+    dataflow_analysis: Optional[Any] = None,
+    sensitive_exposures: Optional[Any] = None,
+    model_supply_chain: Optional[Any] = None,
+    prompt_injection_risks: Optional[Any] = None,
 ) -> str:
     """
     Build a human-readable Enterprise Risk Report in Markdown, including
@@ -163,20 +178,49 @@ def to_risk_report_markdown(
     lines.append(f"**Repository:** `{aibom.repo_path}`")
     lines.append("")
 
-    # Risk score indicator
-    risk_score, risk_label = _compute_risk_score(findings, n_models, policy.passed if policy else None)
-    risk_emoji = {"High": "🔴", "Medium": "🟠", "Low": "🟢", "Minimal": "✅"}
-    lines.append(f"**Risk score:** {risk_emoji.get(risk_label, '')} **{risk_label}** ({risk_score}/100)")
+    # Risk score with 5-dimension breakdown
+    risk_result = compute_risk_score(
+        aibom,
+        findings,
+        policy,
+        arch,
+        sensitive_exposures,
+        model_supply_chain,
+        prompt_injection_risks,
+        dataflow_analysis,
+    )
+    lines.append("## Risk Assessment")
     lines.append("")
+    risk_emoji = {"High": "🔴", "Medium": "🟠", "Low": "🟢", "Minimal": "✅"}
+    lines.append(f"**Risk score:** {risk_emoji.get(risk_result.risk_level, '')} **{risk_result.risk_level}** ({risk_result.total_score}/100)")
+    lines.append("")
+    lines.append("### AI Risk Breakdown")
+    lines.append("")
+    for ln in risk_result._chart_lines():
+        lines.append(f"    {ln}")
+    lines.append("")
+    if risk_result.contributing_factors:
+        lines.append("**Contributing factors:**")
+        for f in risk_result.contributing_factors[:8]:
+            lines.append(f"- {f}")
+        lines.append("")
     lines.append("---")
     lines.append("")
 
     # Table of contents (for reports with multiple sections)
     detections = findings_to_detections(findings)
     provider_summaries = summarize_providers(detections)
-    toc_sections = ["Executive Summary"]
-    if arch and arch.architecture_types and arch.architecture_types != ["Unknown"]:
+    toc_sections = ["Risk Assessment", "Executive Summary"]
+    if arch:
         toc_sections.append("AI Architecture")
+    if dataflow_analysis:
+        toc_sections.append("AI Data Flow Analysis")
+    if sensitive_exposures:
+        toc_sections.append("Sensitive Data Exposures")
+    if model_supply_chain:
+        toc_sections.append("AI Model Supply Chain Risks")
+    if prompt_injection_risks:
+        toc_sections.append("Prompt Injection Exposure")
     if provider_summaries:
         toc_sections.append("Provider Usage Summary")
     if findings:
@@ -192,7 +236,7 @@ def to_risk_report_markdown(
     if aibom.models:
         toc_sections.append("Model Artifacts")
     if aibom.dataflows:
-        toc_sections.append("Code Flows")
+        toc_sections.append("AI Architecture Flows")
     if policy:
         toc_sections.append("Policy Evaluation")
     toc_sections.append("Next Steps")
@@ -220,7 +264,7 @@ def to_risk_report_markdown(
     if aibom.agent_frameworks:
         summary_parts.append(f"**{len(aibom.agent_frameworks)}** agent framework(s): {', '.join(aibom.agent_frameworks)}.")
     if n_dataflows > 0:
-        summary_parts.append(f"**{n_dataflows}** code flow(s) were analyzed for AI inference patterns.")
+        summary_parts.append(f"**{n_dataflows}** high-level AI flow pattern(s) detected.")
     if findings:
         by_cat = {}
         for f in findings:
@@ -239,15 +283,119 @@ def to_risk_report_markdown(
     lines.append("")
 
     # AI Architecture (inferred pattern)
-    if arch and arch.architecture_types and arch.architecture_types != ["Unknown"]:
+    if arch:
         lines.append("## AI Architecture")
         lines.append("")
-        lines.append(f"**Inferred pattern(s):** {', '.join(arch.architecture_types)}")
+        if arch.architecture_types and arch.architecture_types != ["Unknown"]:
+            lines.append(f"**Inferred pattern(s):** {', '.join(arch.architecture_types)}")
+            lines.append("")
+            if arch.components:
+                lines.append("**Components:**")
+                for c in arch.components:
+                    lines.append(f"- {c}")
+        else:
+            lines.append("No AI architecture patterns detected.")
+        # Modular detector results
+        detector_results = getattr(arch, "detector_results", None) or []
+        if detector_results:
+            lines.append("")
+            lines.append("**Detector results:**")
+            lines.append("")
+            lines.append("| Component | Confidence | Evidence |")
+            lines.append("|-----------|------------|----------|")
+            for dr in detector_results:
+                comp = dr.get("component", "—")
+                conf = dr.get("confidence", "—")
+                ev = dr.get("evidence", [])
+                ev_str = ", ".join(str(e)[:40] for e in ev[:3]) if ev else "—"
+                if len(ev_str) > 50:
+                    ev_str = ev_str[:47] + "..."
+                lines.append(f"| {comp} | {conf} | {ev_str} |")
         lines.append("")
-        if arch.components:
-            lines.append("**Components:**")
-            for c in arch.components:
-                lines.append(f"- {c}")
+        lines.append("---")
+        lines.append("")
+
+    # AI Data Flow Analysis (taint analysis: sources -> LLM sinks)
+    if dataflow_analysis:
+        lines.append("## AI Data Flow Analysis")
+        lines.append("")
+        if dataflow_analysis.data_flows:
+            lines.append("Sensitive or external data flowing into LLM inference calls:")
+            lines.append("")
+            lines.append("| Source | Sink | File | Line | Risk |")
+            lines.append("|--------|------|------|------|------|")
+            for df in dataflow_analysis.data_flows[:20]:
+                line_str = str(df.line) if df.line else "—"
+                lines.append(f"| {df.source} | {df.sink} | `{df.file}` | {line_str} | {df.risk} |")
+            if len(dataflow_analysis.data_flows) > 20:
+                lines.append(f"| *... and {len(dataflow_analysis.data_flows) - 20} more flow(s)* | | | | |")
+        else:
+            lines.append("No sensitive data flows from tracked sources to LLM sinks were detected.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    # Sensitive Data Exposures (password, api_key, etc. -> LLM sinks)
+    if sensitive_exposures:
+        lines.append("## Sensitive Data Exposures")
+        lines.append("")
+        if sensitive_exposures.sensitive_exposures:
+            lines.append("Variables with sensitive names flowing into LLM inference calls:")
+            lines.append("")
+            lines.append("| Variable | Sink | File | Line | Risk |")
+            lines.append("|----------|------|------|------|------|")
+            for e in sensitive_exposures.sensitive_exposures[:20]:
+                line_str = str(e.line) if e.line else "—"
+                risk_badge = "🔴" if e.risk == "critical" else "🟠"
+                lines.append(f"| {e.variable} | {e.sink} | `{e.file}` | {line_str} | {risk_badge} {e.risk} |")
+            if len(sensitive_exposures.sensitive_exposures) > 20:
+                lines.append(f"| *... and {len(sensitive_exposures.sensitive_exposures) - 20} more* | | | | |")
+        else:
+            lines.append("No sensitive variables (password, api_key, token, etc.) were detected flowing into LLM sinks.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    # AI Model Supply Chain Risks
+    if model_supply_chain:
+        lines.append("## AI Model Supply Chain Risks")
+        lines.append("")
+        if model_supply_chain.model_sources:
+            lines.append("Models loaded from external sources:")
+            lines.append("")
+            lines.append("| Model | Source | Risk | File | Line |")
+            lines.append("|-------|--------|------|------|------|")
+            for m in model_supply_chain.model_sources[:20]:
+                line_str = str(m.line) if m.line else "—"
+                risk_badge = "🔴" if m.risk == "high" else ("🟠" if m.risk == "medium" else "🟢")
+                model_short = m.model[:50] + "…" if len(m.model) > 50 else m.model
+                lines.append(f"| `{model_short}` | {m.source} | {risk_badge} {m.risk} | `{m.file}` | {line_str} |")
+            if len(model_supply_chain.model_sources) > 20:
+                lines.append(f"| *... and {len(model_supply_chain.model_sources) - 20} more* | | | | |")
+        else:
+            lines.append("No model loading from external sources (HuggingFace, URLs, S3, etc.) was detected.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    # Prompt Injection Exposure (user input → agent with tools)
+    if prompt_injection_risks:
+        lines.append("## Prompt Injection Exposure")
+        lines.append("")
+        if prompt_injection_risks.prompt_injection_risks:
+            lines.append("User input passed to agents with tool access (potential prompt injection):")
+            lines.append("")
+            lines.append("| Agent Framework | Tools | Input Source | Risk | File | Line |")
+            lines.append("|-----------------|-------|--------------|------|------|------|")
+            for r in prompt_injection_risks.prompt_injection_risks[:15]:
+                line_str = str(r.line) if r.line else "—"
+                tools_str = ", ".join(r.tools[:3]) + ("…" if len(r.tools) > 3 else "")
+                risk_badge = "🔴" if r.risk == "high" else "🟠"
+                lines.append(f"| {r.agent_framework} | {tools_str} | {r.input_source} | {risk_badge} {r.risk} | `{r.file}` | {line_str} |")
+            if len(prompt_injection_risks.prompt_injection_risks) > 15:
+                lines.append(f"| *... and {len(prompt_injection_risks.prompt_injection_risks) - 15} more* | | | | | |")
+        else:
+            lines.append("No prompt injection exposure (user input → agent with tools) was detected.")
         lines.append("")
         lines.append("---")
         lines.append("")
@@ -347,22 +495,23 @@ def to_risk_report_markdown(
             lines.append(f"  - Format: {m.format or 'unknown'}, Size: {size_str}")
         lines.append("")
 
-    # Data flows – summarized, not raw dump
+    # AI Architecture Flows – high-level semantic flows (not raw function graphs)
     if aibom.dataflows:
-        lines.append("## Code Flows")
+        lines.append("## AI Architecture Flows")
         lines.append("")
-        lines.append(f"{n_dataflows} analysis flow(s) were extracted from Python source. ")
-        lines.append("Below are the diagrams (expand to view):")
+        lines.append(f"{n_dataflows} high-level AI flow pattern(s) detected (LLM, embeddings, vector stores, agents). ")
+        lines.append("Diagrams use left-to-right layout with semantic nodes:")
         lines.append("")
         for idx, df in enumerate(aibom.dataflows[:5], start=1):
-            lines.append(f"### Flow {idx}")
+            title = df.flow_type if getattr(df, "flow_type", None) else f"Flow {idx}"
+            lines.append(f"### {title}")
             lines.append("")
             lines.append("```mermaid")
-            lines.append(df.to_mermaid())
+            lines.append(df.to_mermaid(layout="LR"))
             lines.append("```")
             lines.append("")
         if n_dataflows > 5:
-            lines.append(f"*... and {n_dataflows - 5} more flow(s) omitted for brevity.*")
+            lines.append(f"*... and {n_dataflows - 5} more flow pattern(s) omitted.*")
             lines.append("")
 
     if policy is not None:

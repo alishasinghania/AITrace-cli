@@ -101,18 +101,30 @@ class DataFlowEdge:
 
 @dataclass
 class DataFlowGraph:
+    """High-level semantic AI architecture flow (not raw function graphs)."""
+
     nodes: List[DataFlowNode] = field(default_factory=list)
     edges: List[DataFlowEdge] = field(default_factory=list)
+    flow_type: Optional[str] = None  # e.g. "RAG", "Direct LLM", "Embedding Pipeline"
 
-    def to_mermaid(self) -> str:
-        lines = ["flowchart TD"]
-        for node in self.nodes:
-            lines.append(f"  {node.id}([{node.label}])")
+    def _escape_mermaid_label(self, s: str) -> str:
+        return s.replace('"', "&quot;")
+
+    def to_mermaid(self, layout: str = "LR") -> str:
+        """Render as Mermaid flowchart. layout: LR (left-to-right) or TD (top-down)."""
+        direction = layout.upper() if layout in ("LR", "TD", "BT", "RL") else "LR"
+        kept = self.nodes[:10]  # Max 10 nodes
+        kept_ids = {n.id for n in kept}
+        lines = [f"flowchart {direction}"]
+        for node in kept:
+            label = self._escape_mermaid_label(node.label)
+            lines.append(f'  {node.id}(["{label}"])')
         for edge in self.edges:
-            if edge.label:
-                lines.append(f"  {edge.source} -->|{edge.label}| {edge.target}")
-            else:
-                lines.append(f"  {edge.source} --> {edge.target}")
+            if edge.source in kept_ids and edge.target in kept_ids:
+                if edge.label:
+                    lines.append(f"  {edge.source} -->|{edge.label}| {edge.target}")
+                else:
+                    lines.append(f"  {edge.source} --> {edge.target}")
         return "\n".join(lines)
 
 

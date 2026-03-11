@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 from ..models import AIBOM, Component, ComponentType
 
 if TYPE_CHECKING:
-    from ..architecture_detector import ArchitectureResult
+    from ..architecture_inference import ArchitectureResult
 
 # Component categories for diagram layout (only these appear in the AI diagram)
 AI_API_SDKS = {"openai", "anthropic", "cohere", "google-generativeai", "vertexai", "mistralai", "litellm"}

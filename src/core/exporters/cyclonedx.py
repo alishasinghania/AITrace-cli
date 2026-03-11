@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 from ..models import AIBOM, Component, ComponentType, MCPServer, ModelArtifact
 
 if TYPE_CHECKING:
-    from ..architecture_detector import ArchitectureResult
+    from ..architecture_inference import ArchitectureResult
 
 
 def _component_to_cyclonedx(c: Component) -> Dict[str, Any]:
