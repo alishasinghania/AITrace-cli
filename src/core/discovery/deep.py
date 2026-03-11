@@ -64,10 +64,18 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
         id_counter += 1
         return val
 
+    from ..config import get_ignore_paths
+
+    ignore_parts = get_ignore_paths(repo_root)
     for path in repo_root.rglob("*"):
         if not path.is_file():
             continue
-        rel = path.relative_to(repo_root)
+        try:
+            rel = path.relative_to(repo_root)
+        except ValueError:
+            continue
+        if set(rel.parts) & ignore_parts:
+            continue
 
         # Model binaries (exclude build artifacts like AssetManifest.bin)
         if path.suffix.lower() in MODEL_EXTENSIONS:

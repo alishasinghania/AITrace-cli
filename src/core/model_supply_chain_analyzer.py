@@ -11,7 +11,7 @@ import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from .detectors._ast_utils import should_skip_path
 
@@ -32,8 +32,11 @@ MODEL_LOAD_PATTERNS: List[Tuple[List[str], str, str]] = [
     (["load_model"], "0", "generic"),
 ]
 
-# Known trustworthy HuggingFace orgs (lower risk)
-KNOWN_HF_ORGS = {"facebook", "meta-ai", "google", "microsoft", "openai", "anthropic", "stabilityai", "runwayml", "bigscience", "huggingface", "bert", "t5", "gpt2", "roberta", "distilbert", "albert", "electra", "deberta"}
+# Trusted model organizations (low risk when org/model format)
+# Includes common HuggingFace org names (e.g. meta-ai for Meta AI models)
+TRUSTED_MODEL_ORGS: FrozenSet[str] = frozenset({
+    "google", "facebook", "meta", "meta-ai", "microsoft", "salesforce", "huggingface",
+})
 
 # Clearly not model IDs (document types, class names, variable placeholders)
 MODEL_ID_BLOCKLIST = {"fileheader", "model_name", "modelloader"}
@@ -94,37 +97,99 @@ def _get_model_id_from_call(node: ast.Call, arg_spec: str) -> List[str]:
     return ids
 
 
-def _classify_source(model_id: str) -> Tuple[str, str]:
+def _load_trusted_orgs_from_policy(policy_path: Optional[Path]) -> Tuple[Set[str], Set[str]]:
     """
-    Classify model source and return (source_type, risk).
-    risk: low, medium, high
+    Load trusted_orgs and verified_orgs from policy.yaml.
+    Returns (trusted_orgs, verified_orgs) as lowercase sets.
+    """
+    trusted: Set[str] = set()
+    verified: Set[str] = set()
+    if not policy_path or not policy_path.exists():
+        return trusted, verified
+    try:
+        import yaml
+        raw = yaml.safe_load(policy_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return trusted, verified
+    model_sources = raw.get("model_sources")
+    if not isinstance(model_sources, dict):
+        return trusted, verified
+    for item in (model_sources.get("trusted_orgs") or []):
+        if isinstance(item, str) and item.strip():
+            trusted.add(item.strip().lower())
+    for item in (model_sources.get("verified_orgs") or []):
+        if isinstance(item, str) and item.strip():
+            verified.add(item.strip().lower())
+    return trusted, verified
+
+
+def _extract_hf_org(model_id: str) -> Optional[str]:
+    """Extract org from HuggingFace model ID (org/model-name) or HF URL path."""
+    model_id = model_id.strip()
+    if not model_id:
+        return None
+    # HF URL: https://huggingface.co/org/model or hf.co/org/model
+    if "huggingface.co/" in model_id.lower() or "hf.co/" in model_id.lower():
+        parts = re.split(r"[/?#]", model_id, flags=re.I)
+        for i, p in enumerate(parts):
+            if p and p.lower() in ("huggingface.co", "hf.co") and i + 1 < len(parts):
+                return parts[i + 1].lower() if parts[i + 1] else None
+    # Simple org/model format
+    if "/" in model_id and not model_id.startswith(("http", "/", ".", "s3:", "gs:")):
+        return model_id.split("/")[0].lower()
+    return None
+
+
+def _classify_source(
+    model_id: str,
+    trusted_orgs: Optional[Set[str]] = None,
+    verified_orgs: Optional[Set[str]] = None,
+) -> Tuple[str, str]:
+    """
+    Classify model source and return (source_display, risk).
+
+    Risk rules:
+    - trusted org → low
+    - verified org (from policy) → low
+    - unknown org → medium
+    - remote download URLs → high
     """
     model_id_lower = model_id.lower().strip()
     if not model_id_lower:
         return ("unknown", "medium")
 
-    # URL-based classification
+    trusted = TRUSTED_MODEL_ORGS | (trusted_orgs or set())
+    verified = verified_orgs or set()
+    low_risk_orgs = trusted | verified
+
+    # Remote URL classification
     for name, pat in URL_PATTERNS.items():
         if pat.search(model_id_lower):
             if name == "huggingface":
-                return ("huggingface", "medium")
+                org = _extract_hf_org(model_id)
+                if org and org in low_risk_orgs:
+                    label = "trusted org" if org in trusted else "verified org"
+                    return (f"huggingface ({label})", "low")
+                return ("huggingface (remote URL)", "high")  # Unknown org URL → high
             if name == "github":
-                return ("github", "high")
+                return ("github (remote URL)", "high")
             if name in ("s3", "gcs"):
-                return (name, "high")
+                return (f"{name} (remote)", "high")
             if name == "http":
-                return ("external_url", "high")
+                return ("remote URL", "high")
 
-    # HuggingFace model ID format: org/model-name or just model-name
-    if "/" in model_id and ":" not in model_id and not model_id.startswith(("http", "/", ".")):
-        org = model_id.split("/")[0].lower()
-        if org in KNOWN_HF_ORGS:
-            return ("huggingface", "low")
-        return ("huggingface", "medium")  # Unknown org on HF
+    # HuggingFace model ID: org/model-name
+    org = _extract_hf_org(model_id)
+    if org is not None:
+        if org in low_risk_orgs:
+            label = "trusted org" if org in trusted else "verified org"
+            return (f"huggingface ({label})", "low")
+        return (f"huggingface ({org})", "medium")
 
-    # Single name (no slash) - could be local or HF
-    if model_id_lower in KNOWN_HF_ORGS or model_id_lower in {"bert", "gpt2", "t5", "roberta"}:
-        return ("huggingface", "low")
+    # Local file (e.g. custom_model.bin, model.pt)
+    if not model_id_lower.startswith(("http", "s3:", "gs:")) and "/" not in model_id_lower:
+        return ("unknown (local or unspecified)", "medium")
+
     return ("unknown", "medium")
 
 
@@ -151,22 +216,90 @@ class ModelSource:
 
 
 @dataclass
+class AggregatedModel:
+    """Model aggregated by name with occurrence count and file locations."""
+
+    model: str
+    source: str
+    risk: str
+    count: int
+    files: List[str]  # e.g. ["path/to/file.py:42", "other.py:10"]
+
+    def to_dict(self) -> dict:
+        return {
+            "model": self.model,
+            "source": self.source,
+            "risk": self.risk,
+            "count": self.count,
+            "files": self.files,
+        }
+
+
+def _aggregate_model_sources(sources: List[ModelSource]) -> List[AggregatedModel]:
+    """Merge duplicate model findings by model name. Returns aggregated list for reporting."""
+    by_model: Dict[str, Dict] = {}
+    for m in sources:
+        key = m.model
+        if key not in by_model:
+            by_model[key] = {
+                "source": m.source,
+                "risk": m.risk,
+                "count": 0,
+                "locs": set(),
+            }
+        by_model[key]["count"] += 1
+        loc = (m.file, m.line if m.line is not None else 0)
+        by_model[key]["locs"].add(loc)
+    result = []
+    for name, data in sorted(by_model.items()):
+        files = sorted(data["locs"], key=lambda x: (x[0], x[1]))
+        files_str = [f"{f}:{ln}" if ln else f for f, ln in files]
+        result.append(AggregatedModel(
+            model=name,
+            source=data["source"],
+            risk=data["risk"],
+            count=data["count"],
+            files=files_str,
+        ))
+    return result
+
+
+@dataclass
 class ModelSupplyChainResult:
     """Result of model supply chain analysis."""
 
     model_sources: List[ModelSource] = field(default_factory=list)
+    _aggregated: Optional[List[AggregatedModel]] = field(default=None, repr=False)
+
+    @property
+    def aggregated_models(self) -> List[AggregatedModel]:
+        """Models aggregated by name (deduplicated) for reporting."""
+        if self._aggregated is None:
+            self._aggregated = _aggregate_model_sources(self.model_sources)
+        return self._aggregated
 
     def to_dict(self) -> dict:
         return {
             "model_sources": [m.to_dict() for m in self.model_sources],
+            "models": {  # Aggregated: model -> {count, files}
+                a.model: {"count": a.count, "files": a.files, "source": a.source, "risk": a.risk}
+                for a in self.aggregated_models
+            },
         }
 
 
 class _ModelLoadVisitor(ast.NodeVisitor):
     """Finds model loading calls and extracts source identifiers."""
 
-    def __init__(self, file_path: str):
+    def __init__(
+        self,
+        file_path: str,
+        trusted_orgs: Optional[Set[str]] = None,
+        verified_orgs: Optional[Set[str]] = None,
+    ):
         self.file_path = file_path
+        self.trusted_orgs = trusted_orgs or set()
+        self.verified_orgs = verified_orgs or set()
         self.sources: List[ModelSource] = []
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -185,10 +318,10 @@ class _ModelLoadVisitor(ast.NodeVisitor):
                     continue
                 if mid.lower().strip() in MODEL_ID_BLOCKLIST:
                     continue
-                src_type, risk = _classify_source(mid)
+                src_display, risk = _classify_source(mid, self.trusted_orgs, self.verified_orgs)
                 self.sources.append(ModelSource(
                     model=mid,
-                    source=src_type,
+                    source=src_display,
                     risk=risk,
                     file=self.file_path,
                     line=getattr(node, "lineno", None),
@@ -210,9 +343,20 @@ def _should_skip(path: Path, repo_root: Path) -> bool:
     return False
 
 
-def analyze_model_supply_chain(repo_root: Path) -> ModelSupplyChainResult:
-    """Analyze Python files for model loading from external sources."""
+def analyze_model_supply_chain(
+    repo_root: Path,
+    policy_path: Optional[Path] = None,
+) -> ModelSupplyChainResult:
+    """
+    Analyze Python files for model loading from external sources.
+
+    Trusted/verified orgs from policy.yaml (model_sources.trusted_orgs, verified_orgs)
+    are treated as low risk alongside the built-in TRUSTED_MODEL_ORGS.
+    """
     repo_root = Path(repo_root).resolve()
+    policy_trusted, policy_verified = _load_trusted_orgs_from_policy(policy_path)
+    trusted_orgs = TRUSTED_MODEL_ORGS | policy_trusted
+    verified_orgs = policy_verified
     all_sources: List[ModelSource] = []
     seen: Set[Tuple[str, str, Optional[int]]] = set()
 
@@ -225,7 +369,7 @@ def analyze_model_supply_chain(repo_root: Path) -> ModelSupplyChainResult:
             continue
 
         rel_path = str(path.relative_to(repo_root))
-        visitor = _ModelLoadVisitor(rel_path)
+        visitor = _ModelLoadVisitor(rel_path, trusted_orgs, verified_orgs)
         visitor.visit(tree)
 
         for m in visitor.sources:

@@ -65,9 +65,11 @@ def detect_huggingface(repo_root: Path) -> DetectionResult:
 
     scan_ast(repo_root, visit)
 
-    # File discovery: model binaries and configs (exclude .git, venv, etc.)
-    IGNORED = {"test", "tests", ".git", "venv", ".venv", "node_modules", "site-packages"}
-    CONFIG_IGNORED = IGNORED | {"benchmark", "classic", "forge", "agbenchmark", "original_autogpt"}
+    # File discovery: model binaries and configs (uses aitrace.yaml ignore_paths)
+    from ..config import get_ignore_paths
+
+    ignore_parts = get_ignore_paths(repo_root)
+    CONFIG_IGNORED = ignore_parts | {"benchmark", "classic", "forge", "agbenchmark", "original_autogpt"}
     MODEL_BIN_EXCLUDE = {"build", "web", "assets", "assetmanifest"}
     MODEL_BIN_NAME_EXCLUDE = {"data_level0.bin", "length.bin", "link_lists.bin", "header.bin"}
     model_files: List[str] = []
@@ -78,7 +80,7 @@ def detect_huggingface(repo_root: Path) -> DetectionResult:
             rel = path.relative_to(repo_root)
         except ValueError:
             continue
-        if set(rel.parts) & IGNORED:
+        if set(rel.parts) & ignore_parts:
             continue
         if path.suffix.lower() in MODEL_EXTENSIONS:
             if path.suffix.lower() == ".bin":

@@ -181,6 +181,18 @@ models:
   denied: []
   fail_build: true
 
+# Model supply chain: trusted/verified orgs for HuggingFace-style model IDs (org/model)
+# Models from these orgs are classified as low risk.
+model_sources:
+  trusted_orgs:
+    - google
+    - facebook
+    - meta
+    - microsoft
+    - salesforce
+    - huggingface
+  verified_orgs: []  # Add orgs you have verified (e.g. - mycompany)
+
 risk:
   # Maximum severity allowed before failing the build.
   # One of: info, low, medium, high, critical

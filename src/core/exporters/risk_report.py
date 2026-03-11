@@ -19,12 +19,78 @@ SEVERITY_BADGES = {
 }
 
 
+def _build_executive_insights(
+    aibom: AIBOM,
+    findings: List[Finding],
+    architecture_result: Optional[Any] = None,
+    dataflow_analysis: Optional[Any] = None,
+    sensitive_exposures: Optional[Any] = None,
+    model_supply_chain: Optional[Any] = None,
+    prompt_injection_risks: Optional[Any] = None,
+    llm_usage: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Build structured executive insights for meaningful metrics.
+    Replaces raw counts (e.g. 1650 findings) with actionable summary.
+    """
+    arch = architecture_result
+    insights: Dict[str, Any] = {
+        "ai_components_detected": len(aibom.components) + len(aibom.models) + len(aibom.mcp_servers),
+        "unique_llm_invocation_patterns": 0,
+        "rag_pipelines_detected": 0,
+        "agent_frameworks_detected": len(aibom.agent_frameworks or []),
+        "potential_security_issues": 0,
+    }
+
+    if llm_usage:
+        insights["unique_llm_invocation_patterns"] = len(llm_usage)
+
+    if arch and getattr(arch, "architecture_types", None):
+        atypes = arch.architecture_types or []
+        if "RAG" in atypes:
+            insights["rag_pipelines_detected"] = 1
+
+    # Potential security issues: high-severity findings + sensitive exposures + risky data flows +
+    # prompt injection risks + risky model sources
+    security_count = 0
+    for f in (findings or []):
+        if f.severity.value in ("high", "critical"):
+            security_count += 1
+    if sensitive_exposures and getattr(sensitive_exposures, "sensitive_exposures", None):
+        security_count += len(sensitive_exposures.sensitive_exposures)
+    if dataflow_analysis and getattr(dataflow_analysis, "data_flows", None):
+        security_count += sum(1 for df in dataflow_analysis.data_flows if df.risk in ("high", "medium"))
+    if prompt_injection_risks and getattr(prompt_injection_risks, "prompt_injection_risks", None):
+        security_count += len(prompt_injection_risks.prompt_injection_risks)
+    if model_supply_chain:
+        agg = getattr(model_supply_chain, "aggregated_models", None)
+        if agg:
+            security_count += sum(1 for m in agg if m.risk in ("high", "medium"))
+    insights["potential_security_issues"] = security_count
+
+    return insights
+
+
 def _build_summary_with_llm(
     aibom: AIBOM,
     findings: List[Finding],
     llm_usage: Optional[Dict[str, Any]] = None,
+    architecture_result: Optional[Any] = None,
+    dataflow_analysis: Optional[Any] = None,
+    sensitive_exposures: Optional[Any] = None,
+    model_supply_chain: Optional[Any] = None,
+    prompt_injection_risks: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Build summary dict, adding llm_invocation_patterns when available."""
+    """Build summary dict with structured insights and legacy fields for compatibility."""
+    insights = _build_executive_insights(
+        aibom, findings,
+        architecture_result=architecture_result,
+        dataflow_analysis=dataflow_analysis,
+        sensitive_exposures=sensitive_exposures,
+        model_supply_chain=model_supply_chain,
+        prompt_injection_risks=prompt_injection_risks,
+        llm_usage=llm_usage,
+    )
     summary: Dict[str, Any] = {
         "component_count": len(aibom.components),
         "model_count": len(aibom.models),
@@ -32,6 +98,7 @@ def _build_summary_with_llm(
         "finding_count": len(findings),
         "mcp_server_count": len(aibom.mcp_servers),
         "agent_framework_count": len(aibom.agent_frameworks),
+        "executive_insights": insights,
     }
     if llm_usage:
         lp = _build_llm_invocation_patterns(llm_usage)
@@ -154,7 +221,14 @@ def to_risk_report_json(
             "breakdown": {d.name: {"score": d.score, "max": d.max_score, "contributing_factors": d.contributing_factors} for d in risk_result.dimensions},
             "breakdown_chart": risk_result._chart_lines(),
         },
-        "summary": _build_summary_with_llm(aibom, findings, llm_usage),
+        "summary": _build_summary_with_llm(
+            aibom, findings, llm_usage,
+            architecture_result=architecture_result,
+            dataflow_analysis=dataflow_analysis,
+            sensitive_exposures=sensitive_exposures,
+            model_supply_chain=model_supply_chain,
+            prompt_injection_risks=prompt_injection_risks,
+        ),
         "findings": [
             {
                 "id": f.id,
@@ -354,36 +428,39 @@ def to_risk_report_markdown(
     lines.append("---")
     lines.append("")
 
-    # Executive summary (plain language)
+    # Executive summary (structured insights, not raw counts)
+    insights = _build_executive_insights(
+        aibom, findings,
+        architecture_result=arch,
+        dataflow_analysis=dataflow_analysis,
+        sensitive_exposures=sensitive_exposures,
+        model_supply_chain=model_supply_chain,
+        prompt_injection_risks=prompt_injection_risks,
+        llm_usage=llm_usage,
+    )
     lines.append("## Executive Summary")
     lines.append("")
-    summary_parts = []
-    if n_components > 0:
-        names = ", ".join(c.name for c in aibom.components[:5])
-        summary_parts.append(f"This repository has **{n_components}** dependency(ies): **{names}**" + (" and more." if n_components > 5 else "."))
-    if n_models > 0:
-        summary_parts.append(f"**{n_models}** model artifact(s) were discovered (binary or config files).")
-    if aibom.mcp_servers:
-        summary_parts.append(f"**{len(aibom.mcp_servers)}** MCP server(s) configured.")
-    if aibom.agent_frameworks:
-        summary_parts.append(f"**{len(aibom.agent_frameworks)}** agent framework(s): {', '.join(aibom.agent_frameworks)}.")
-    if n_dataflows > 0:
-        summary_parts.append(f"**{n_dataflows}** high-level AI flow pattern(s) detected.")
-    if llm_patterns:
-        summary_parts.append(
-            f"**LLM invocation patterns:** {llm_patterns['pattern_count']} pattern(s), {llm_patterns['total_call_sites']} total call site(s)."
+    has_any = any(
+        insights[k] for k in (
+            "ai_components_detected", "unique_llm_invocation_patterns",
+            "rag_pipelines_detected", "agent_frameworks_detected", "potential_security_issues"
         )
-    if findings:
-        by_cat = {}
-        for f in findings:
-            by_cat[f.category.value] = by_cat.get(f.category.value, 0) + 1
-        cat_labels = {"surface": "dependencies", "deep": "artifacts", "semantic": "inference calls", "policy": "policy"}
-        cats = ", ".join(f"{v} {cat_labels.get(k, k)}" for k, v in by_cat.items())
-        summary_parts.append(f"**{len(findings)}** finding(s): {cats}.")
-    if arch and arch.architecture_types and arch.architecture_types != ["Unknown"]:
-        summary_parts.append(f"**Inferred architecture**: {' + '.join(arch.architecture_types)}.")
-    if summary_parts:
-        lines.append(" ".join(summary_parts))
+    )
+    if has_any:
+        lines.append("- **AI components detected:** " + str(insights["ai_components_detected"]))
+        lines.append("- **Unique LLM invocation patterns:** " + str(insights["unique_llm_invocation_patterns"]))
+        lines.append("- **RAG pipelines detected:** " + str(insights["rag_pipelines_detected"]))
+        af_count = insights["agent_frameworks_detected"]
+        af_str = f"{af_count}"
+        if aibom.agent_frameworks:
+            af_str += f" ({', '.join(aibom.agent_frameworks)})"
+        lines.append("- **Agent frameworks detected:** " + af_str)
+        lines.append("- **Potential security issues:** " + str(insights["potential_security_issues"]))
+        if arch and arch.architecture_types and arch.architecture_types != ["Unknown"]:
+            lines.append(f"- **Inferred architecture:** {', '.join(arch.architecture_types)}")
+        if n_components > 0:
+            names = ", ".join(c.name for c in aibom.components[:5])
+            lines.append(f"- **Key dependencies:** {names}" + (" and more" if n_components > 5 else ""))
     else:
         lines.append("No AI/ML components, models, or inference patterns were detected in this repository.")
     lines.append("")
@@ -428,13 +505,19 @@ def to_risk_report_markdown(
         lines.append("## AI Data Flow Analysis")
         lines.append("")
         if dataflow_analysis.data_flows:
-            lines.append("Sensitive or external data flowing into LLM inference calls:")
+            lines.append("Data flowing from sources into LLM inference calls. Risk is classified by source type:")
             lines.append("")
-            lines.append("| Source | Sink | File | Line | Risk |")
-            lines.append("|--------|------|------|------|------|")
+            lines.append("- **High**: user_input (request, form, argv)")
+            lines.append("- **Medium**: external_api (HTTP, DB), environment (env vars)")
+            lines.append("- **Low**: file_read, config, internal_variable")
+            lines.append("")
+            lines.append("| Source Type | Sink | File | Line | Risk |")
+            lines.append("|-------------|------|------|------|------|")
+            risk_badges = {"high": "🔴 high", "medium": "🟠 medium", "low": "🟢 low"}
             for df in dataflow_analysis.data_flows[:20]:
                 line_str = str(df.line) if df.line else "—"
-                lines.append(f"| {df.source} | {df.sink} | `{df.file}` | {line_str} | {df.risk} |")
+                risk_str = risk_badges.get(df.risk.lower(), df.risk)
+                lines.append(f"| {df.source} | {df.sink} | `{df.file}` | {line_str} | {risk_str} |")
             if len(dataflow_analysis.data_flows) > 20:
                 lines.append(f"| *... and {len(dataflow_analysis.data_flows) - 20} more flow(s)* | | | | |")
         else:
@@ -464,22 +547,32 @@ def to_risk_report_markdown(
         lines.append("---")
         lines.append("")
 
-    # AI Model Supply Chain Risks
+    # AI Model Supply Chain Risks (aggregated by model name)
     if model_supply_chain:
         lines.append("## AI Model Supply Chain Risks")
         lines.append("")
-        if model_supply_chain.model_sources:
-            lines.append("Models loaded from external sources:")
+        agg = getattr(model_supply_chain, "aggregated_models", None) or []
+        if agg:
+            lines.append("Models loaded from external sources. Risk by source type:")
             lines.append("")
-            lines.append("| Model | Source | Risk | File | Line |")
-            lines.append("|-------|--------|------|------|------|")
-            for m in model_supply_chain.model_sources[:20]:
-                line_str = str(m.line) if m.line else "—"
+            lines.append("- **Low**: trusted/verified org (google, meta, huggingface, etc.)")
+            lines.append("- **Medium**: unknown org, local/unspecified")
+            lines.append("- **High**: remote URLs (GitHub, S3, arbitrary HTTP)")
+            lines.append("")
+            for m in agg[:20]:
                 risk_badge = "🔴" if m.risk == "high" else ("🟠" if m.risk == "medium" else "🟢")
-                model_short = m.model[:50] + "…" if len(m.model) > 50 else m.model
-                lines.append(f"| `{model_short}` | {m.source} | {risk_badge} {m.risk} | `{m.file}` | {line_str} |")
-            if len(model_supply_chain.model_sources) > 20:
-                lines.append(f"| *... and {len(model_supply_chain.model_sources) - 20} more* | | | | |")
+                model_display = m.model[:60] + "…" if len(m.model) > 60 else m.model
+                lines.append(f"**`{model_display}`**")
+                lines.append(f"- {risk_badge} {m.risk} · Source: {m.source}")
+                lines.append(f"- Used in **{m.count}** location(s)")
+                for f in m.files[:5]:
+                    lines.append(f"  - `{f}`")
+                if len(m.files) > 5:
+                    lines.append(f"  - *... and {len(m.files) - 5} more*")
+                lines.append("")
+            if len(agg) > 20:
+                lines.append(f"*... and {len(agg) - 20} more model(s)*")
+                lines.append("")
         else:
             lines.append("No model loading from external sources (HuggingFace, URLs, S3, etc.) was detected.")
         lines.append("")

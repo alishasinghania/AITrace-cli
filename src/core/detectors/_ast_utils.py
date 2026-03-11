@@ -7,20 +7,25 @@ import re
 from pathlib import Path
 from typing import Callable, List, Optional
 
-IGNORED_PATH_PARTS = {
-    "test", "tests", "__tests__", "site-packages", "venv", ".venv",
-    "node_modules", ".git", "dist", "build", "egg-info", ".eggs",
-}
+# Additional path parts (beyond config ignore_paths) - always applied
+EXTRA_IGNORED_PARTS = {"__tests__"}
 IGNORED_FILE_PATTERNS = (r"_test\.py$", r"test_.*\.py$", r"conftest\.py$")
 
 
 def should_skip_path(path: Path, repo_root: Path) -> bool:
-    """Skip test files, site-packages, venv, framework internals."""
+    """
+    Skip non-production files before AST scanning.
+    Uses aitrace.yaml ignore_paths (examples, tests, docs, etc.) plus builtins.
+    """
     try:
         rel = path.relative_to(repo_root)
     except ValueError:
         return True
-    if set(rel.parts) & IGNORED_PATH_PARTS:
+
+    from ..config import get_ignore_paths
+
+    ignore_parts = get_ignore_paths(repo_root) | EXTRA_IGNORED_PARTS
+    if set(rel.parts) & ignore_parts:
         return True
     # Skip AITrace's own detectors (avoid self-detection)
     parts = rel.parts

@@ -29,44 +29,56 @@ def _should_skip(path: Path, repo_root: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Source patterns: (chain_patterns, source_label, risk)
-# chain = ['requests', 'get'] or ['request', 'json'] etc.
+# Source risk classification: risk level by source type
+# Used to derive risk for source → LLM flows (e.g. user_input→LLM = high)
 # ---------------------------------------------------------------------------
 
-SOURCE_PATTERNS: List[Tuple[List[str], str, str]] = [
-    # (call/attr chain (lowered), source_label, risk)
-    (["request", "json"], "user_input", "high"),
-    (["request", "args"], "user_input", "high"),
-    (["request", "form"], "user_input", "high"),
-    (["request", "data"], "user_input", "high"),
-    (["request", "get_json"], "user_input", "high"),
-    (["request", "form"], "user_input", "high"),
-    (["flask", "request", "json"], "user_input", "high"),
-    (["flask", "request", "args"], "user_input", "high"),
-    (["input"], "user_input", "high"),
-    (["sys", "argv"], "user_input", "medium"),
-    (["cursor", "execute"], "database", "high"),
-    (["session", "query"], "database", "high"),
-    (["fetchall"], "database", "high"),
-    (["fetchone"], "database", "high"),
-    (["execute"], "database", "medium"),  # generic, may be DB
-    (["open"], "file_read", "medium"),
-    (["read"], "file_read", "medium"),
-    (["load"], "file_read", "medium"),
-    (["loads"], "file_read", "medium"),
-    (["read_csv"], "file_read", "medium"),
-    (["read_json"], "file_read", "medium"),
-    (["load_json"], "file_read", "medium"),
-    (["os", "getenv"], "environment", "medium"),
-    (["os", "environ"], "environment", "medium"),
-    (["environ", "get"], "environment", "medium"),
-    (["requests", "get"], "http_request", "high"),
-    (["requests", "post"], "http_request", "high"),
-    (["requests", "put"], "http_request", "high"),
-    (["requests", "patch"], "http_request", "high"),
-    (["requests", "request"], "http_request", "high"),
-    (["httpx", "get"], "http_request", "high"),
-    (["httpx", "post"], "http_request", "high"),
+SOURCE_RISK: Dict[str, str] = {
+    "user_input": "high",
+    "external_api": "medium",
+    "environment": "medium",
+    "file_read": "low",
+    "config": "low",
+    "internal_variable": "low",
+}
+
+# Source patterns: (chain_patterns, source_type)
+# source_type must be a key in SOURCE_RISK; risk is derived via SOURCE_RISK.get(source_type)
+SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
+    (["request", "json"], "user_input"),
+    (["request", "args"], "user_input"),
+    (["request", "form"], "user_input"),
+    (["request", "data"], "user_input"),
+    (["request", "get_json"], "user_input"),
+    (["flask", "request", "json"], "user_input"),
+    (["flask", "request", "args"], "user_input"),
+    (["input"], "user_input"),
+    (["sys", "argv"], "user_input"),
+    (["cursor", "execute"], "external_api"),
+    (["session", "query"], "external_api"),
+    (["fetchall"], "external_api"),
+    (["fetchone"], "external_api"),
+    (["execute"], "external_api"),
+    (["open"], "file_read"),
+    (["read"], "file_read"),
+    (["load"], "file_read"),
+    (["loads"], "file_read"),
+    (["read_csv"], "file_read"),
+    (["read_json"], "file_read"),
+    (["load_json"], "file_read"),
+    (["os", "getenv"], "environment"),
+    (["os", "environ"], "environment"),
+    (["environ", "get"], "environment"),
+    (["requests", "get"], "external_api"),
+    (["requests", "post"], "external_api"),
+    (["requests", "put"], "external_api"),
+    (["requests", "patch"], "external_api"),
+    (["requests", "request"], "external_api"),
+    (["httpx", "get"], "external_api"),
+    (["httpx", "post"], "external_api"),
+    (["yaml", "safe_load"], "config"),
+    (["yaml", "load"], "config"),
+    (["toml", "load"], "config"),
 ]
 
 # Sink patterns: (chain_contains, sink_label)
@@ -125,10 +137,11 @@ class DataFlow:
     def to_dict(self) -> dict:
         return {
             "source": self.source,
+            "source_type": self.source,  # Source type used for risk classification
             "sink": self.sink,
             "file": self.file,
             "line": self.line,
-            "risk": self.risk,
+            "risk": self.risk,  # Derived from SOURCE_RISK.get(source_type)
         }
 
 
@@ -183,37 +196,41 @@ def _get_attr_chain(node: ast.expr) -> List[str]:
     return list(reversed(chain))
 
 
+def _get_source_risk(source_type: str) -> str:
+    """Derive risk level from source type using SOURCE_RISK mapping."""
+    return SOURCE_RISK.get(source_type, "medium")
+
+
 def _is_source_call(node: ast.Call) -> Optional[Tuple[str, str]]:
-    """Return (source_label, risk) if node is a source call."""
+    """Return (source_type, risk) if node is a source call."""
     chain = _get_call_chain(node)
     chain_str = ".".join(chain).lower()
-    for pattern, label, risk in SOURCE_PATTERNS:
+    for pattern, source_type in SOURCE_PATTERNS:
         pat_str = ".".join(pattern).lower()
         if pat_str in chain_str or _chain_matches(chain, pattern):
-            return (label, risk)
-    # Check for request.json as attribute (not call)
+            return (source_type, _get_source_risk(source_type))
     return None
 
 
 def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
-    """Check if expression is a source (call or attribute like request.json)."""
+    """Check if expression is a source (call or attribute like request.json). Returns (source_type, risk)."""
     if isinstance(node, ast.Call):
         return _is_source_call(node)
     if isinstance(node, ast.Attribute):
         chain = _get_attr_chain(node)
-        for pattern, label, risk in SOURCE_PATTERNS:
+        for pattern, source_type in SOURCE_PATTERNS:
             if len(pattern) <= len(chain) and pattern == [c.lower() for c in chain[-len(pattern):]]:
-                return (label, risk)
+                return (source_type, _get_source_risk(source_type))
         if chain and chain[-1].lower() in ("json", "args", "form", "data"):
             if len(chain) >= 2 and chain[0].lower() in ("request", "req"):
-                return ("user_input", "high")
+                return ("user_input", _get_source_risk("user_input"))
     if isinstance(node, ast.Subscript):
         if isinstance(node.value, ast.Attribute):
             chain = _get_attr_chain(node.value)
             if chain and chain[0].lower() in ("request", "req") and chain[-1].lower() in ("args", "form"):
-                return ("user_input", "high")
+                return ("user_input", _get_source_risk("user_input"))
         if isinstance(node.value, ast.Name) and node.value.id.lower() == "sys":
-            return ("user_input", "medium")  # sys['argv']-like
+            return ("user_input", _get_source_risk("user_input"))
     if isinstance(node, ast.Name) and node.id == "sys":
         return None  # sys alone isn't a source
     return None

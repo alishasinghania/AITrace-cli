@@ -78,6 +78,26 @@ The risk report includes:
 
 ---
 
+## Configuration (`aitrace.yaml`)
+
+Place `aitrace.yaml` in your repo root to customize scanning:
+
+```yaml
+# Path segments to skip during AI analysis (reduces false positives)
+ignore_paths:
+  - examples
+  - tests
+  - docs
+  - experimental
+  - integrations
+  - packs
+  - demo
+```
+
+Files under these directories are excluded from AST scanning and AI analysis. Defaults match the list above if no config is present.
+
+---
+
 ## Policy Governance
 
 Create a `policy.yaml` to enforce:

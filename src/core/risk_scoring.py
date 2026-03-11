@@ -143,10 +143,12 @@ def compute_risk_score(
     ext_score = 0
     ext_factors: List[str] = []
     risky_models = []
-    if model_supply_chain and getattr(model_supply_chain, "model_sources", None):
-        for m in model_supply_chain.model_sources:
-            if m.risk in ("high", "medium"):
-                risky_models.append(m)
+    if model_supply_chain:
+        agg = getattr(model_supply_chain, "aggregated_models", None)
+        if agg:
+            risky_models = [m for m in agg if m.risk in ("high", "medium")]
+        elif getattr(model_supply_chain, "model_sources", None):
+            risky_models = [m for m in model_supply_chain.model_sources if m.risk in ("high", "medium")]
     if risky_models:
         ext_score += min(10, 5 + len(risky_models) * 2)
         ext_factors.append(

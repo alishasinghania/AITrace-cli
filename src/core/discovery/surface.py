@@ -131,8 +131,12 @@ def _scan_manifests(root: Path) -> List[Component]:
 
 
 def _scan_python_imports(root: Path) -> Set[str]:
+    from ..detectors._ast_utils import should_skip_path
+
     imported: Set[str] = set()
     for path in root.rglob("*.py"):
+        if should_skip_path(path, root):
+            continue
         try:
             source = path.read_text(encoding="utf-8", errors="ignore")
             tree = ast.parse(source, filename=str(path))

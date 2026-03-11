@@ -1,0 +1,13 @@
+# AITrace configuration (optional)
+# Copy to aitrace.yaml in your repo root to customize.
+
+# Path segments to skip during AI analysis (reduces false positives from
+# non-production code such as examples, tests, and demos).
+ignore_paths:
+  - examples
+  - tests
+  - docs
+  - experimental
+  - integrations
+  - packs
+  - demo

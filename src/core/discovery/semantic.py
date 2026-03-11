@@ -30,29 +30,8 @@ from ..models import (
 )
 
 # ---------------------------------------------------------------------------
-# File path patterns to ignore
+# File path patterns (uses shared should_skip_path from detectors)
 # ---------------------------------------------------------------------------
-
-IGNORED_PATH_PARTS = {
-    "test",
-    "tests",
-    "__tests__",
-    "site-packages",
-    "venv",
-    ".venv",
-    "node_modules",
-    ".git",
-    "dist",
-    "build",
-    "egg-info",
-    ".eggs",
-}
-
-IGNORED_FILE_PATTERNS = (
-    r"_test\.py$",
-    r"test_.*\.py$",
-    r"conftest\.py$",
-)
 
 # ---------------------------------------------------------------------------
 # Semantic node types and call pattern mappings
@@ -115,19 +94,9 @@ AGENT_PATTERNS = (
 
 
 def _should_skip_path(path: Path, repo_root: Path) -> bool:
-    """Skip test files, site-packages, venv, and framework internals."""
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    parts = set(rel.parts)
-    if parts & IGNORED_PATH_PARTS:
-        return True
-    name = path.name.lower()
-    for pat in IGNORED_FILE_PATTERNS:
-        if re.search(pat, name):
-            return True
-    return False
+    """Skip non-production code (uses aitrace.yaml ignore_paths)."""
+    from ..detectors._ast_utils import should_skip_path
+    return should_skip_path(path, repo_root)
 
 
 def _call_target_name(node: ast.Call) -> Optional[str]:
