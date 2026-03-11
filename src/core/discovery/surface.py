@@ -30,6 +30,22 @@ AI_PACKAGES: Dict[str, str] = {
     "copilot": "GitHub Copilot",
 }
 
+AGENT_PACKAGES: Dict[str, str] = {
+    "langgraph": "LangGraph",
+    "crewai": "CrewAI",
+    "autogen": "AutoGen",
+    "semantic-kernel": "Microsoft Semantic Kernel",
+    "semantic_kernel": "Microsoft Semantic Kernel",
+    "haystack": "Haystack",
+    "agentpy": "AgentPy",
+    "agixt": "AGiXT",
+}
+
+MCP_PACKAGES: Dict[str, str] = {
+    "mcp": "MCP Python SDK",
+    "modelcontextprotocol": "Model Context Protocol",
+}
+
 CLOUD_PACKAGES: Dict[str, str] = {
     "boto3": "AWS",
     "google-cloud": "GCP",
@@ -99,11 +115,15 @@ def _scan_manifests(root: Path) -> List[Component]:
     pkg_json = root / "package.json"
     if pkg_json.exists():
         for name, version in _parse_package_json(pkg_json).items():
+            props = {}
+            if "@modelcontextprotocol" in name.lower() or "mcp-server" in name.lower():
+                props["aitrace:mcp_server"] = True
             comp = Component(
                 id=f"pkg:npm/{name}@{version}" if version else f"pkg:npm/{name}",
                 name=name,
                 type=ComponentType.LIBRARY,
                 version=version,
+                properties=props,
             )
             components.append(comp)
 
@@ -144,13 +164,22 @@ def _build_findings_for_components(
     # Map by name
     comp_by_name: Dict[str, Component] = {c.name.lower(): c for c in components}
 
-    # AI and cloud components from manifests
-    for pkg, label in {**AI_PACKAGES, **CLOUD_PACKAGES}.items():
+    # AI, agent, MCP, and cloud components from manifests
+    for pkg, label in {**AI_PACKAGES, **AGENT_PACKAGES, **MCP_PACKAGES, **CLOUD_PACKAGES}.items():
         comp = comp_by_name.get(pkg)
         if not comp:
             continue
         is_ai = pkg in AI_PACKAGES
-        category_tag = "ai-library" if is_ai else "cloud-provider"
+        is_agent = pkg in AGENT_PACKAGES
+        is_mcp = pkg in MCP_PACKAGES
+        if is_agent:
+            category_tag = "ai-agent"
+        elif is_mcp:
+            category_tag = "mcp"
+        elif is_ai:
+            category_tag = "ai-library"
+        else:
+            category_tag = "cloud-provider"
 
         findings.append(
             Finding(
@@ -165,9 +194,25 @@ def _build_findings_for_components(
             )
         )
 
+    # MCP server packages from npm (@modelcontextprotocol/server-*)
+    for c in components:
+        if c.properties.get("aitrace:mcp_server"):
+            findings.append(
+                Finding(
+                    id=next_id(),
+                    title=f"MCP server package: {c.name}",
+                    category=FindingCategory.SURFACE,
+                    severity=Severity.MEDIUM,
+                    description=f"MCP server package '{c.name}' in package.json.",
+                    component_id=c.id,
+                    evidence=[Evidence(description="Detected in package.json", file=str(repo_root))],
+                    tags=["mcp-server"],
+                )
+            )
+
     # Imports without explicit manifest entries (heuristic)
     for module in imported_modules:
-        if module in AI_PACKAGES or module in CLOUD_PACKAGES:
+        if module in AI_PACKAGES or module in AGENT_PACKAGES or module in MCP_PACKAGES or module in CLOUD_PACKAGES:
             if module not in comp_by_name:
                 findings.append(
                     Finding(
@@ -194,6 +239,24 @@ def discover_surface(repo_root: Path) -> SurfaceDiscoveryResult:
     repo_root = repo_root.resolve()
     components = _scan_manifests(repo_root)
     imported_modules = _scan_python_imports(repo_root)
+    comp_by_name: Dict[str, Component] = {c.name.lower(): c for c in components}
+
+    # Add inferred components for AI/agent/MCP/cloud packages imported but not in manifests
+    all_known = {**AI_PACKAGES, **AGENT_PACKAGES, **MCP_PACKAGES, **CLOUD_PACKAGES}
+    for module in imported_modules:
+        if module in all_known and module not in comp_by_name:
+            pkg_id = f"pkg:pypi/{module}"  # inferred PyPI, no version
+            inferred = Component(
+                id=pkg_id,
+                name=module,
+                type=ComponentType.LIBRARY,
+                version=None,
+                purl=pkg_id,
+                properties={"aitrace:inferred": "import-analysis"},
+            )
+            components.append(inferred)
+            comp_by_name[module] = inferred
+
     findings = _build_findings_for_components(components, imported_modules, repo_root)
     return SurfaceDiscoveryResult(components=components, findings=findings)
 

@@ -7,7 +7,7 @@ Provides:
 - Semantic mapping of data flows for AI components.
 """
 
-from .surface import discover_surface  # noqa: F401
-from .deep import discover_deep  # noqa: F401
-from .semantic import discover_semantic  # noqa: F401
+from .surface import SurfaceDiscoveryResult, discover_surface  # noqa: F401
+from .deep import DeepDiscoveryResult, discover_deep  # noqa: F401
+from .semantic import SemanticDiscoveryResult, discover_semantic  # noqa: F401
 

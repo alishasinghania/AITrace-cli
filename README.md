@@ -23,14 +23,16 @@ pip install -r requirements.txt
 2. Initialize a policy file (optional but recommended):
 
 ```bash
-python -m AITRACE_CLI init-policy
+./run.sh init-policy
 ```
 
 3. Run a scan:
 
 ```bash
-python -m AITRACE_CLI scan . --out-dir aitrace-out
+./run.sh scan . --out-dir aitrace-out
 ```
+
+Or from the `src` directory: `python3 -m aitrace_cli scan . --out-dir aitrace-out`
 
 This will generate:
 

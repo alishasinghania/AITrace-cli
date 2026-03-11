@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
 import typer
 
+from core.architecture_detector import detect_architecture, scan_from_aibom
 from core.cli_support import find_default_policy, resolve_repo_path
 from core.engine import AITraceEngine
 from core.exporters import (
+    to_ai_component_mermaid,
     to_cyclonedx_json,
+    to_findings_json,
     to_risk_report_json,
     to_risk_report_markdown,
     to_spdx_json,
@@ -18,11 +22,12 @@ from core.exporters import (
 app = typer.Typer(help="AITrace - AI Bill of Materials and governance CLI")
 
 
-class OutputFormat(str, typer.enums.Enum):
+class OutputFormat(str, Enum):
     CYCLONEDX = "cyclonedx"
     SPDX = "spdx"
     RISK_JSON = "risk-json"
     RISK_MD = "risk-md"
+    MERMAID = "mermaid"
 
 
 @app.command()
@@ -44,10 +49,16 @@ def scan(
         help="Directory where reports will be written.",
     ),
     formats: List[OutputFormat] = typer.Option(
-        [OutputFormat.CYCLONEDX, OutputFormat.SPDX, OutputFormat.RISK_JSON],
+        [
+            OutputFormat.CYCLONEDX,
+            OutputFormat.SPDX,
+            OutputFormat.RISK_JSON,
+            OutputFormat.RISK_MD,
+            OutputFormat.MERMAID,
+        ],
         "--format",
         "-f",
-        help="Output format(s) to generate.",
+        help="Output format(s) to generate. Pass multiple -f to add; omitting -f uses all formats.",
     ),
 ) -> None:
     """
@@ -72,28 +83,42 @@ def scan(
     out_path = Path(out_dir).expanduser().resolve()
     out_path.mkdir(parents=True, exist_ok=True)
 
+    scan = scan_from_aibom(result.aibom.components, result.aibom.agent_frameworks, result.findings)
+    architecture_result = detect_architecture(scan)
+
     if OutputFormat.CYCLONEDX in formats:
-        cdx = to_cyclonedx_json(result.aibom)
+        cdx = to_cyclonedx_json(result.aibom, architecture_result)
         (out_path / "aitrace-cyclonedx.json").write_text(json.dumps(cdx, indent=2), encoding="utf-8")
         typer.echo("Wrote CycloneDX BOM.")
 
     if OutputFormat.SPDX in formats:
-        spdx = to_spdx_json(result.aibom)
+        spdx = to_spdx_json(result.aibom, architecture_result)
         (out_path / "aitrace-spdx.json").write_text(json.dumps(spdx, indent=2), encoding="utf-8")
         typer.echo("Wrote SPDX document.")
 
     if OutputFormat.RISK_JSON in formats or OutputFormat.RISK_MD in formats:
-        risk_json = to_risk_report_json(result.aibom, result.policy_report)
+        risk_json = to_risk_report_json(result.aibom, result.policy_report, result.findings, architecture_result)
         (out_path / "aitrace-risk-report.json").write_text(
             json.dumps(risk_json, indent=2),
             encoding="utf-8",
         )
         typer.echo("Wrote Enterprise Risk Report (JSON).")
+        findings_json = to_findings_json(result.findings, architecture_result)
+        (out_path / "aitrace-findings.json").write_text(
+            json.dumps(findings_json, indent=2),
+            encoding="utf-8",
+        )
+        typer.echo("Wrote findings (JSON).")
 
     if OutputFormat.RISK_MD in formats:
-        risk_md = to_risk_report_markdown(result.aibom, result.policy_report)
+        risk_md = to_risk_report_markdown(result.aibom, result.policy_report, result.findings, architecture_result)
         (out_path / "aitrace-risk-report.md").write_text(risk_md, encoding="utf-8")
         typer.echo("Wrote Enterprise Risk Report (Markdown).")
+
+    if OutputFormat.MERMAID in formats:
+        mermaid_diagram = to_ai_component_mermaid(result.aibom, architecture_result)
+        (out_path / "aitrace-component-diagram.mmd").write_text(mermaid_diagram, encoding="utf-8")
+        typer.echo("Wrote AI component diagram (Mermaid).")
 
     if result.policy_report is not None and not result.policy_report.passed:
         typer.echo("Policy violations detected. Failing build.", err=True)

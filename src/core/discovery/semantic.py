@@ -25,6 +25,19 @@ AI_CALL_NAMES = {
     "generativeai",
 }
 
+AGENT_PATTERNS = (
+    "create_react_agent",
+    "create_agent",
+    "crewagent",
+    "crew",
+    "stategraph",
+    "stategraphcompiled",
+    "assistantagent",
+    "userproxyagent",
+    "conversableagent",
+    "langgraph",
+)
+
 
 @dataclass
 class SemanticDiscoveryResult:
@@ -85,6 +98,26 @@ class _InferenceCallVisitor(ast.NodeVisitor):
                         )
                     ],
                     tags=["semantic-flow", "inference-call"],
+                )
+            )
+
+        # Agent framework patterns (LangGraph, CrewAI, AutoGen, etc.)
+        if target_name and any(p in target_name.lower() for p in AGENT_PATTERNS):
+            self.findings.append(
+                Finding(
+                    id=self.next_id(),
+                    title=f"AI agent pattern detected: {target_name}",
+                    category=FindingCategory.SEMANTIC,
+                    severity=Severity.MEDIUM,
+                    description=f"Possible agent/orchestrator usage: '{target_name}'.",
+                    evidence=[
+                        Evidence(
+                            description="Static call analysis",
+                            file=self.file_path,
+                            line=getattr(node, "lineno", None),
+                        )
+                    ],
+                    tags=["ai-agent", "semantic-flow"],
                 )
             )
 

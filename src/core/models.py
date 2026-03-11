@@ -61,6 +61,18 @@ class ModelArtifact:
 
 
 @dataclass
+class MCPServer:
+    """Discovered MCP (Model Context Protocol) server from config."""
+
+    id: str
+    name: str
+    config_path: str
+    command: Optional[str] = None
+    args: List[str] = field(default_factory=list)
+    package: Optional[str] = None
+
+
+@dataclass
 class Finding:
     id: str
     title: str
@@ -112,6 +124,8 @@ class AIBOM:
     components: List[Component] = field(default_factory=list)
     models: List[ModelArtifact] = field(default_factory=list)
     dataflows: List[DataFlowGraph] = field(default_factory=list)
+    mcp_servers: List[MCPServer] = field(default_factory=list)
+    agent_frameworks: List[str] = field(default_factory=list)  # names of detected agent packages
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

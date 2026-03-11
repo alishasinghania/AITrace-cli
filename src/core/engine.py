@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from .discovery import DeepDiscoveryResult, SemanticDiscoveryResult, SurfaceDiscoveryResult
 from .discovery import discover_deep, discover_semantic, discover_surface
+from .discovery.surface import AGENT_PACKAGES
 from .models import AIBOM, Finding, PolicyReport
 from .policy import evaluate_policy, load_policy
 
@@ -36,11 +37,17 @@ class AITraceEngine:
         # Semantic mapping
         semantic: SemanticDiscoveryResult = discover_semantic(self.repo_root)
 
+        agent_frameworks = [
+            c.name for c in surface.components
+            if c.name and c.name.lower() in AGENT_PACKAGES
+        ]
         aibom = AIBOM(
             repo_path=self.repo_root,
             components=[*surface.components, *deep.components],
             models=deep.models,
             dataflows=semantic.dataflows,
+            mcp_servers=deep.mcp_servers,
+            agent_frameworks=agent_frameworks,
         )
 
         all_findings: List[Finding] = [*surface.findings, *deep.findings, *semantic.findings]
