@@ -62,7 +62,7 @@ def _build_executive_insights(
     if dataflow_analysis and getattr(dataflow_analysis, "data_flows", None):
         security_count += sum(1 for df in dataflow_analysis.data_flows if df.risk in ("high", "medium"))
     if prompt_injection_risks and getattr(prompt_injection_risks, "prompt_injection_risks", None):
-        security_count += len(prompt_injection_risks.prompt_injection_risks)
+        security_count += len([r for r in prompt_injection_risks.prompt_injection_risks if not getattr(r, "sanitized", False)])
     if model_supply_chain:
         agg = getattr(model_supply_chain, "aggregated_models", None)
         if agg:
@@ -591,24 +591,34 @@ def to_risk_report_markdown(
         lines.append("---")
         lines.append("")
 
-    # Prompt Injection Exposure (user input → agent with tools)
+    # Prompt Injection Exposure (user input → LLM / agent with tools)
     if prompt_injection_risks:
         lines.append("## Prompt Injection Exposure")
         lines.append("")
         if prompt_injection_risks.prompt_injection_risks:
-            lines.append("User input passed to agents with tool access (potential prompt injection):")
+            unmitigated = [r for r in prompt_injection_risks.prompt_injection_risks if not getattr(r, "sanitized", False)]
+            if unmitigated:
+                lines.append("User input reaching LLM prompts or agents (potential prompt injection):")
+            else:
+                lines.append("All detected flows pass through sanitization (mitigated).")
             lines.append("")
-            lines.append("| Agent Framework | Tools | Input Source | Risk | File | Line |")
-            lines.append("|-----------------|-------|--------------|------|------|------|")
+            lines.append("| Type | Source / Evidence | Severity | Mitigated | File | Line |")
+            lines.append("|------|-------------------|----------|-----------|------|------|")
             for r in prompt_injection_risks.prompt_injection_risks[:15]:
                 line_str = str(r.line) if r.line else "—"
-                tools_str = ", ".join(r.tools[:3]) + ("…" if len(r.tools) > 3 else "")
-                risk_badge = "🔴" if r.risk == "high" else "🟠"
-                lines.append(f"| {r.agent_framework} | {tools_str} | {r.input_source} | {risk_badge} {r.risk} | `{r.file}` | {line_str} |")
+                rtype = getattr(r, "type", "prompt_injection")
+                evidence = r.evidence or (f"{r.input_source} → agent" if r.agent_framework else f"{r.source_file} → {r.sink_file}")
+                if len(evidence) > 40:
+                    evidence = evidence[:37] + "…"
+                sev = getattr(r, "severity", r.risk) if r.risk else getattr(r, "severity", "medium")
+                risk_badge = "🔴" if sev == "high" else ("🟠" if sev == "medium" else "🟢")
+                mitigated = "✓" if getattr(r, "sanitized", False) else "—"
+                fpath = r.file or r.source_file or "—"
+                lines.append(f"| {rtype} | {evidence} | {risk_badge} {sev} | {mitigated} | `{fpath}` | {line_str} |")
             if len(prompt_injection_risks.prompt_injection_risks) > 15:
                 lines.append(f"| *... and {len(prompt_injection_risks.prompt_injection_risks) - 15} more* | | | | | |")
         else:
-            lines.append("No prompt injection exposure (user input → agent with tools) was detected.")
+            lines.append("No prompt injection exposure (user input → LLM or agent) was detected.")
         lines.append("")
         lines.append("---")
         lines.append("")

@@ -209,12 +209,15 @@ def compute_risk_score(
     has_prompt_injection = False
     if prompt_injection_risks and getattr(prompt_injection_risks, "prompt_injection_risks", None):
         risks = prompt_injection_risks.prompt_injection_risks
-        if risks:
+        unmitigated = [r for r in risks if not getattr(r, "sanitized", False)]
+        if unmitigated:
             has_prompt_injection = True
             exec_score += 20
             exec_factors.append(
-                f"Prompt injection exposure: user input to agent with tools ({len(risks)} risk(s))"
+                f"Prompt injection exposure: user input to agent/LLM ({len(unmitigated)} risk(s))"
             )
+        if risks and len(unmitigated) < len(risks):
+            exec_factors.append(f"Mitigated: {len(risks) - len(unmitigated)} flow(s) pass through sanitization")
     if has_agents and not has_prompt_injection:
         exec_score += 15
         exec_factors.append("AI agent frameworks (LangChain, LangGraph, etc.)")

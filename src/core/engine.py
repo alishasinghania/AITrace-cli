@@ -76,7 +76,7 @@ class AITraceEngine:
         dataflow_analysis = analyze_dataflows(self.repo_root)
         sensitive_exposures = analyze_sensitive_exposures(self.repo_root)
         model_supply_chain = analyze_model_supply_chain(self.repo_root, policy_path=policy_path)
-        prompt_injection_risks = analyze_prompt_injection(self.repo_root)
+        prompt_injection_risks = analyze_prompt_injection(self.repo_root, dataflow_analysis=dataflow_analysis)
         repo_type = classify_repository(self.repo_root)
 
         return AnalysisResult(

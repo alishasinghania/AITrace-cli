@@ -45,15 +45,21 @@ SOURCE_RISK: Dict[str, str] = {
 # Source patterns: (chain_patterns, source_type)
 # source_type must be a key in SOURCE_RISK; risk is derived via SOURCE_RISK.get(source_type)
 SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
+    # HTTP request user input
     (["request", "json"], "user_input"),
     (["request", "args"], "user_input"),
     (["request", "form"], "user_input"),
     (["request", "data"], "user_input"),
     (["request", "get_json"], "user_input"),
+    (["request", "files"], "user_input"),  # file uploads
+    (["request", "get_data"], "user_input"),
     (["flask", "request", "json"], "user_input"),
     (["flask", "request", "args"], "user_input"),
+    (["flask", "request", "form"], "user_input"),
+    (["flask", "request", "files"], "user_input"),
     (["input"], "user_input"),
     (["sys", "argv"], "user_input"),
+    # Database fields
     (["cursor", "execute"], "external_api"),
     (["session", "query"], "external_api"),
     (["fetchall"], "external_api"),
@@ -84,26 +90,44 @@ SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
 # Sink patterns: (chain_contains, sink_label)
 # Full chain must contain these for a match
 SINK_PATTERNS: List[Tuple[List[str], str]] = [
-    (["openai", "chat", "completions", "create"], "openai.chat.completions.create"),
-    (["openai", "completion", "create"], "openai.Completion.create"),
     (["openai", "chat", "completions", "create"], "openai.ChatCompletion.create"),
+    (["client", "chat", "completions", "create"], "client.chat.completions.create"),
+    (["openai", "completion", "create"], "openai.Completion.create"),
     (["openai", "completions", "create"], "openai.completions.create"),
     (["anthropic", "messages", "create"], "anthropic.messages.create"),
-    (["anthropic", "messages", "create"], "Anthropic.client.messages.create"),
+    (["anthropic", "client", "messages", "create"], "anthropic.client.messages.create"),
     (["cohere", "chat", "create"], "cohere.chat.create"),
     (["cohere", "generate"], "cohere.generate"),
-    (["invoke"], "LangChain LLM invoke"),  # llm.invoke - need chain context
+    (["run"], "LangChain LLMChain.run"),  # chain.run()
+    (["invoke"], "LangChain LLM invoke"),
+    (["query"], "llama_index query_engine"),  # query_engine.query()
     (["chat", "completions", "create"], "openai.ChatCompletion"),
     (["messages", "create"], "Anthropic messages.create"),
-    (["query"], "llama_index query"),  # index.query
-    (["chat"], "llama_index chat"),   # index.chat - may overlap, refine by chain
-    (["pipeline"], "transformers pipeline"),  # pipeline("text-generation")
+    (["pipeline"], "transformers pipeline"),
     (["generate"], "LLM generate"),
     (["create"], "LLM create"),
 ]
 
 # Refined sink: require chain to contain provider indicators for generic names
-SINK_PROVIDER_INDICATORS = {"openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral", "litellm", "llm", "chat", "completion", "messages", "completions"}
+SINK_PROVIDER_INDICATORS = {"openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral", "litellm", "llm", "chat", "completion", "messages", "completions", "chain", "index", "query_engine"}
+
+# Sanitization functions: call chain pattern -> True if sanitizes
+# When tainted_var is passed to these, the result is considered sanitized (mitigated)
+SANITIZATION_PATTERNS: List[List[str]] = [
+    ["escape"],
+    ["sanitize"],
+    ["strip_html"],
+    ["guardrails", "validate"],
+    ["guardrails", "apply"],
+    ["prompt_guard"],
+    ["moderation"],
+    ["input_validation"],
+    ["validate_input"],
+    ["clean_input"],
+    ["html", "escape"],
+    ["bleach", "clean"],
+    ["markupsafe", "escape"],
+]
 
 
 def _chain_matches(chain: List[str], pattern: List[str]) -> bool:
@@ -133,15 +157,17 @@ class DataFlow:
     line: Optional[int]
     risk: str
     source_line: Optional[int] = None
+    sanitized: bool = False  # True when input passed through sanitization before sink
 
     def to_dict(self) -> dict:
         return {
             "source": self.source,
-            "source_type": self.source,  # Source type used for risk classification
+            "source_type": self.source,
             "sink": self.sink,
             "file": self.file,
             "line": self.line,
-            "risk": self.risk,  # Derived from SOURCE_RISK.get(source_type)
+            "risk": self.risk,
+            "sanitized": self.sanitized,
         }
 
 
@@ -236,6 +262,17 @@ def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _is_sanitization_call(node: ast.Call) -> bool:
+    """Return True if this call is a sanitization function (escape, sanitize, guardrails, etc.)."""
+    chain = _get_call_chain(node)
+    chain_lower = ".".join(c.lower() for c in chain)
+    for pattern in SANITIZATION_PATTERNS:
+        pat_str = ".".join(p.lower() for p in pattern)
+        if pat_str in chain_lower or _chain_matches(chain, pattern):
+            return True
+    return False
+
+
 def _is_sink_call(node: ast.Call) -> Optional[str]:
     """Return sink label if node is an LLM sink."""
     chain = _get_call_chain(node)
@@ -244,7 +281,7 @@ def _is_sink_call(node: ast.Call) -> Optional[str]:
     for pattern, label in SINK_PATTERNS:
         if not _chain_matches(chain, pattern):
             continue
-        if pattern in (["invoke"], ["query"], ["chat"]):
+        if pattern in (["invoke"], ["query"], ["chat"], ["run"]):
             if chain_set & (SINK_PROVIDER_INDICATORS | {"llm", "chain", "index", "retriever", "agent"}):
                 return label
         else:
@@ -264,24 +301,36 @@ def _names_in_expr(node: ast.expr) -> Set[str]:
 
 
 class _TaintVisitor(ast.NodeVisitor):
-    """Per-function taint analysis visitor."""
+    """Per-function taint analysis visitor with sanitization tracking."""
 
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.tainted: Dict[str, Tuple[str, str, Optional[int]]] = {}  # var -> (source, risk, line)
+        self.sanitized: Set[str] = set()  # vars that passed through sanitization (mitigated)
         self.flows: List[DataFlow] = []
         self._in_function = False
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._in_function = True
         func_tainted = dict(self.tainted)
+        func_sanitized = set(self.sanitized)
         self.generic_visit(node)
         self.tainted = func_tainted
+        self.sanitized = func_sanitized
         self._in_function = False
 
     def visit_Assign(self, node: ast.Assign) -> None:
         targets = _get_assign_targets(node)
         if not targets:
+            self.generic_visit(node)
+            return
+
+        # Check for sanitization: target = sanitize(tainted_var)
+        if isinstance(node.value, ast.Call) and _is_sanitization_call(node.value):
+            refs = _names_in_expr(node.value)
+            if refs & set(self.tainted.keys()) and not (refs & self.sanitized):
+                for t in targets:
+                    self.sanitized.add(t)
             self.generic_visit(node)
             return
 
@@ -291,15 +340,24 @@ class _TaintVisitor(ast.NodeVisitor):
             line = getattr(node, "lineno", None)
             for t in targets:
                 self.tainted[t] = (label, risk, line)
+                self.sanitized.discard(t)  # Fresh source is not sanitized
         else:
             refs = _names_in_expr(node.value)
+            had_tainted = False
+            had_sanitized = False
             for r in refs:
                 if r in self.tainted:
+                    had_tainted = True
                     label, risk, _ = self.tainted[r]
                     line = getattr(node, "lineno", None)
                     for t in targets:
                         self.tainted[t] = (label, risk, line)
                     break
+                if r in self.sanitized:
+                    had_sanitized = True
+            if had_sanitized and not had_tainted:
+                for t in targets:
+                    self.sanitized.add(t)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -310,6 +368,7 @@ class _TaintVisitor(ast.NodeVisitor):
                 for r in refs:
                     if r in self.tainted:
                         src_label, risk, src_line = self.tainted[r]
+                        is_sanitized = r in self.sanitized
                         self.flows.append(DataFlow(
                             source=src_label,
                             sink=sink_label,
@@ -317,6 +376,7 @@ class _TaintVisitor(ast.NodeVisitor):
                             line=getattr(node, "lineno", None),
                             risk=risk,
                             source_line=src_line,
+                            sanitized=is_sanitized,
                         ))
                         break
             for kw in node.keywords:
@@ -324,6 +384,7 @@ class _TaintVisitor(ast.NodeVisitor):
                 for r in refs:
                     if r in self.tainted:
                         src_label, risk, src_line = self.tainted[r]
+                        is_sanitized = r in self.sanitized
                         self.flows.append(DataFlow(
                             source=src_label,
                             sink=sink_label,
@@ -331,6 +392,7 @@ class _TaintVisitor(ast.NodeVisitor):
                             line=getattr(node, "lineno", None),
                             risk=risk,
                             source_line=src_line,
+                            sanitized=is_sanitized,
                         ))
                         break
         self.generic_visit(node)
