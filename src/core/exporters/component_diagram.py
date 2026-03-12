@@ -17,9 +17,19 @@ if TYPE_CHECKING:
 AI_API_SDKS = {"openai", "anthropic", "cohere", "google-generativeai", "vertexai", "mistralai", "litellm"}
 LOCAL_ML = {"transformers", "accelerate", "diffusers", "vllm"}
 CLOUD = {"boto3", "google-cloud", "google-cloud-aiplatform", "azure-ai", "azure-core", "azure-identity"}
-AI_ORCHESTRATION = {"langchain", "langchain-community", "llama-index", "litellm"}
-AGENT_FRAMEWORKS = {"langgraph", "crewai", "autogen", "semantic-kernel", "semantic_kernel", "haystack"}
-ALL_AI_CLOUD = AI_API_SDKS | LOCAL_ML | CLOUD | AI_ORCHESTRATION
+AI_ORCHESTRATION = {
+    "langchain", "langchain-community", "llama-index", "litellm",
+    "llama-index-core", "llama_index_core",
+    "haystack-ai", "ragas", "ragstack", "gpt-index", "gpt_index",
+}
+RAG_FRAMEWORKS = {"llama-index", "llama-index-core", "llama_index_core", "haystack", "haystack-ai", "ragas", "ragstack", "gpt-index"}
+AGENT_FRAMEWORKS = {
+    "langchain", "langchain-community", "langchain-core",
+    "langgraph", "crewai", "autogen", "semantic-kernel", "semantic_kernel",
+    "haystack", "smolagents", "marvin", "superagi", "babyagi",
+}
+AGENT_TOOLS = {"duckduckgo-search", "duckduckgo_search", "playwright", "gitpython", "selenium"}
+ALL_AI_CLOUD = AI_API_SDKS | LOCAL_ML | CLOUD | AI_ORCHESTRATION | AGENT_TOOLS
 
 
 def _sanitize_id(name: str) -> str:
@@ -67,6 +77,8 @@ def to_ai_component_mermaid(aibom: AIBOM, architecture_result: Optional["Archite
             ai_components.append(c)
         elif name_lower in AGENT_FRAMEWORKS:
             ai_components.append(c)  # Agent frameworks go in AI section
+        elif name_lower in AGENT_TOOLS:
+            ai_components.append(c)  # Agent tools (web search, browser, git)
         elif c.properties.get("aitrace:mcp_server"):
             ai_components.append(c)  # MCP server packages
         elif name_lower in CLOUD or "azure" in name_lower or "google" in name_lower or "boto" in name_lower:

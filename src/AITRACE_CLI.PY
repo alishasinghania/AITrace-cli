@@ -86,7 +86,13 @@ def scan(
     architecture_result = infer_architecture(result.aibom.repo_path, result.aibom)
 
     if OutputFormat.CYCLONEDX in formats:
-        cdx = to_cyclonedx_json(result.aibom, architecture_result)
+        cdx = to_cyclonedx_json(
+            result.aibom,
+            architecture_result=architecture_result,
+            findings=result.findings,
+            llm_usage=result.llm_usage,
+            model_supply_chain=result.model_supply_chain,
+        )
         (out_path / "aitrace-cyclonedx.json").write_text(json.dumps(cdx, indent=2), encoding="utf-8")
         typer.echo("Wrote CycloneDX BOM.")
 

@@ -39,6 +39,7 @@ def _build_executive_insights(
         "unique_llm_invocation_patterns": 0,
         "rag_pipelines_detected": 0,
         "agent_frameworks_detected": len(aibom.agent_frameworks or []),
+        "agent_tools_detected": len(getattr(aibom, "agent_tools", None) or []),
         "potential_security_issues": 0,
     }
 
@@ -98,6 +99,7 @@ def _build_summary_with_llm(
         "finding_count": len(findings),
         "mcp_server_count": len(aibom.mcp_servers),
         "agent_framework_count": len(aibom.agent_frameworks),
+        "agent_tool_count": len(getattr(aibom, "agent_tools", None) or []),
         "executive_insights": insights,
     }
     if llm_usage:
@@ -256,6 +258,7 @@ def to_risk_report_json(
             for m in aibom.mcp_servers
         ],
         "agent_frameworks": aibom.agent_frameworks,
+        "agent_tools": getattr(aibom, "agent_tools", None) or [],
         "models": [
             {
                 "id": m.id,
@@ -407,6 +410,8 @@ def to_risk_report_markdown(
         toc_sections.append("MCP Servers")
     if aibom.agent_frameworks:
         toc_sections.append("Agent Frameworks")
+    if getattr(aibom, "agent_tools", None):
+        toc_sections.append("Agent Tools")
     if aibom.components or aibom.models:
         toc_sections.append("AI Component Architecture")
     if aibom.components:
@@ -443,7 +448,8 @@ def to_risk_report_markdown(
     has_any = any(
         insights[k] for k in (
             "ai_components_detected", "unique_llm_invocation_patterns",
-            "rag_pipelines_detected", "agent_frameworks_detected", "potential_security_issues"
+            "rag_pipelines_detected", "agent_frameworks_detected",
+            "agent_tools_detected", "potential_security_issues"
         )
     )
     if has_any:
@@ -455,6 +461,12 @@ def to_risk_report_markdown(
         if aibom.agent_frameworks:
             af_str += f" ({', '.join(aibom.agent_frameworks)})"
         lines.append("- **Agent frameworks detected:** " + af_str)
+        at_count = insights.get("agent_tools_detected", len(getattr(aibom, "agent_tools", None) or []))
+        at_list = getattr(aibom, "agent_tools", None) or []
+        at_str = str(at_count)
+        if at_list:
+            at_str += f" ({', '.join(at_list)})"
+        lines.append("- **Agent tools detected:** " + at_str)
         lines.append("- **Potential security issues:** " + str(insights["potential_security_issues"]))
         if arch and arch.architecture_types and arch.architecture_types != ["Unknown"]:
             lines.append(f"- **Inferred architecture:** {', '.join(arch.architecture_types)}")
@@ -687,6 +699,17 @@ def to_risk_report_markdown(
         lines.append("")
         for af in aibom.agent_frameworks:
             lines.append(f"- **{af}**")
+        lines.append("")
+
+    # Agent Tools
+    agent_tools = getattr(aibom, "agent_tools", None) or []
+    if agent_tools:
+        lines.append("## Agent Tools")
+        lines.append("")
+        lines.append("Packages used as agent tools (web search, browser automation, git, etc.):")
+        lines.append("")
+        for at in agent_tools:
+            lines.append(f"- **{at}**")
         lines.append("")
 
     # AI Component Architecture diagram

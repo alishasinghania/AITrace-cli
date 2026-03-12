@@ -10,7 +10,7 @@ from .prompt_injection_detector import PromptInjectionResult, analyze_prompt_inj
 from .sensitive_data_detector import SensitiveExposureResult, analyze_sensitive_exposures
 from .discovery import DeepDiscoveryResult, SemanticDiscoveryResult, SurfaceDiscoveryResult
 from .discovery import discover_deep, discover_semantic, discover_surface
-from .discovery.surface import AGENT_PACKAGES
+from .discovery.surface import AGENT_PACKAGES, AGENT_TOOL_PACKAGES
 from .models import AIBOM, Finding, PolicyReport
 from .policy import evaluate_policy, load_policy
 from .repo_classifier import classify_repository
@@ -52,6 +52,10 @@ class AITraceEngine:
             c.name for c in surface.components
             if c.name and c.name.lower() in AGENT_PACKAGES
         ]
+        agent_tools = [
+            c.name for c in surface.components
+            if c.name and c.name.lower().replace("-", "_") in AGENT_TOOL_PACKAGES
+        ]
         aibom = AIBOM(
             repo_path=self.repo_root,
             components=[*surface.components, *deep.components],
@@ -59,6 +63,7 @@ class AITraceEngine:
             dataflows=semantic.dataflows,
             mcp_servers=deep.mcp_servers,
             agent_frameworks=agent_frameworks,
+            agent_tools=agent_tools,
         )
 
         all_findings: List[Finding] = [*surface.findings, *deep.findings, *semantic.findings]

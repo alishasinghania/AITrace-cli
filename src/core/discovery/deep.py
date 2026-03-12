@@ -17,7 +17,7 @@ from ..models import (
 )
 
 
-MODEL_EXTENSIONS = {".pt", ".bin", ".safetensors", ".onnx", ".pb"}
+MODEL_EXTENSIONS = {".pt", ".bin", ".safetensors", ".onnx", ".pb", ".gguf", ".ggml"}
 CONFIG_FILENAMES = {"config.json", "model_config.json"}
 MCP_CONFIG_PATHS = (".cursor/mcp.json", "mcp.json", ".mcp.json")
 # Path parts that indicate non-model .bin files (Flutter/Dart, etc.)

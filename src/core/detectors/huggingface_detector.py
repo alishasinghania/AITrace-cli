@@ -23,7 +23,7 @@ HF_AST_PATTERNS = {
 }
 # "pipeline" alone matches redis.pipeline; require explicit HF context
 HF_PIPELINE_REQUIRED = {"transformers", "diffusers", "from_pretrained"}
-MODEL_EXTENSIONS = {".pt", ".bin", ".safetensors", ".onnx", ".pb"}
+MODEL_EXTENSIONS = {".pt", ".bin", ".safetensors", ".onnx", ".pb", ".gguf", ".ggml"}
 CONFIG_NAMES = {"config.json", "model_config.json"}
 
 

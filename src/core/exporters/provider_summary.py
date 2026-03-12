@@ -21,6 +21,12 @@ PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
     "generativeai": "Google Generative AI",
     "huggingface": "Hugging Face",
     "transformers": "Hugging Face",
+    "ollama": "Ollama",
+    "ai21": "AI21 Labs",
+    "fireworks": "Fireworks AI",
+    "fireworks-ai": "Fireworks AI",
+    "aleph_alpha": "Aleph Alpha",
+    "aleph-alpha-client": "Aleph Alpha",
     "client": "Client (generic)",  # openai.Client, anthropic.Client - ambiguous
 }
 
@@ -33,6 +39,12 @@ PROVIDER_ORDER = (
     "mistralai",
     "vertexai",
     "generativeai",
+    "ollama",
+    "ai21",
+    "fireworks",
+    "fireworks-ai",
+    "aleph_alpha",
+    "aleph-alpha-client",
     "huggingface",
     "transformers",
     "client",

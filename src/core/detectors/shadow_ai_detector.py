@@ -25,8 +25,17 @@ AI_API_MODULE_TO_PACKAGES: Dict[str, Set[str]] = {
     "cohere": {"cohere"},
     "vertexai": {"vertexai", "google-cloud-aiplatform"},
     "generativeai": {"google-generativeai", "generativeai"},
+    "genai": {"google-generativeai", "generativeai"},
     "mistral": {"mistralai", "mistral"},
     "litellm": {"litellm"},
+    "replicate": {"replicate"},
+    "together": {"together"},
+    "fireworks": {"fireworks", "fireworks-ai"},
+    "groq": {"groq"},
+    "ai21": {"ai21"},
+    "aleph_alpha": {"aleph-alpha-client"},
+    "perplexity": {"perplexity"},
+    "ollama": {"ollama"},
     # AWS Bedrock via boto3
     "bedrock": {"boto3"},
 }
@@ -34,11 +43,15 @@ AI_API_MODULE_TO_PACKAGES: Dict[str, Set[str]] = {
 # Package names that indicate a framework repo (skip Shadow AI detection)
 FRAMEWORK_PACKAGE_NAMES = frozenset({
     "llama-index", "llama_index", "llamaindex",
+    "llama-index-core", "llama_index_core", "gpt-index", "gpt_index",
     "langchain", "langchain-core", "langchain-community",
+    "langgraph", "langgraph-sdk",
     "haystack", "haystack-ai",
+    "ragas", "ragstack",
     "semantic-kernel", "semantic_kernel",
     "crewai", "crewai-tools",
     "autogen", "litellm",  # litellm is a proxy/framework
+    "smolagents", "marvin", "superagi", "babyagi",
 })
 
 
@@ -198,7 +211,15 @@ def _get_ai_api_usage_in_code(repo_root: Path) -> Dict[str, List[Tuple[str, Opti
 
     scan_ast(repo_root, visit)
 
-    # Also scan imports
+    def _extract_str_arg(arg: ast.AST) -> Optional[str]:
+        """Extract string from ast.Constant or ast.Str (for dynamic import args)."""
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if hasattr(ast, "Str") and isinstance(arg, ast.Str):
+            return arg.s
+        return None
+
+    # Also scan imports and dynamic imports
     for path in walk_python_files(repo_root):
         try:
             rel = str(path.relative_to(repo_root))
@@ -208,9 +229,12 @@ def _get_ai_api_usage_in_code(repo_root: Path) -> Dict[str, List[Tuple[str, Opti
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    mod = alias.name.split(".")[0].lower()
+                    full_mod = alias.name.lower()
+                    mod = full_mod.split(".")[0]
                     if mod in AI_API_MODULE_TO_PACKAGES:
                         _add(mod, rel, getattr(node, "lineno", None))
+                    elif "generativeai" in full_mod or "genai" in full_mod:
+                        _add("generativeai", rel, getattr(node, "lineno", None))
             elif isinstance(node, ast.ImportFrom) and node.module:
                 mod = node.module.split(".")[0].lower()
                 if mod in AI_API_MODULE_TO_PACKAGES:
@@ -218,6 +242,26 @@ def _get_ai_api_usage_in_code(repo_root: Path) -> Dict[str, List[Tuple[str, Opti
                 elif "generativeai" in node.module.lower():
                     _add("generativeai", rel, getattr(node, "lineno", None))
                 elif "vertexai" in node.module.lower():
+                    _add("vertexai", rel, getattr(node, "lineno", None))
+            elif isinstance(node, ast.Call):
+                # Dynamic imports: __import__("openai"), importlib.import_module("anthropic")
+                is_dynamic_import = False
+                if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+                    is_dynamic_import = True
+                elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                    if node.func.value.id == "importlib" and node.func.attr == "import_module":
+                        is_dynamic_import = True
+                if not is_dynamic_import or not node.args:
+                    continue
+                mod_str = _extract_str_arg(node.args[0])
+                if not mod_str:
+                    continue
+                first = mod_str.split(".")[0].lower()
+                if first in AI_API_MODULE_TO_PACKAGES:
+                    _add(first, rel, getattr(node, "lineno", None))
+                elif "generativeai" in mod_str.lower() or "genai" in mod_str.lower():
+                    _add("generativeai", rel, getattr(node, "lineno", None))
+                elif "vertexai" in mod_str.lower():
                     _add("vertexai", rel, getattr(node, "lineno", None))
 
     return used

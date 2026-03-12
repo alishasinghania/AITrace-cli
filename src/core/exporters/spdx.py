@@ -81,5 +81,8 @@ def to_spdx_json(aibom: AIBOM, architecture_result: Optional["ArchitectureResult
         doc["aitrace"] = {
             "architecture": architecture_result.to_dict(),
         }
+    agent_tools = getattr(aibom, "agent_tools", None) or []
+    if agent_tools:
+        doc.setdefault("aitrace", {})["agent_tools"] = agent_tools
     return doc
 

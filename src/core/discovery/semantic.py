@@ -50,7 +50,7 @@ SEMANTIC_PATTERNS: List[Tuple[Set[str], str, str]] = [
 ]
 # LLM: generic "create"/"invoke" need chain context; provider names are direct matches
 SEMANTIC_LLM_TARGETS = {"chat", "complete", "create", "invoke", "generate", "messages"}
-SEMANTIC_LLM_CHAIN_REQUIRED = {"openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai", "bedrock", "litellm", "chat", "completion", "messages"}
+SEMANTIC_LLM_CHAIN_REQUIRED = {"openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai", "bedrock", "litellm", "ollama", "ai21", "fireworks", "aleph_alpha", "chat", "completion", "messages"}
 
 # Targets that are NOT LLM inference (config, reflection, embeddings, UI)
 LLM_TARGET_BLOCKLIST = frozenset({
@@ -74,7 +74,7 @@ LLM_BARE_SELF_CHAT = ("self", "chat")  # chain for self.chat (no llm/client)
 
 # Known LLM providers - for strict matching of generic targets
 LLM_KNOWN_PROVIDERS = frozenset(
-    {"openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai", "bedrock", "litellm"}
+    {"openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai", "bedrock", "litellm", "ollama", "ai21", "fireworks", "aleph_alpha"}
 )
 # Agent: require framework in chain to avoid create_agent_task, create_agent_card
 SEMANTIC_AGENT_SPECIFIC = {"create_react_agent", "stategraph", "crewagent", "crew", "assistantagent", "userproxyagent", "conversableagent"}

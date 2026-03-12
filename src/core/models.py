@@ -158,6 +158,7 @@ class AIBOM:
     dataflows: List[DataFlowGraph] = field(default_factory=list)
     mcp_servers: List[MCPServer] = field(default_factory=list)
     agent_frameworks: List[str] = field(default_factory=list)  # names of detected agent packages
+    agent_tools: List[str] = field(default_factory=list)  # names of detected agent tool packages
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
