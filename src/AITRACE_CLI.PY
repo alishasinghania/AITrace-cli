@@ -7,7 +7,6 @@ from typing import List, Optional
 
 import typer
 
-from core.architecture_inference import infer_architecture
 from core.cli_support import find_default_policy, resolve_repo_path
 from core.engine import AITraceEngine
 from core.exporters import (
@@ -83,7 +82,7 @@ def scan(
     out_path = Path(out_dir).expanduser().resolve()
     out_path.mkdir(parents=True, exist_ok=True)
 
-    architecture_result = infer_architecture(result.aibom.repo_path, result.aibom)
+    architecture_result = result.architecture_result
 
     if OutputFormat.CYCLONEDX in formats:
         cdx = to_cyclonedx_json(
@@ -119,6 +118,8 @@ def scan(
             result.prompt_injection_risks,
             result.llm_usage,
             result.repo_type,
+            architecture_graph=result.architecture_graph,
+            attack_path_findings=result.attack_path_findings,
         )
         (out_path / "aitrace-risk-report.json").write_text(
             json.dumps(risk_json, indent=2),
@@ -144,6 +145,8 @@ def scan(
             result.prompt_injection_risks,
             result.llm_usage,
             result.repo_type,
+            architecture_graph=result.architecture_graph,
+            attack_path_findings=result.attack_path_findings,
         )
         (out_path / "aitrace-risk-report.md").write_text(risk_md, encoding="utf-8")
         typer.echo("Wrote Enterprise Risk Report (Markdown).")
@@ -152,6 +155,17 @@ def scan(
         mermaid_diagram = to_ai_component_mermaid(result.aibom, architecture_result)
         (out_path / "aitrace-component-diagram.mmd").write_text(mermaid_diagram, encoding="utf-8")
         typer.echo("Wrote AI component diagram (Mermaid).")
+    if result.architecture_graph and (OutputFormat.RISK_JSON in formats or OutputFormat.RISK_MD in formats):
+        from core.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
+        (out_path / "aitrace-architecture-graph.json").write_text(
+            architecture_graph_to_json(result.architecture_graph),
+            encoding="utf-8",
+        )
+        (out_path / "aitrace-architecture-graph.mmd").write_text(
+            architecture_graph_to_mermaid(result.architecture_graph),
+            encoding="utf-8",
+        )
+        typer.echo("Wrote AI architecture graph (JSON and Mermaid).")
 
     if result.policy_report is not None and not result.policy_report.passed:
         typer.echo("Policy violations detected. Failing build.", err=True)

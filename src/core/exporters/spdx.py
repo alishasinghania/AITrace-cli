@@ -75,11 +75,21 @@ def _cdx_to_spdx_artifact(cdx: Dict[str, Any], spdx_id: str) -> Dict[str, Any]:
     author = cdx.get("author")
     if author:
         elem["originatedBy"] = [{"type": "Person", "name": author}]
+    # Include SHA256 hash when present (from ModelArtifact.config)
+    hashes = cdx.get("hashes", [])
+    if hashes:
+        elem["hashes"] = hashes
     # Evidence in comment
     props = cdx.get("properties", [])
     ev_parts = [f"{p.get('name')}: {p.get('value')}" for p in props if "evidence" in str(p.get("name", "")).lower()]
     if ev_parts:
         elem["comment"] = " | ".join(ev_parts[:4])
+    # Include model sha256 when present (from CycloneDX hashes)
+    hashes = cdx.get("hashes", [])
+    for h in hashes:
+        if h.get("alg") == "SHA-256" and h.get("content"):
+            elem["contentIdentifier"] = f"sha256:{h['content']}"
+            break
     return elem
 
 

@@ -43,6 +43,12 @@ RETRIEVAL_PATTERNS = {
     "similarity_search", "as_retriever", "max_marginal_relevance",
     "Retriever", "retrieve", "VectorStoreRetriever",
 }
+# Document loaders (LangChain, LlamaIndex) - URL/user path → possible RAG poisoning
+DOCUMENT_LOADER_PATTERNS = {
+    "PDFLoader", "SimpleDirectoryReader", "CSVLoader", "WebBaseLoader",
+    "UnstructuredFileLoader", "DirectoryLoader", "PyPDFLoader",
+    "TextLoader", "Docx2txtLoader", "read_file", "load_data",
+}
 LLM_PATTERNS = {
     "chat", "complete", "create", "invoke", "generate", "messages",
     "ChatOpenAI", "ChatAnthropic", "ChatVertexAI", "BedrockChat",
@@ -86,6 +92,19 @@ def detect_rag(repo_root: Path) -> DetectionResult:
     retrievals: List[str] = []
     llms: List[str] = []
     rag_frameworks: List[str] = []
+    document_loaders: List[str] = []
+    possible_rag_poisoning_flag: List[bool] = [False]  # use list for mutability in closure
+
+    def _arg_suggests_external_or_user(call: ast.Call) -> bool:
+        """True if loader gets URL or user-provided path (variable, not constant)."""
+        if not call.args:
+            return False
+        first = call.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return "http://" in first.value or "https://" in first.value
+        if isinstance(first, ast.Name):
+            return True  # variable = user-provided
+        return False
 
     def visit(call: ast.Call, file_path: str, line: Optional[int]) -> None:
         target = get_call_target(call)
@@ -123,6 +142,12 @@ def detect_rag(repo_root: Path) -> DetectionResult:
             if chain_lower & LLM_CHAIN_KEYWORDS:
                 seen.add(full)
                 llms.append(full)
+        elif _matches(target, DOCUMENT_LOADER_PATTERNS) or _matches(full, DOCUMENT_LOADER_PATTERNS):
+            if full not in seen:
+                seen.add(full)
+                document_loaders.append(full)
+            if _arg_suggests_external_or_user(call):
+                possible_rag_poisoning_flag[0] = True
 
     scan_ast(repo_root, visit)
 
@@ -144,55 +169,53 @@ def detect_rag(repo_root: Path) -> DetectionResult:
 
     if has_embed and has_vector and has_llm:
         confidence = "high" if (has_retrieval and len(evidence) >= 4) else "medium"
+        details: dict = {
+            "detected": True,
+            "embeddings": embeddings,
+            "vector_stores": vector_stores,
+            "llms": llms,
+        }
+        if document_loaders:
+            details["document_loaders"] = document_loaders
+        if possible_rag_poisoning_flag[0]:
+            details["possible_rag_poisoning"] = True
         return DetectionResult(
             component="RAG",
             confidence=confidence,
             evidence=evidence or ["RAG pattern inferred from components"],
-            details={
-                "detected": True,
-                "embeddings": embeddings,
-                "vector_stores": vector_stores,
-                "llms": llms,
-            },
+            details=details,
         )
+    base_details: dict = {
+        "embeddings": embeddings,
+        "vector_stores": vector_stores,
+        "llms": llms,
+    }
+    if document_loaders:
+        base_details["document_loaders"] = document_loaders
+    if possible_rag_poisoning_flag[0]:
+        base_details["possible_rag_poisoning"] = True
+
     # Partial RAG patterns (embedding/vector + LLM without full stack)
     if has_embed and has_llm and not has_vector:
         return DetectionResult(
             component="Embedding + LLM (Partial RAG)",
             confidence="medium",
             evidence=evidence or ["Embedding and LLM detected; no vector store"],
-            details={
-                "detected": True,
-                "has_vector_store": False,
-                "embeddings": embeddings,
-                "vector_stores": [],
-                "llms": llms,
-            },
+            details={"detected": True, "has_vector_store": False, "embeddings": embeddings, "vector_stores": [], "llms": llms, **base_details},
         )
     if has_vector and has_llm and not has_embed:
         return DetectionResult(
             component="Vector Store + LLM (Partial RAG)",
             confidence="medium",
             evidence=evidence or ["Vector store and LLM detected; no embeddings"],
-            details={
-                "detected": True,
-                "has_embeddings": False,
-                "embeddings": [],
-                "vector_stores": vector_stores,
-                "llms": llms,
-            },
+            details={"detected": True, "has_embeddings": False, "embeddings": [], "vector_stores": vector_stores, "llms": llms, **base_details},
         )
     if (has_embed or has_vector) and has_llm:
         return DetectionResult(
             component="RAG",
             confidence="low",
             evidence=evidence or ["Partial RAG pattern (embedding/vector + LLM)"],
-            details={
-                "detected": True,
-                "embeddings": embeddings,
-                "vector_stores": vector_stores,
-                "llms": llms,
-            },
+            details={"detected": True, "embeddings": embeddings, "vector_stores": vector_stores, "llms": llms, **base_details},
         )
 
     return DetectionResult(

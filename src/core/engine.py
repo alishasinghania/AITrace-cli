@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+from .architecture_graph import build_architecture_graph
+from .ai_attack_path_analyzer import analyze_attack_paths
+from .architecture_inference import ArchitectureResult, infer_architecture
 from .dataflow_analyzer import DataFlowAnalysisResult, analyze_dataflows
 from .model_supply_chain_analyzer import ModelSupplyChainResult, analyze_model_supply_chain
 from .prompt_injection_detector import PromptInjectionResult, analyze_prompt_injection
@@ -11,7 +14,7 @@ from .sensitive_data_detector import SensitiveExposureResult, analyze_sensitive_
 from .discovery import DeepDiscoveryResult, SemanticDiscoveryResult, SurfaceDiscoveryResult
 from .discovery import discover_deep, discover_semantic, discover_surface
 from .discovery.surface import AGENT_PACKAGES, AGENT_TOOL_PACKAGES
-from .models import AIBOM, Finding, PolicyReport
+from .models import AIBOM, AttackPathFinding, Finding, PolicyReport
 from .policy import evaluate_policy, load_policy
 from .repo_classifier import classify_repository
 
@@ -27,6 +30,9 @@ class AnalysisResult:
     prompt_injection_risks: Optional[PromptInjectionResult] = None
     llm_usage: Optional[dict] = None  # Dict[str, LLMPatternUsage] - deduplicated patterns
     repo_type: str = "application"  # "application" | "library" | "framework"
+    architecture_result: Optional[ArchitectureResult] = None
+    architecture_graph: Optional[dict] = None  # {nodes, edges} from build_architecture_graph
+    attack_path_findings: Optional[List[AttackPathFinding]] = None
 
 
 class AITraceEngine:
@@ -79,6 +85,15 @@ class AITraceEngine:
         prompt_injection_risks = analyze_prompt_injection(self.repo_root, dataflow_analysis=dataflow_analysis)
         repo_type = classify_repository(self.repo_root)
 
+        architecture_result = infer_architecture(self.repo_root, aibom)
+        architecture_graph = build_architecture_graph(
+            aibom,
+            dataflow_analysis=dataflow_analysis,
+            semantic_result=semantic,
+            architecture_result=architecture_result,
+        )
+        attack_path_findings = analyze_attack_paths(architecture_graph)
+
         return AnalysisResult(
             aibom=aibom,
             findings=all_findings,
@@ -89,5 +104,8 @@ class AITraceEngine:
             prompt_injection_risks=prompt_injection_risks,
             llm_usage=semantic.llm_usage,
             repo_type=repo_type,
+            architecture_result=architecture_result,
+            architecture_graph=architecture_graph,
+            attack_path_findings=attack_path_findings,
         )
 

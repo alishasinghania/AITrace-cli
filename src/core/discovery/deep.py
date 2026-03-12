@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..models import (
     Component,
@@ -17,7 +18,7 @@ from ..models import (
 )
 
 
-MODEL_EXTENSIONS = {".pt", ".bin", ".safetensors", ".onnx", ".pb", ".gguf", ".ggml"}
+MODEL_EXTENSIONS = {".pt", ".pth", ".bin", ".safetensors", ".onnx", ".pb", ".gguf", ".ggml"}
 CONFIG_FILENAMES = {"config.json", "model_config.json"}
 MCP_CONFIG_PATHS = (".cursor/mcp.json", "mcp.json", ".mcp.json")
 # Path parts that indicate non-model .bin files (Flutter/Dart, etc.)
@@ -27,6 +28,9 @@ MODEL_BIN_NAME_EXCLUDE = {"data_level0.bin", "length.bin", "link_lists.bin", "he
 # Config paths to skip (benchmark, test fixtures)
 CONFIG_PATH_EXCLUDE = {"benchmark", "classic", "forge", "agbenchmark", "original_autogpt"}
 
+# Max bytes to read for SHA256 (large models: hash first chunk + size)
+SHA256_MAX_BYTES = 1024 * 1024 * 16  # 16 MB
+
 
 @dataclass
 class DeepDiscoveryResult:
@@ -34,6 +38,22 @@ class DeepDiscoveryResult:
     components: List[Component]
     findings: List[Finding]
     mcp_servers: List[MCPServer] = field(default_factory=list)
+
+
+def _compute_sha256(path: Path, max_bytes: int = 10 * 1024 * 1024) -> Optional[str]:
+    """Compute SHA256 for file. For files > max_bytes, hash first max_bytes only."""
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            total = 0
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+                total += len(chunk)
+                if total >= max_bytes:
+                    break
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def _infer_framework_from_config(config: Dict) -> Optional[str]:
@@ -91,12 +111,18 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
             except OSError:
                 pass
 
+            sha256 = _compute_sha256(path, SHA256_MAX_BYTES)
+            artifact_config: Dict[str, Any] = {}
+            if sha256:
+                artifact_config["sha256"] = sha256
+
             artifact = ModelArtifact(
                 id=next_id("MODEL"),
                 name=rel.name,
                 path=str(rel),
                 format=path.suffix.lower().lstrip("."),
                 size_bytes=size,
+                config=artifact_config,
             )
             models.append(artifact)
 

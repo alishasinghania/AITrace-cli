@@ -194,6 +194,8 @@ def to_risk_report_json(
     prompt_injection_risks: Optional[Any] = None,
     llm_usage: Optional[Dict[str, Any]] = None,
     repo_type: Optional[str] = None,
+    architecture_graph: Optional[Dict[str, Any]] = None,
+    attack_path_findings: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Build an Enterprise Risk Report JSON document.
@@ -215,8 +217,10 @@ def to_risk_report_json(
         "repo": str(aibom.repo_path),
         "repo_type": repo_type or "application",
         "risk_score": {
+            "ai_security_score": getattr(risk_result, "ai_security_score", 100 - risk_result.total_score),
             "score": risk_result.total_score,
             "risk_level": risk_result.risk_level,
+            "top_risks": getattr(risk_result, "top_risks", [])[:5],
             "repo_type": repo_type or "application",
             "raw_score": risk_result.raw_score,
             "contributing_factors": risk_result.contributing_factors,
@@ -293,6 +297,14 @@ def to_risk_report_json(
     if policy is not None:
         report["policy"] = policy.to_dict()
 
+    if architecture_graph is not None:
+        report["ai_architecture_graph"] = architecture_graph
+    if attack_path_findings is not None:
+        report["attack_path_findings"] = [
+            f.to_dict() if hasattr(f, "to_dict") else f
+            for f in attack_path_findings
+        ]
+
     return report
 
 
@@ -334,6 +346,8 @@ def to_risk_report_markdown(
     prompt_injection_risks: Optional[Any] = None,
     llm_usage: Optional[Dict[str, Any]] = None,
     repo_type: Optional[str] = None,
+    architecture_graph: Optional[Dict[str, Any]] = None,
+    attack_path_findings: Optional[Any] = None,
 ) -> str:
     """
     Build a human-readable Enterprise Risk Report in Markdown, including

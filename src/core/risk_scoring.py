@@ -47,13 +47,16 @@ class RiskScoreResult:
     risk_level: str
     dimensions: List[RiskDimension]
     contributing_factors: List[str] = field(default_factory=list)
+    top_risks: List[str] = field(default_factory=list)  # Top 5 from contributing_factors or high-severity findings
     raw_score: Optional[int] = None  # Before repo_type multiplier, when applied
     repo_type: Optional[str] = None  # When multiplier was applied
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "ai_security_score": 100 - self.total_score,  # Higher is safer
             "score": self.total_score,
             "risk_level": self.risk_level,
+            "top_risks": self.top_risks,
             "contributing_factors": self.contributing_factors,
             "breakdown": {
                 d.name: {
@@ -288,11 +291,14 @@ def compute_risk_score(
     if applied_repo_type:
         all_factors.append(f"Repository type: {applied_repo_type} (score {raw_total} → {total})")
 
+    top_risks: List[str] = all_factors[:5]
+
     return RiskScoreResult(
         total_score=total,
         risk_level=_risk_level_from_score(total),
         dimensions=dimensions,
         contributing_factors=all_factors,
+        top_risks=top_risks,
         raw_score=raw_total if applied_repo_type else None,
         repo_type=applied_repo_type,
     )

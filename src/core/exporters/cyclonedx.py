@@ -366,6 +366,8 @@ def _build_binary_model_components(aibom: AIBOM) -> Tuple[List[Dict[str, Any]], 
         }
         if m.size_bytes is not None:
             comp_dict["properties"].append({"name": "aitrace:size_bytes", "value": str(m.size_bytes)})
+        if m.config and m.config.get("sha256"):
+            comp_dict["hashes"] = [{"alg": "SHA-256", "content": m.config["sha256"]}]
         components.append(comp_dict)
 
     return components, refs

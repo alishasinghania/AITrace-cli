@@ -40,12 +40,14 @@ AGENT_PATTERNS = {
 SANITIZATION_NAMES = frozenset({
     "escape", "sanitize", "strip_html", "guardrails", "prompt_guard",
     "moderation", "input_validation", "validate_input", "clean_input",
+    "guardrails.validate", "guardrails.apply", "html.escape", "bleach.clean", "markupsafe.escape",
 })
 
 # High-risk tools (enable prompt injection to execution)
 HIGH_RISK_TOOLS = {
     "searchtool", "browsertool", "shelltool", "pythontool", "gmailtoolspec",
     "serperapitool", "webtool", "bash", "shell", "python_repl", "code_interpreter",
+    "execute",
 }
 
 # User input variable name patterns (heuristic)

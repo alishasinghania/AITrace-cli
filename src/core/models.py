@@ -165,6 +165,24 @@ class AIBOM:
 
 
 @dataclass
+class AttackPathFinding:
+    """AI attack path discovered from architecture graph analysis."""
+
+    type: str
+    severity: str
+    path: List[str]
+    description: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "severity": self.severity,
+            "path": self.path,
+            "description": self.description,
+        }
+
+
+@dataclass
 class PolicyRuleResult:
     rule_id: str
     passed: bool
