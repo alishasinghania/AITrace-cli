@@ -97,7 +97,13 @@ def scan(
         typer.echo("Wrote CycloneDX BOM.")
 
     if OutputFormat.SPDX in formats:
-        spdx = to_spdx_json(result.aibom, architecture_result)
+        spdx = to_spdx_json(
+            result.aibom,
+            architecture_result=architecture_result,
+            findings=result.findings,
+            llm_usage=result.llm_usage,
+            model_supply_chain=result.model_supply_chain,
+        )
         (out_path / "aitrace-spdx.json").write_text(json.dumps(spdx, indent=2), encoding="utf-8")
         typer.echo("Wrote SPDX document.")
 
