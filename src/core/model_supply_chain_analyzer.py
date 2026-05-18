@@ -18,6 +18,7 @@ from .detectors._ast_utils import should_skip_path
 # Model loading patterns: (chain_pattern, arg_name_for_model_id, source_label)
 # arg_name: "0" = first positional arg, or keyword name like "repo_id"
 MODEL_LOAD_PATTERNS: List[Tuple[List[str], str, str]] = [
+    # HuggingFace — highly specific, low false-positive risk
     (["from_pretrained"], "0", "huggingface"),
     (["hf_hub_download"], "repo_id", "huggingface"),
     (["hf_hub_download"], "0", "huggingface"),
@@ -25,11 +26,17 @@ MODEL_LOAD_PATTERNS: List[Tuple[List[str], str, str]] = [
     (["snapshot_download"], "0", "huggingface"),
     (["HfApi", "download"], "repo_id", "huggingface"),
     (["huggingface_hub", "hf_hub_download"], "repo_id", "huggingface"),
+    # PyTorch — require "torch" in chain so bare load_file() doesn't match
     (["torch", "load"], "0", "torch"),
+    # safetensors — require library prefix; bare load_file() is too generic
     (["safetensors", "torch", "load_file"], "0", "safetensors"),
-    (["load_file"], "0", "safetensors"),
-    (["download_model"], "0", "generic"),
-    (["load_model"], "0", "generic"),
+    (["safetensors", "load_file"], "0", "safetensors"),
+    # Generic loaders — require AI-library prefix to avoid false positives on
+    # audio loaders, sklearn joblib, image loaders, etc.
+    (["ollama", "download_model"], "0", "generic"),
+    (["llm", "download_model"], "0", "generic"),
+    (["transformers", "load_model"], "0", "generic"),
+    (["diffusers", "load_model"], "0", "generic"),
 ]
 
 # Trusted model organizations (low risk when org/model format)
@@ -38,8 +45,16 @@ TRUSTED_MODEL_ORGS: FrozenSet[str] = frozenset({
     "google", "facebook", "meta", "meta-ai", "microsoft", "salesforce", "huggingface",
 })
 
-# Clearly not model IDs (document types, class names, variable placeholders)
-MODEL_ID_BLOCKLIST = {"fileheader", "model_name", "modelloader"}
+# Clearly not model IDs — variable placeholders, class names, test fixtures
+MODEL_ID_BLOCKLIST = {
+    "fileheader", "model_name", "modelloader",
+    # common placeholder strings in examples/tests
+    "your-model-here", "your_model", "model_id", "model-id",
+    "path/to/model", "/path/to/model", "./model", "../model",
+    "<model>", "<model_id>", "model_name_here",
+    # non-AI model identifiers
+    "3d", "cad", "mesh",
+}
 
 # URL patterns for classification
 URL_PATTERNS = {

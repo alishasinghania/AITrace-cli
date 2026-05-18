@@ -23,7 +23,7 @@ API_URL_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"api\.cohere\.(ai|com)", re.I), "cohere"),
     (re.compile(r"api\.mistral\.ai", re.I), "mistralai"),
     (re.compile(r"api\.replicate\.com", re.I), "replicate"),
-    (re.compile(r"ollama|localhost:11434", re.I), "ollama"),  # Ollama local API
+    (re.compile(r"localhost:11434|ollama[./]|[\"']ollama[\"']|OLLAMA_", re.I), "ollama"),  # Ollama local API
     (re.compile(r"api\.ai21\.(com|ai)", re.I), "ai21"),
     (re.compile(r"api\.fireworks\.ai", re.I), "fireworks-ai"),
     (re.compile(r"api\.aleph-alpha\.com", re.I), "aleph-alpha-client"),

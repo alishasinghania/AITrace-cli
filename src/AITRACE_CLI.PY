@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import webbrowser
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional
@@ -51,13 +52,23 @@ def scan(
         [
             OutputFormat.CYCLONEDX,
             OutputFormat.SPDX,
-            OutputFormat.RISK_JSON,
             OutputFormat.RISK_MD,
             OutputFormat.MERMAID,
         ],
         "--format",
         "-f",
         help="Output format(s) to generate. Pass multiple -f to add; omitting -f uses all formats.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Also write risk-report.json, findings.json, and architecture graph files.",
+    ),
+    exploit: bool = typer.Option(
+        False,
+        "--exploit",
+        help="Generate proof-of-concept exploit payloads from detected data flows.",
     ),
 ) -> None:
     """
@@ -106,32 +117,17 @@ def scan(
         (out_path / "aitrace-spdx.json").write_text(json.dumps(spdx, indent=2), encoding="utf-8")
         typer.echo("Wrote SPDX document.")
 
-    if OutputFormat.RISK_JSON in formats or OutputFormat.RISK_MD in formats:
-        risk_json = to_risk_report_json(
-            result.aibom,
-            result.policy_report,
-            result.findings,
-            architecture_result,
-            result.dataflow_analysis,
-            result.sensitive_exposures,
-            result.model_supply_chain,
-            result.prompt_injection_risks,
-            result.llm_usage,
-            result.repo_type,
-            architecture_graph=result.architecture_graph,
-            attack_path_findings=result.attack_path_findings,
-        )
-        (out_path / "aitrace-risk-report.json").write_text(
-            json.dumps(risk_json, indent=2),
-            encoding="utf-8",
-        )
-        typer.echo("Wrote Enterprise Risk Report (JSON).")
-        findings_json = to_findings_json(result.findings, architecture_result)
-        (out_path / "aitrace-findings.json").write_text(
-            json.dumps(findings_json, indent=2),
-            encoding="utf-8",
-        )
-        typer.echo("Wrote findings (JSON).")
+    exploit_payloads = []
+    verification_results = []
+    if exploit:
+        from core.features.exploit_synthesizer import synthesize, exploits_to_markdown, print_exploits
+        from core.features.finding_verifier import verify_statically, print_verification, verification_to_markdown
+        exploit_payloads = synthesize(result)
+        if exploit_payloads:
+            verification_results = verify_statically(exploit_payloads, repo_root)
+
+        from core.features.rag_poison_simulator import simulate as rag_simulate, poison_to_text
+        rag_poison = rag_simulate(architecture_result)
 
     if OutputFormat.RISK_MD in formats:
         risk_md = to_risk_report_markdown(
@@ -148,14 +144,40 @@ def scan(
             architecture_graph=result.architecture_graph,
             attack_path_findings=result.attack_path_findings,
         )
+        if exploit_payloads:
+            risk_md += exploits_to_markdown(exploit_payloads)
+            risk_md += verification_to_markdown(exploit_payloads, verification_results)
         (out_path / "aitrace-risk-report.md").write_text(risk_md, encoding="utf-8")
-        typer.echo("Wrote Enterprise Risk Report (Markdown).")
+        typer.echo("Wrote risk report (Markdown).")
 
     if OutputFormat.MERMAID in formats:
         mermaid_diagram = to_ai_component_mermaid(result.aibom, architecture_result)
         (out_path / "aitrace-component-diagram.mmd").write_text(mermaid_diagram, encoding="utf-8")
         typer.echo("Wrote AI component diagram (Mermaid).")
-    if result.architecture_graph and (OutputFormat.RISK_JSON in formats or OutputFormat.RISK_MD in formats):
+
+    # Verbose-only: raw JSON dumps and architecture graph
+    if verbose or OutputFormat.RISK_JSON in formats:
+        risk_json = to_risk_report_json(
+            result.aibom,
+            result.policy_report,
+            result.findings,
+            architecture_result,
+            result.dataflow_analysis,
+            result.sensitive_exposures,
+            result.model_supply_chain,
+            result.prompt_injection_risks,
+            result.llm_usage,
+            result.repo_type,
+            architecture_graph=result.architecture_graph,
+            attack_path_findings=result.attack_path_findings,
+        )
+        (out_path / "aitrace-risk-report.json").write_text(json.dumps(risk_json, indent=2), encoding="utf-8")
+        typer.echo("Wrote risk report (JSON).")
+        findings_json = to_findings_json(result.findings, architecture_result)
+        (out_path / "aitrace-findings.json").write_text(json.dumps(findings_json, indent=2), encoding="utf-8")
+        typer.echo("Wrote findings (JSON).")
+
+    if verbose and result.architecture_graph:
         from core.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
         (out_path / "aitrace-architecture-graph.json").write_text(
             architecture_graph_to_json(result.architecture_graph),
@@ -165,7 +187,39 @@ def scan(
             architecture_graph_to_mermaid(result.architecture_graph),
             encoding="utf-8",
         )
-        typer.echo("Wrote AI architecture graph (JSON and Mermaid).")
+        typer.echo("Wrote architecture graph (JSON and Mermaid).")
+
+    if exploit_payloads:
+        ver_map = {r.finding_id: r.to_dict() for r in verification_results}
+        exploits_out = [
+            {**p.to_dict(), "verification": ver_map.get(p.finding_id)}
+            for p in exploit_payloads
+        ]
+        (out_path / "aitrace-exploits.json").write_text(
+            json.dumps(exploits_out, indent=2),
+            encoding="utf-8",
+        )
+        typer.echo(f"Wrote {len(exploit_payloads)} exploit payload(s) to aitrace-exploits.json.")
+        print_exploits(exploit_payloads)
+        if verification_results:
+            typer.echo("\nStatic verification results:")
+            print_verification(exploit_payloads, verification_results)
+
+        if rag_poison:
+            payload_path = out_path / "aitrace-rag-poison-payload.txt"
+            payload_path.write_text(poison_to_text(rag_poison), encoding="utf-8")
+            typer.echo(
+                f"\nRAG pipeline detected ({rag_poison.detected_vector_store} + "
+                f"{rag_poison.detected_embeddings})."
+            )
+            typer.echo(f"Wrote {len(rag_poison.variants)} poison variants to aitrace-rag-poison-payload.txt.")
+
+    from core.exporters.html_report import to_html_report
+    html_report = to_html_report(result, out_path)
+    html_path = out_path / "aitrace-report.html"
+    html_path.write_text(html_report, encoding="utf-8")
+    typer.echo("Wrote interactive HTML report.")
+    webbrowser.open(html_path.as_uri())
 
     if result.policy_report is not None and not result.policy_report.passed:
         typer.echo("Policy violations detected. Failing build.", err=True)

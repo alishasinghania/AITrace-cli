@@ -24,17 +24,23 @@ LANGGRAPH_PATTERNS = {
 # add_node/add_edge only when chain suggests LangGraph (not networkx)
 LANGGRAPH_CHAIN_PATTERNS = {"add_node", "add_edge"}
 LANGGRAPH_CHAIN_REQUIRED = {"langgraph", "langchain", "stategraph"}
-# Semantic Kernel – avoid generic "Skill" alone (matches validate_skill_tree, etc.)
+# Semantic Kernel – "Kernel" alone matches Jupyter/IPython/SVM kernels; require chain context.
 SEMANTIC_KERNEL_PATTERNS = {
-    "Kernel", "KernelBuilder", "SemanticFunction", "SkillCollection",
+    "KernelBuilder", "SemanticFunction", "SkillCollection",
     "OpenAIChatCompletion", "register_completion_service", "invoke_async",
     "create_semantic_function", "PromptTemplateConfig",
 }
+# "Kernel" is allowed only when the call chain contains a semantic-kernel indicator
+SEMANTIC_KERNEL_BARE_NAMES = {"Kernel"}
+SEMANTIC_KERNEL_CHAIN_REQUIRED = {"semantic_kernel", "kernel", "semantic", "sk"}
 SEMANTIC_KERNEL_REQUIRED_FOR_SKILL = {"kernel", "semantic", "skill"}
-# CrewAI – avoid generic "Agent", "Task", "Crew"; keep framework-specific
+# CrewAI – "crew" is a common English word; require unambiguous names or chain context
 CREWAI_PATTERNS = {
-    "CrewAgent", "crew", "kickoff", "create_crew", "create_agent",
+    "CrewAgent", "CrewAI", "kickoff", "create_crew",
 }
+# "crew" alone only counts when call chain contains a crewai indicator
+CREWAI_BARE_NAMES = {"crew"}
+CREWAI_CHAIN_REQUIRED = {"crewai", "crew_ai"}
 # AutoGen
 AUTOGEN_PATTERNS = {
     "AssistantAgent", "UserProxyAgent", "ConversableAgent", "GroupChat",
@@ -82,8 +88,18 @@ def _classify(target: str, chain: List[str]) -> Optional[str]:
         return "LangGraph"
     if _matches(target, SEMANTIC_KERNEL_PATTERNS):
         return "Semantic Kernel"
+    # "Kernel" alone: require semantic-kernel import evidence in call chain
+    if _matches(target, SEMANTIC_KERNEL_BARE_NAMES):
+        if chain_set & SEMANTIC_KERNEL_CHAIN_REQUIRED:
+            return "Semantic Kernel"
+        return None
     if _matches(target, CREWAI_PATTERNS):
         return "CrewAI"
+    # "crew" alone: require crewai chain evidence (avoids "film_crew", "my_crew", etc.)
+    if _matches(target, CREWAI_BARE_NAMES):
+        if chain_set & CREWAI_CHAIN_REQUIRED:
+            return "CrewAI"
+        return None
     if _matches(target, AUTOGEN_PATTERNS):
         return "AutoGen"
     if _matches(target, LANGCHAIN_PATTERNS):

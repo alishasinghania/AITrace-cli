@@ -59,19 +59,21 @@ SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
     (["flask", "request", "files"], "user_input"),
     (["input"], "user_input"),
     (["sys", "argv"], "user_input"),
-    # Database fields
+    # Database fields — require cursor/session/db context to avoid matching generic .execute()
     (["cursor", "execute"], "external_api"),
     (["session", "query"], "external_api"),
+    (["db", "execute"], "external_api"),
+    (["conn", "execute"], "external_api"),
     (["fetchall"], "external_api"),
     (["fetchone"], "external_api"),
-    (["execute"], "external_api"),
+    # Specific file-read patterns only — bare ["load"] and ["read"] taint every file operation
     (["open"], "file_read"),
-    (["read"], "file_read"),
-    (["load"], "file_read"),
-    (["loads"], "file_read"),
+    (["loads"], "file_read"),         # json.loads / yaml.safe_load result
     (["read_csv"], "file_read"),
     (["read_json"], "file_read"),
     (["load_json"], "file_read"),
+    (["json", "loads"], "file_read"),
+    (["json", "load"], "file_read"),
     (["os", "getenv"], "environment"),
     (["os", "environ"], "environment"),
     (["environ", "get"], "environment"),
@@ -88,8 +90,9 @@ SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
 ]
 
 # Sink patterns: (chain_contains, sink_label)
-# Full chain must contain these for a match
+# Multi-token patterns are matched directly; single-token generics require SINK_PROVIDER_INDICATORS.
 SINK_PATTERNS: List[Tuple[List[str], str]] = [
+    # Fully-qualified, unambiguous LLM API calls
     (["openai", "chat", "completions", "create"], "openai.ChatCompletion.create"),
     (["client", "chat", "completions", "create"], "client.chat.completions.create"),
     (["openai", "completion", "create"], "openai.Completion.create"),
@@ -98,18 +101,26 @@ SINK_PATTERNS: List[Tuple[List[str], str]] = [
     (["anthropic", "client", "messages", "create"], "anthropic.client.messages.create"),
     (["cohere", "chat", "create"], "cohere.chat.create"),
     (["cohere", "generate"], "cohere.generate"),
-    (["run"], "LangChain LLMChain.run"),  # chain.run()
+    (["bedrock", "invoke_model"], "bedrock.invoke_model"),
+    (["vertexai", "generate_content"], "vertexai.generate_content"),
+    (["generativeai", "generate_content"], "generativeai.generate_content"),
+    (["chat", "completions", "create"], "LLM ChatCompletion.create"),
+    (["messages", "create"], "LLM messages.create"),
+    # Generic single-token patterns — only matched when SINK_PROVIDER_INDICATORS present in chain
     (["invoke"], "LangChain LLM invoke"),
-    (["query"], "llama_index query_engine"),  # query_engine.query()
-    (["chat", "completions", "create"], "openai.ChatCompletion"),
-    (["messages", "create"], "Anthropic messages.create"),
-    (["pipeline"], "transformers pipeline"),
     (["generate"], "LLM generate"),
-    (["create"], "LLM create"),
+    (["pipeline"], "transformers pipeline"),
+    # "run" and "create" removed: too generic even with provider checks.
+    # chain.run() is LangChain-deprecated; openai/anthropic .create() caught by patterns above.
 ]
 
-# Refined sink: require chain to contain provider indicators for generic names
-SINK_PROVIDER_INDICATORS = {"openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral", "litellm", "llm", "chat", "completion", "messages", "completions", "chain", "index", "query_engine"}
+# Provider names that confirm a generic single-token sink is an LLM call.
+# Removed "chain", "index", "query_engine" — too common in non-LLM code.
+SINK_PROVIDER_INDICATORS = {
+    "openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral",
+    "litellm", "llm", "langchain", "llamaindex", "llama_index",
+    "completion", "completions", "chat_model", "transformers", "diffusers",
+}
 
 # Sanitization functions: call chain pattern -> True if sanitizes
 # When tainted_var is passed to these, the result is considered sanitized (mitigated)
@@ -273,20 +284,23 @@ def _is_sanitization_call(node: ast.Call) -> bool:
     return False
 
 
+_GENERIC_SINK_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
+
+
 def _is_sink_call(node: ast.Call) -> Optional[str]:
     """Return sink label if node is an LLM sink."""
     chain = _get_call_chain(node)
-    chain_lower = [c.lower() for c in chain]
-    chain_set = set(chain_lower)
+    chain_set = set(c.lower() for c in chain)
     for pattern, label in SINK_PATTERNS:
         if not _chain_matches(chain, pattern):
             continue
-        if pattern in (["invoke"], ["query"], ["chat"], ["run"]):
-            if chain_set & (SINK_PROVIDER_INDICATORS | {"llm", "chain", "index", "retriever", "agent"}):
+        if tuple(pattern) in _GENERIC_SINK_PATTERNS:
+            if chain_set & SINK_PROVIDER_INDICATORS:
                 return label
         else:
             return label
-    if "create" in chain_set and chain_set & {"openai", "anthropic", "cohere", "completions", "chat", "messages"}:
+    # Catch-all for .create() — only when an explicit LLM provider is in the chain
+    if "create" in chain_set and chain_set & {"openai", "anthropic", "cohere", "completions", "messages"}:
         return "LLM API create"
     return None
 

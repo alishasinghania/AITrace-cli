@@ -22,12 +22,19 @@ SENSITIVE_KEYWORDS: Dict[str, str] = {
     "api_key": "critical",
     "apikey": "critical",
     "token": "critical",
-    "auth": "high",
+    "auth_token": "critical",
+    "auth_key": "critical",
+    "auth_secret": "critical",
     "ssn": "critical",
     "credit_card": "critical",
     "creditcard": "critical",
-    "email": "high",
-    "phone": "high",
+    # "auth" alone is too broad — matches author, authorize, oauth, authentication_method, etc.
+    # Only match whole-word or clear compound forms (auth_token, auth_key above).
+    # email/phone as standalone exact names only (not email_template, phone_format, etc.)
+    "user_email": "high",
+    "user_phone": "high",
+    "phone_number": "high",
+    "email_address": "high",
 }
 # Variable names that are safe despite substring matches (LLM API params, OAuth fields)
 SENSITIVE_BLOCKLIST: Set[str] = {
@@ -35,24 +42,42 @@ SENSITIVE_BLOCKLIST: Set[str] = {
     "input_tokens", "output_tokens", "completion_tokens", "prompt_tokens",
     "expires_at", "expires_in", "issued_at",
     "all_messages",  # conversation history, not secrets
+    # auth-adjacent but non-secret variables
+    "auth_method", "auth_type", "auth_scheme", "auth_provider", "auth_url",
+    "auth_endpoint", "auth_flow", "auth_header_name",
+    # generic email/phone that are not PII secrets
+    "email_template", "email_subject", "email_body", "email_count",
+    "phone_format", "phone_mask",
 }
 
 # LLM sink patterns: (chain_pattern, sink_label)
+# Specific multi-token patterns are matched directly; single-token generics require SINK_INDICATORS.
 SINK_PATTERNS: List[tuple] = [
     (["openai", "chat", "completions", "create"], "OpenAI API"),
+    (["client", "chat", "completions", "create"], "OpenAI API"),
     (["openai", "completion", "create"], "OpenAI API"),
+    (["openai", "completions", "create"], "OpenAI API"),
     (["anthropic", "messages", "create"], "Anthropic API"),
+    (["anthropic", "client", "messages", "create"], "Anthropic API"),
     (["cohere", "chat", "create"], "Cohere API"),
     (["cohere", "generate"], "Cohere API"),
+    (["bedrock", "invoke_model"], "Bedrock API"),
+    (["vertexai", "generate_content"], "VertexAI API"),
+    (["generativeai", "generate_content"], "VertexAI API"),
+    # Generic patterns — only matched when SINK_INDICATORS present in chain
     (["invoke"], "LangChain LLM invoke"),
     (["messages", "create"], "LLM API"),
-    (["query"], "LlamaIndex query"),
-    (["chat"], "LLM chat"),
-    (["pipeline"], "Transformers pipeline"),
+    (["chat", "completions", "create"], "LLM API"),
     (["generate"], "LLM generate"),
-    (["create"], "LLM create"),
+    (["pipeline"], "Transformers pipeline"),
 ]
-SINK_INDICATORS = {"openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral", "litellm", "llm", "chain", "index", "retriever", "agent", "chat", "completion", "messages", "completions"}
+# Provider-specific names that confirm a generic call is an LLM sink.
+# Removed "chain" and "index" — too common in non-LLM code (method chains, DB indexes, etc.)
+SINK_INDICATORS = {
+    "openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral",
+    "litellm", "llm", "langchain", "llamaindex", "llama_index",
+    "completion", "completions", "messages", "chat_model",
+}
 # Sinks that send data to external AI providers (critical when secrets reach these)
 EXTERNAL_PROVIDER_SINKS = {"OpenAI API", "Anthropic API", "Cohere API", "LLM API"}
 
@@ -74,13 +99,34 @@ SECRET_SOURCE_CHAINS = {"os", "getenv", "environ", "dotenv", "load_dotenv", "pyt
 
 
 def _var_contains_sensitive(name: str) -> Optional[str]:
-    """Return risk level if variable name contains a sensitive keyword."""
+    """Return risk level if variable name contains a sensitive keyword.
+
+    Uses word-boundary matching on underscore-split tokens to avoid false positives
+    like 'author' matching 'auth', or 'tokenizer' matching 'token'.
+    """
     if name in SENSITIVE_BLOCKLIST:
         return None
-    n = name.lower().replace("_", "")
+    name_lower = name.lower()
+    if name_lower in SENSITIVE_BLOCKLIST:
+        return None
+    # Split on underscores to get tokens (e.g. "user_api_key" -> ["user", "api", "key"])
+    tokens = set(name_lower.replace("-", "_").split("_"))
+    name_no_sep = name_lower.replace("_", "").replace("-", "")
     for kw, risk in SENSITIVE_KEYWORDS.items():
-        if kw.replace("_", "") in n or kw in name.lower():
-            return risk
+        kw_no_sep = kw.lower().replace("_", "").replace("-", "")
+        kw_parts = kw.lower().replace("-", "_").split("_")
+        if len(kw_parts) > 1:
+            # Multi-token keyword (e.g. "api_key", "credit_card"): match as contiguous subsequence
+            # of name tokens, so "my_api_key_value" matches but "apikey_manager" won't match "api_key"
+            name_tokens_list = name_lower.replace("-", "_").split("_")
+            n = len(kw_parts)
+            if any(name_tokens_list[i:i + n] == kw_parts for i in range(len(name_tokens_list) - n + 1)):
+                return risk
+        else:
+            # Single-token keyword: must be a whole token in the underscore-split name
+            # "token" matches "access_token", "token_value" but NOT "tokenizer"
+            if kw_no_sep in tokens:
+                return risk
     return None
 
 
@@ -109,15 +155,18 @@ def _chain_matches(chain: List[str], pattern: List[str]) -> bool:
 def _is_llm_sink(node: ast.Call) -> Optional[str]:
     chain = _get_call_chain(node)
     chain_set = set(c.lower() for c in chain)
+    # Single-token generic patterns that require a provider indicator in the chain
+    _GENERIC_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
     for pattern, label in SINK_PATTERNS:
         if not _chain_matches(chain, pattern):
             continue
-        if pattern in (["invoke"], ["query"], ["chat"]):
+        if tuple(pattern) in _GENERIC_PATTERNS:
             if chain_set & SINK_INDICATORS:
                 return label
         else:
             return label
-    if "create" in chain_set and chain_set & {"openai", "anthropic", "cohere", "completions", "chat", "messages"}:
+    # Catch-all: .create() with explicit LLM provider in chain
+    if "create" in chain_set and chain_set & {"openai", "anthropic", "cohere", "completions", "messages"}:
         return "LLM API"
     return None
 

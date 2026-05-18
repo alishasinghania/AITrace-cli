@@ -24,30 +24,41 @@ EMBEDDING_PATTERNS = {
     "OpenAIEmbeddings", "CohereEmbeddings", "VoyageEmbeddings",
     "HuggingFaceEmbeddings", "VertexAIEmbeddings", "BedrockEmbeddings",
 }
-# Vector DBs: match on full call chain (e.g. chromadb.PersistentClient, weaviate.Client)
+# Vector DBs: unambiguous library-specific class/function names
 VECTOR_STORE_PATTERNS = {
     "Chroma", "chromadb", "ChromaVectorStore",
-    "Pinecone", "pinecone",  # pinecone-client
-    "Weaviate", "weaviate",  # weaviate-client
-    "Qdrant", "qdrant_client", "QdrantClient",  # qdrant-client
-    "Milvus", "pymilvus",  # milvus, pymilvus
-    "pgvector",
-    "redisvl", "RedisVL",
-    "FAISS", "faiss",
-    "annoy", "AnnoyIndex",
-    "vespa", "pyvespa",
-    "ElasticsearchStore", "from_documents", "from_texts",
-    "add_documents", "add_texts", "VectorStore",
+    "Pinecone", "PineconeVectorStore",
+    "Weaviate", "WeaviateVectorStore",
+    "Qdrant", "qdrant_client", "QdrantClient", "QdrantVectorStore",
+    "Milvus", "pymilvus", "MilvusVectorStore",
+    "pgvector", "PGVector",
+    "redisvl", "RedisVL", "RedisVectorStore",
+    "FAISS", "FAISSVectorStore",
+    "AnnoyIndex",
+    "pyvespa",
+    "ElasticsearchStore",
+}
+# Generic vector-store method names that only count when called on a known VS object.
+# from_documents/from_texts/add_documents/add_texts/VectorStore are too common in ORMs.
+VECTOR_STORE_CHAIN_PATTERNS = {
+    "from_documents", "from_texts", "add_documents", "add_texts",
+}
+VECTOR_STORE_CHAIN_REQUIRED = {
+    "chroma", "chromadb", "pinecone", "weaviate", "qdrant", "milvus",
+    "faiss", "pgvector", "redisvl", "elasticsearch", "vectorstore", "vectordb",
 }
 RETRIEVAL_PATTERNS = {
     "similarity_search", "as_retriever", "max_marginal_relevance",
-    "Retriever", "retrieve", "VectorStoreRetriever",
+    # "Retriever" and "retrieve" removed — too common in non-vector-store code
+    # (HTTP retrievers, Django querysets, caching layers, etc.)
+    "VectorStoreRetriever",
 }
-# Document loaders (LangChain, LlamaIndex) - URL/user path → possible RAG poisoning
+# Document loaders: use framework-specific class names only.
+# "read_file" and "load_data" removed — they match any file-reading utility.
 DOCUMENT_LOADER_PATTERNS = {
     "PDFLoader", "SimpleDirectoryReader", "CSVLoader", "WebBaseLoader",
     "UnstructuredFileLoader", "DirectoryLoader", "PyPDFLoader",
-    "TextLoader", "Docx2txtLoader", "read_file", "load_data",
+    "TextLoader", "Docx2txtLoader",
 }
 LLM_PATTERNS = {
     "chat", "complete", "create", "invoke", "generate", "messages",
@@ -134,6 +145,12 @@ def detect_rag(repo_root: Path) -> DetectionResult:
         elif _matches(full, VECTOR_STORE_PATTERNS) and full not in seen:
             seen.add(full)
             vector_stores.append(full)
+        elif _matches(target, VECTOR_STORE_CHAIN_PATTERNS) and full not in seen:
+            # Generic methods like from_documents/add_texts: only count when called on a VS object
+            chain_lower_set = {c.lower() for c in chain}
+            if chain_lower_set & VECTOR_STORE_CHAIN_REQUIRED:
+                seen.add(full)
+                vector_stores.append(full)
         elif _matches(target, RETRIEVAL_PATTERNS) and full not in seen:
             seen.add(full)
             retrievals.append(full)

@@ -18,10 +18,13 @@ from typing import Dict, List, Optional, Set, Tuple
 from .dataflow_analyzer import DataFlow, analyze_dataflows
 from .detectors._ast_utils import should_skip_path
 
-# Agent invocation methods
-INVOKE_METHODS = {"invoke", "run", "stream", "ainvoke", "arun", "astream", "kickoff"}
+# Agent invocation methods — async variants kept; bare "run" and "stream" removed
+# because they match subprocess.run(), file.stream(), etc. outside agent context.
+INVOKE_METHODS = {"invoke", "ainvoke", "arun", "astream", "kickoff"}
 
-# Agent framework patterns (chain must contain these)
+# Agent framework patterns — unambiguous framework-specific names only.
+# Removed bare "Pipeline", "Agent", "Kernel", "Crew": too generic (sklearn Pipeline,
+# HTTP Agent, Jupyter Kernel, film crew) — they fire without any AI framework context.
 AGENT_PATTERNS = {
     "create_react_agent",
     "create_agent",
@@ -29,11 +32,10 @@ AGENT_PATTERNS = {
     "initialize_agent",
     "StateGraph",
     "create_crew",
-    "Crew",
-    "Kernel",
+    "CrewAI",
     "SemanticFunction",
-    "Pipeline",
-    "Agent",
+    "KernelBuilder",
+    "HaystackPipeline",
 }
 
 # Sanitization functions for agent flows (same as dataflow_analyzer)
@@ -50,10 +52,13 @@ HIGH_RISK_TOOLS = {
     "execute",
 }
 
-# User input variable name patterns (heuristic)
+# User input variable name heuristics — require "user_" prefix or explicit input-context suffix.
+# Removed: "query", "message", "text", "request" — too common in non-LLM code
+# (DB queries, log messages, plain text, HTTP request objects).
+# "prompt" is borderline but kept because it's strongly associated with LLM usage.
 USER_INPUT_NAMES = {
-    "user_input", "user_query", "user_message", "query", "prompt", "message",
-    "human_input", "request", "input_text", "user_prompt", "question", "text",
+    "user_input", "user_query", "user_message", "user_prompt",
+    "human_input", "input_text", "question", "prompt",
 }
 
 

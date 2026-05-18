@@ -70,6 +70,9 @@ class MCPServer:
     command: Optional[str] = None
     args: List[str] = field(default_factory=list)
     package: Optional[str] = None
+    trust_score: int = 100
+    suspicious_description: bool = False
+    suspicious_tools: List[str] = field(default_factory=list)
 
 
 @dataclass

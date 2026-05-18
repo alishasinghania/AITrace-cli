@@ -2,3 +2,9 @@ _ref_discovery/
 _ref_metadata/
 .DS_Store
 aitrace-out/
+*.egg-info/
+__pycache__/
+*.pyc
+dist/
+build/
+CLAUDE.md

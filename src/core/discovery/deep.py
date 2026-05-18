@@ -193,6 +193,12 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                     pkg = args[-1] if len(args) > 1 else name
                 elif any("mcp" in str(a).lower() or "modelcontextprotocol" in str(a).lower() for a in args):
                     pkg = next((a for a in args if "mcp" in str(a).lower() or "modelcontextprotocol" in str(a).lower()), name)
+
+            from core.detectors.mcp_detector import scan_tool_descriptions
+            suspicious_tools = scan_tool_descriptions(cfg)
+            suspicious = bool(suspicious_tools)
+            trust_score = max(0, 100 - 50 * len(suspicious_tools))
+
             mcp_servers.append(
                 MCPServer(
                     id=next_id("MCP"),
@@ -201,6 +207,9 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                     command=command,
                     args=args if isinstance(args, list) else [],
                     package=pkg,
+                    trust_score=trust_score,
+                    suspicious_description=suspicious,
+                    suspicious_tools=suspicious_tools,
                 )
             )
             findings.append(
@@ -214,6 +223,28 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                     tags=["mcp-server"],
                 )
             )
+            if suspicious:
+                findings.append(
+                    Finding(
+                        id=next_id("DEEP"),
+                        title=f"MCP tool injection detected: {name}",
+                        category=FindingCategory.SEMANTIC,
+                        severity=Severity.CRITICAL,
+                        description=(
+                            f"MCP server '{name}' ({mcp_rel}) has tool(s) with descriptions "
+                            f"matching prompt-injection patterns: {', '.join(suspicious_tools)}. "
+                            "An attacker-controlled server can hijack agent behaviour via "
+                            "malicious tool descriptions read before each tool call."
+                        ),
+                        evidence=[Evidence(
+                            description="Suspicious tool description(s) in MCP config",
+                            file=str(mcp_rel),
+                            extra={"suspicious_tools": suspicious_tools, "trust_score": trust_score},
+                        )],
+                        tags=["mcp-server", "prompt-injection", "supply-chain"],
+                        metadata={"suspicious_tools": suspicious_tools, "trust_score": trust_score},
+                    )
+                )
 
     return DeepDiscoveryResult(
         models=models, components=components, findings=findings, mcp_servers=mcp_servers
