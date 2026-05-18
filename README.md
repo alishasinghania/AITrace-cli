@@ -42,8 +42,27 @@ Wrote 3 poison variants → aitrace-rag-poison-payload.txt
 
 ```bash
 git clone https://github.com/alishasinghania/AITrace-cli
-cd aitrace-cli
-pip install -e .
+cd AITrace-cli
+pip3 install -e .
+```
+
+On macOS, pip installs scripts to `~/Library/Python/3.x/bin` which may not be on your PATH. If `aitrace` is not found after install, run:
+
+```bash
+echo 'export PATH="$HOME/Library/Python/3.9/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Then verify:
+
+```bash
+aitrace --help
+```
+
+Alternatively, use the included `run.sh` without any PATH changes:
+
+```bash
+./run.sh scan . --out-dir aitrace-out
 ```
 
 **Requirements:** Python 3.9+ · No external API calls · No telemetry
