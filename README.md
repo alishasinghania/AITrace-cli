@@ -68,6 +68,34 @@ aitrace scan ./my-app --verbose
 
 ---
 
+## Architecture
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                        Analysis Pipeline                          │
+  ├─────────────────┬──────────────────┬───────────────────────────── ┤
+  │  SURFACE        │  DEEP            │  SEMANTIC                    │
+  │  · manifests    │  · model files   │  · LLM call patterns         │
+  │  · AST imports  │  · MCP configs   │  · RAG flows                 │
+  │  · config refs  │  · HuggingFace   │  · agent orchestrators       │
+  └────────┬────────┴────────┬─────────┴──────────────┬──────────────┘
+           └─────────────────┴────────────────────────┘
+                                      │
+  ┌───────────────────────────────────▼──────────────────────────────┐
+  │                       Security Analysis                           │
+  │  Taint Tracker · Sensitive Exposure · Prompt Injection · MCP     │
+  └───────────────────────────────────┬──────────────────────────────┘
+                                      │
+  ┌───────────────────────────────────▼──────────────────────────────┐
+  │                    Exploit & Verification                         │
+  │  Exploit Synthesizer · Static Verifier · RAG Poison Simulator    │
+  └───────────────────────────────────┬──────────────────────────────┘
+                                      │
+              Risk Score · AI SBOM · HTML Report · Policy Gate
+```
+
+---
+
 ## What It Does
 
 **AI Bill of Materials** — CycloneDX 1.7 and SPDX 3.0 SBOMs covering every LLM SDK, embedding model, vector store, agent framework, and MCP server in your codebase.
