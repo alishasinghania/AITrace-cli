@@ -5,10 +5,12 @@ from __future__ import annotations
 import html as _html
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from core.engine import AnalysisResult
+    from core.features.exploit_synthesizer import ExploitPayload
+    from core.features.finding_verifier import VerificationResult
     from core.risk_scoring import RiskScoreResult
 
 _SEV_COLOR: Dict[str, str] = {
@@ -96,6 +98,18 @@ h2{font-size:.8rem;font-weight:700;color:var(--muted);text-transform:uppercase;l
 .dl-btn:hover{background:var(--accent);color:#fff}
 /* empty state */
 .empty{color:var(--muted);font-size:.875rem;padding:1rem 0}
+/* exploit payloads */
+.exploit{background:var(--card);border:1px solid #ef444444;border-left:3px solid #ef4444;border-radius:.75rem;padding:1rem;margin-bottom:.75rem}
+.exploit-hdr{display:flex;align-items:flex-start;gap:.75rem;margin-bottom:.5rem}
+.exploit-payload{background:#0f172a;border:1px solid var(--border);border-radius:.5rem;padding:.75rem;font-family:monospace;font-size:.78rem;white-space:pre-wrap;color:#a5f3fc;margin-top:.5rem;max-height:160px;overflow-y:auto}
+.exploit-meta{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.4rem;margin-top:.5rem}
+.exploit-meta-item{font-size:.75rem;color:var(--muted)}.exploit-meta-item strong{color:var(--text)}
+/* verification */
+.verdict-confirmed{color:#22c55e}.verdict-likely{color:#f59e0b}.verdict-uncertain{color:#94a3b8}
+.verify-ev{font-size:.8rem;padding:.15rem 0;display:flex;gap:.4rem;align-items:flex-start}
+/* discovery */
+.disc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:.6rem}
+.disc-item{background:var(--card);border:1px solid var(--border);border-radius:.5rem;padding:.65rem .875rem}
 """
 
 
@@ -339,6 +353,125 @@ def _mcp_section(mcp_servers: list) -> str:
     )
 
 
+def _discovery_findings_section(discovery_findings: list) -> str:
+    """Render surface/deep discovery findings (dependencies, config, models) as a compact grid."""
+    if not discovery_findings:
+        return ""
+
+    items = ""
+    for f in discovery_findings:
+        sev = f.severity.value.upper()
+        color = _SEV_COLOR.get(sev, "#94a3b8")
+        loc = ""
+        if f.evidence:
+            ev = f.evidence[0]
+            if ev.file:
+                loc_str = ev.file + (f":{ev.line}" if ev.line else "")
+                loc = f"<div style='font-size:.72rem;font-family:monospace;color:var(--accent);margin-top:.2rem'>{_e(loc_str)}</div>"
+        items += (
+            f"<div class='disc-item'>"
+            f"<div style='display:flex;align-items:center;gap:.5rem'>"
+            f"<span class='sev-chip' style='background:{color}22;color:{color}'>{_e(sev)}</span>"
+            f"<span style='font-size:.85rem;font-weight:600'>{_e(f.title)}</span>"
+            f"</div>{loc}"
+            f"</div>"
+        )
+    return (
+        f"<div class='section'><h2>Discovery findings ({len(discovery_findings)})</h2>"
+        f"<div class='disc-grid'>{items}</div></div>"
+    )
+
+
+def _exploit_section(
+    payloads: List["ExploitPayload"],
+    verification_map: Dict[str, "VerificationResult"],
+) -> str:
+    """Render exploit payloads with static verification results."""
+    if not payloads:
+        return ""
+
+    _VERDICT_COLORS = {
+        "confirmed":  "#22c55e",
+        "likely":     "#f59e0b",
+        "uncertain":  "#94a3b8",
+    }
+    _VERDICT_LABELS = {
+        "confirmed": "✔ CONFIRMED",
+        "likely":    "~ LIKELY",
+        "uncertain": "? UNCERTAIN",
+    }
+
+    cards = ""
+    sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    for p in sorted(payloads, key=lambda x: sev_order.get(x.severity, 9)):
+        sev = p.severity.upper()
+        color = _SEV_COLOR.get(sev, "#94a3b8")
+        loc = p.target_file + (f":{p.target_line}" if p.target_line else "")
+
+        vr = verification_map.get(p.finding_id)
+        verdict_html = ""
+        if vr:
+            vc = _VERDICT_COLORS.get(vr.verdict, "#94a3b8")
+            vl = _VERDICT_LABELS.get(vr.verdict, vr.verdict.upper())
+            ev_for_html = "".join(
+                f"<div class='verify-ev'><span style='color:#22c55e'>+</span><span>{_e(ev)}</span></div>"
+                for ev in vr.evidence_for
+            )
+            ev_against_html = "".join(
+                f"<div class='verify-ev'><span style='color:#ef4444'>−</span><span>{_e(ev)}</span></div>"
+                for ev in vr.evidence_against
+            )
+            verdict_html = (
+                f"<div style='margin-top:.6rem;padding:.6rem .75rem;background:#0f172a;"
+                f"border-radius:.5rem;border:1px solid {vc}44'>"
+                f"<div style='font-size:.8rem;font-weight:700;color:{vc};margin-bottom:.35rem'>"
+                f"{_e(vl)} — {vr.confidence}% confidence</div>"
+                f"{ev_for_html}{ev_against_html}"
+                f"</div>"
+            )
+
+        steps_html = "".join(
+            f"<li style='font-size:.8rem;color:var(--muted);margin-top:.2rem'>{_e(s)}</li>"
+            for s in p.reproduction_steps
+        )
+
+        cards += (
+            f"<div class='exploit'>"
+            f"<div class='exploit-hdr'>"
+            f"<span class='sev-badge' style='background:{color}22;color:{color}'>{_e(sev)}</span>"
+            f"<div>"
+            f"<div style='font-weight:600;font-size:.95rem'>{_e(p.title)}</div>"
+            f"<div style='font-size:.75rem;color:var(--muted);font-family:monospace;margin-top:.2rem'>"
+            f"{_e(p.finding_id)} · {_e(loc)}</div>"
+            f"</div></div>"
+            f"<div class='exploit-meta'>"
+            f"<div class='exploit-meta-item'><strong>Source:</strong> {_e(p.source_type)}</div>"
+            f"<div class='exploit-meta-item'><strong>Sink:</strong> {_e(p.sink_type)}</div>"
+            f"<div class='exploit-meta-item'><strong>CVSS:</strong> {_e(p.cvss_vector.split('/')[0] if '/' in p.cvss_vector else p.cvss_vector)}</div>"
+            f"</div>"
+            f"<div style='font-size:.8rem;color:var(--muted);margin-top:.5rem'>{_e(p.expected_behavior)}</div>"
+            f"<div class='exploit-payload'>{_e(p.payload)}</div>"
+            f"{verdict_html}"
+            f"<details style='margin-top:.6rem'>"
+            f"<summary style='font-size:.8rem;color:var(--accent);cursor:pointer'>Reproduction steps</summary>"
+            f"<ol style='padding-left:1.2rem;margin-top:.4rem'>{steps_html}</ol>"
+            f"</details>"
+            f"</div>"
+        )
+
+    warning = (
+        "<div style='font-size:.8rem;color:#f97316;background:#f9731622;border:1px solid #f9731644;"
+        "border-radius:.5rem;padding:.6rem .875rem;margin-bottom:1rem'>"
+        "⚠ These payloads are generated for authorized security testing only. "
+        "Use only against systems you own or have explicit written permission to test."
+        "</div>"
+    )
+    return (
+        f"<div class='section'><h2>Exploit payloads ({len(payloads)})</h2>"
+        f"{warning}{cards}</div>"
+    )
+
+
 def _downloads_section() -> str:
     files = [
         ("aitrace-risk-report.md", "Risk Report (Markdown)"),
@@ -362,10 +495,16 @@ def _mermaid_script() -> str:
     )
 
 
-def to_html_report(result: "AnalysisResult", out_path: Path) -> str:
+def to_html_report(
+    result: "AnalysisResult",
+    out_path: Path,
+    exploit_payloads: Optional[List["ExploitPayload"]] = None,
+    verification_results: Optional[List["VerificationResult"]] = None,
+) -> str:
     """Build and return a self-contained HTML report string."""
     from core.risk_scoring import compute_risk_score
     from core.exporters.component_diagram import to_ai_component_mermaid
+    from core.models import FindingCategory
 
     aibom = result.aibom
     findings = result.findings or []
@@ -387,10 +526,13 @@ def to_html_report(result: "AnalysisResult", out_path: Path) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     badge_color = _risk_badge_color(risk.total_score)
 
-    # Separate security findings (semantic/policy) from component discovery (surface/deep)
-    from core.models import FindingCategory
+    # Split findings into security (semantic/policy) and discovery (surface/deep)
     security_findings = sorted(
         [f for f in findings if f.category in (FindingCategory.SEMANTIC, FindingCategory.POLICY)],
+        key=lambda f: _SEV_ORDER.get(f.severity.value.upper(), 99),
+    )
+    discovery_findings = sorted(
+        [f for f in findings if f.category not in (FindingCategory.SEMANTIC, FindingCategory.POLICY)],
         key=lambda f: _SEV_ORDER.get(f.severity.value.upper(), 99),
     )
 
@@ -411,6 +553,11 @@ def to_html_report(result: "AnalysisResult", out_path: Path) -> str:
 
     mermaid_src = to_ai_component_mermaid(aibom, arch)
 
+    # Build verification lookup map
+    verification_map: Dict[str, Any] = {}
+    if verification_results:
+        verification_map = {r.finding_id: r for r in verification_results}
+
     parts: List[str] = [
         _head(repo_name),
         "<body>",
@@ -420,7 +567,9 @@ def to_html_report(result: "AnalysisResult", out_path: Path) -> str:
         _components_section(aibom.components),
         _mcp_section(aibom.mcp_servers),
         _findings_section(security_findings),
+        _discovery_findings_section(discovery_findings),
         _dataflows_section(data_flows),
+        _exploit_section(exploit_payloads or [], verification_map),
         _mermaid_section(mermaid_src),
         _downloads_section(),
         _mermaid_script(),

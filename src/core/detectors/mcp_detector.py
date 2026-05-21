@@ -2,13 +2,18 @@
 MCP (Model Context Protocol) server detector.
 
 Detects MCP server configurations from .cursor/mcp.json, mcp.json, .mcp.json.
-Also scans tool description fields for prompt-injection patterns.
+Extended to detect:
+- Poisoned tool descriptions (prompt injection via tool metadata)
+- Hardcoded credentials in env blocks
+- Dangerous tool names (shell, exec, run_command)
+- Tool shadowing across servers
+- Companion tool definition files
 """
 
 from __future__ import annotations
 
 import json
-import re
+import re as _re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -16,59 +21,147 @@ from .base import DetectionResult
 
 MCP_CONFIG_PATHS = (".cursor/mcp.json", "mcp.json", ".mcp.json")
 
-# Patterns that indicate a tool description may be attempting prompt injection
-SUSPICIOUS_TOOL_PATTERNS = [
-    r"\bignore\b.*\bprevious\b",
-    r"\boverride\b",
-    r"\balways\b.*\b(read|write|execute|send)\b",
-    r"\bnever\b.*\btell\b",
-    r"system:?\s*(prompt|instruction)",
-    r"\bforget\b.*\binstruction",
+# Patterns in tool descriptions that indicate prompt injection / tool poisoning
+SUSPICIOUS_DESCRIPTION_PATTERNS = [
+    _re.compile(r"\bignore\b.{0,40}\b(previous|prior|above|instructions?|prompt)\b", _re.I),
+    _re.compile(r"\bsystem\s*(override|instruction|prompt|command)\b", _re.I),
+    _re.compile(r"\balways\b.{0,30}\b(append|output|include|send|return|add)\b", _re.I),
+    _re.compile(r"\bnever\s+tell\b", _re.I),
+    _re.compile(r"\bforget\b.{0,20}\b(previous|prior|above|all)\b", _re.I),
+    _re.compile(r"\boverride\b.{0,30}\b(instruction|rule|policy|guideline)\b", _re.I),
+    _re.compile(r"\brequired for\s+(audit|compliance|security|system)\b", _re.I),
+    _re.compile(r"\bdo not\s+(mention|tell|reveal|disclose)\b", _re.I),
+    # Zero-width / invisible characters used for steganographic injection
+    _re.compile(r"[\u200b\u200c\u200d\ufeff\u2028\u2029]"),
 ]
 
-_COMPILED = [re.compile(p, re.IGNORECASE) for p in SUSPICIOUS_TOOL_PATTERNS]
+# Tool names that suggest dangerous permissions
+DANGEROUS_TOOL_NAMES = {
+    "run_command", "execute_command", "shell", "bash", "eval",
+    "run_code", "execute_code", "exec", "subprocess",
+}
+
+# Env var key patterns that suggest hardcoded credentials
+CREDENTIAL_KEY_PATTERNS = _re.compile(
+    r"(password|passwd|secret|api_key|apikey|token|auth_token|admin_token"
+    r"|smtp_pass|db_pass|private_key|access_key|secret_key)",
+    _re.I,
+)
 
 
-def scan_tool_descriptions(server_cfg: Dict[str, Any]) -> List[str]:
-    """Return names of tools whose descriptions match injection patterns.
-
-    Checks the ``tools`` dict in an MCP server config entry.  Each tool whose
-    ``description`` string matches any pattern is returned by name.
-    """
-    suspicious: List[str] = []
-    tools = server_cfg.get("tools") or {}
-    if not isinstance(tools, dict):
-        return suspicious
-    for tool_name, tool_def in tools.items():
-        desc = ""
-        if isinstance(tool_def, dict):
-            desc = str(tool_def.get("description", ""))
-        elif isinstance(tool_def, str):
-            desc = tool_def
-        if not desc:
+def _check_tool_descriptions(
+    tools: Any, server_name: str, source: str
+) -> List[str]:
+    """Scan tool definitions for poisoned descriptions. Returns evidence strings."""
+    found: List[str] = []
+    if not isinstance(tools, (list, dict)):
+        return found
+    items = tools.values() if isinstance(tools, dict) else tools
+    for tool in items:
+        if not isinstance(tool, dict):
             continue
-        for pattern in _COMPILED:
-            if pattern.search(desc):
-                suspicious.append(str(tool_name))
+        name = tool.get("name", "")
+        desc = tool.get("description", "")
+        if name.lower() in DANGEROUS_TOOL_NAMES:
+            found.append(
+                f"DANGEROUS TOOL: {server_name}.{name} exposes command execution ({source})"
+            )
+        for pat in SUSPICIOUS_DESCRIPTION_PATTERNS:
+            if pat.search(desc):
+                found.append(
+                    f"POISONED DESCRIPTION [{server_name}.{name}]: "
+                    f"suspicious pattern in tool description ({source})"
+                )
                 break
+    return found
+
+
+def _check_env_for_credentials(env: Any, server_name: str, source: str) -> List[str]:
+    """Check MCP server env block for hardcoded credentials."""
+    found: List[str] = []
+    if not isinstance(env, dict):
+        return found
+    for key, value in env.items():
+        if CREDENTIAL_KEY_PATTERNS.search(key) and value and isinstance(value, str):
+            found.append(
+                f"HARDCODED CREDENTIAL: {server_name} env.{key} = "
+                f"{value[:4]}*** ({source})"
+            )
+    return found
+
+
+def _scan_companion_tool_files(repo_root: Path, server_name: str) -> List[str]:
+    """
+    Look for companion tool definition JSON files referenced by an MCP server.
+    Checks: mcp/*_tools.json, mcp/tools/*.json, .cursor/*_tools.json
+    """
+    found: List[str] = []
+    search_patterns = [
+        f"mcp/{server_name}_tools.json",
+        f"mcp/tools/{server_name}.json",
+        f".cursor/{server_name}_tools.json",
+        "mcp/filesystem_tools.json",
+        "mcp/tools.json",
+    ]
+    for rel in search_patterns:
+        path = repo_root / rel
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        tools = data.get("tools") or data.get("functions") or data
+        found.extend(_check_tool_descriptions(tools, server_name, rel))
+    return found
+
+
+def scan_tool_descriptions(cfg: Dict[str, Any]) -> List[str]:
+    """Return a list of suspicious tool names from a single MCP server config dict."""
+    tools = cfg.get("tools") or cfg.get("functions") or []
+    suspicious: List[str] = []
+    items = tools.values() if isinstance(tools, dict) else tools
+    for tool in items:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name", "")
+        desc = tool.get("description", "")
+        flagged = name.lower() in DANGEROUS_TOOL_NAMES
+        if not flagged:
+            for pat in SUSPICIOUS_DESCRIPTION_PATTERNS:
+                if pat.search(desc):
+                    flagged = True
+                    break
+        if flagged and name:
+            suspicious.append(name)
     return suspicious
 
 
 def detect_mcp(repo_root: Path) -> DetectionResult:
     """
     Detect MCP servers from config files.
-    Returns structured result with component, confidence, evidence.
+    Also scans for:
+    - Poisoned tool descriptions (prompt injection via tool metadata)
+    - Hardcoded credentials in env blocks
+    - Dangerous tool names (shell, exec, run_command)
+    - Companion tool definition files
+    - Tool shadowing across servers
     """
     repo_root = repo_root.resolve()
     evidence: List[str] = []
     servers: List[Dict[str, Any]] = []
+    security_findings: List[str] = []
+
+    # Track tool names across all servers to detect shadowing
+    all_tool_names: Dict[str, str] = {}  # tool_name -> first_server
 
     for rel_path in MCP_CONFIG_PATHS:
         config_path = repo_root / rel_path
         if not config_path.exists():
             continue
         try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
+            raw = config_path.read_text(encoding="utf-8")
+            config = json.loads(raw)
         except (OSError, json.JSONDecodeError):
             continue
 
@@ -76,10 +169,78 @@ def detect_mcp(repo_root: Path) -> DetectionResult:
         for name, cfg in cfg_servers.items():
             if not isinstance(cfg, dict):
                 continue
-            evidence.append(f"MCP: {name} ({rel_path})")
-            servers.append({"name": name, "config_path": rel_path})
 
-    if not evidence:
+            evidence.append(f"MCP: {name} ({rel_path})")
+            server_entry: Dict[str, Any] = {
+                "name": name,
+                "config_path": rel_path,
+                "trust_score": 100,
+                "suspicious_description": False,
+                "suspicious_tools": [],
+            }
+
+            # Check args for dangerous filesystem access
+            args = cfg.get("args", [])
+            if isinstance(args, list):
+                for arg in args:
+                    if isinstance(arg, str) and arg in ("/", "~", str(Path.home())):
+                        finding = (
+                            f"EXCESSIVE PERMISSIONS: {name} allowed-dirs={arg!r} "
+                            f"gives access to entire filesystem ({rel_path})"
+                        )
+                        security_findings.append(finding)
+                        server_entry["trust_score"] -= 40
+
+            # Check env block for hardcoded credentials
+            env = cfg.get("env", {})
+            cred_findings = _check_env_for_credentials(env, name, rel_path)
+            security_findings.extend(cred_findings)
+            if cred_findings:
+                server_entry["trust_score"] -= 30
+
+            # Check inline tool definitions
+            tools = cfg.get("tools") or cfg.get("functions") or []
+            tool_findings = _check_tool_descriptions(tools, name, rel_path)
+            security_findings.extend(tool_findings)
+            if tool_findings:
+                server_entry["suspicious_description"] = True
+                server_entry["suspicious_tools"] = [
+                    f.split(":")[1].strip() for f in tool_findings
+                ]
+                server_entry["trust_score"] -= 50
+
+            # Check companion tool files on disk
+            companion_findings = _scan_companion_tool_files(repo_root, name)
+            security_findings.extend(companion_findings)
+            if companion_findings:
+                server_entry["suspicious_description"] = True
+                server_entry["trust_score"] -= 50
+
+            # Tool shadowing check
+            for tool in (tools if isinstance(tools, list) else []):
+                if isinstance(tool, dict):
+                    tname = tool.get("name", "")
+                    if tname:
+                        if tname in all_tool_names:
+                            security_findings.append(
+                                f"TOOL SHADOWING: tool '{tname}' registered by both "
+                                f"'{all_tool_names[tname]}' and '{name}' — "
+                                f"agent may call wrong server ({rel_path})"
+                            )
+                            server_entry["trust_score"] -= 25
+                        else:
+                            all_tool_names[tname] = name
+
+            # Raw JSON credential pattern check (catches inline env values)
+            if CREDENTIAL_KEY_PATTERNS.search(raw):
+                server_entry["trust_score"] = min(server_entry["trust_score"], 60)
+
+            servers.append(server_entry)
+
+    # Add security findings to evidence
+    evidence.extend(security_findings[:15])
+
+    if not servers:
         return DetectionResult(
             component="MCP Servers",
             confidence="low",
@@ -91,6 +252,17 @@ def detect_mcp(repo_root: Path) -> DetectionResult:
     return DetectionResult(
         component="MCP Servers",
         confidence=confidence,
-        evidence=evidence[:10],
-        details={"detected": True, "servers": servers},
+        evidence=evidence[:20],
+        details={
+            "detected": True,
+            "servers": servers,
+            "security_findings": security_findings,
+            "has_poisoned_tools": any(s.get("suspicious_description") for s in servers),
+            "has_hardcoded_creds": any(
+                "HARDCODED CREDENTIAL" in f for f in security_findings
+            ),
+            "has_excessive_permissions": any(
+                "EXCESSIVE PERMISSIONS" in f for f in security_findings
+            ),
+        },
     )

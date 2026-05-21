@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .architecture_graph import build_architecture_graph
 from .ai_attack_path_analyzer import analyze_attack_paths
@@ -33,6 +33,9 @@ class AnalysisResult:
     architecture_result: Optional[ArchitectureResult] = None
     architecture_graph: Optional[dict] = None  # {nodes, edges} from build_architecture_graph
     attack_path_findings: Optional[List[AttackPathFinding]] = None
+    pattern_analysis: Optional[Any] = None    # PatternAnalysisResult
+    crossfile_taint: Optional[Any] = None     # CrossFileTaintResult
+    llm_verification: Optional[Any] = None   # LLMVerificationResult
 
 
 class AITraceEngine:
@@ -94,6 +97,73 @@ class AITraceEngine:
         )
         attack_path_findings = analyze_attack_paths(architecture_graph)
 
+        # Pattern analysis + cross-file taint
+        pattern_analysis = None
+        crossfile_taint = None
+        llm_verification = None
+        try:
+            from core.pattern_analyzer import analyze_patterns
+            pattern_analysis = analyze_patterns(self.repo_root)
+        except Exception as e:
+            pass  # Never crash scan due to pattern analyzer
+
+        try:
+            from core.crossfile_taint import analyze_crossfile_taint
+            if pattern_analysis is not None:
+                crossfile_taint = analyze_crossfile_taint(
+                    self.repo_root,
+                    pattern_analysis.findings,
+                    max_hops=6,
+                )
+        except Exception:
+            pass
+
+        # LLM verification (only when verify_with_llm=True)
+        if getattr(self, "verify_with_llm", False) and pattern_analysis is not None:
+            try:
+                from core.features.llm_verifier import verify_findings
+                llm_verification = verify_findings(
+                    self.repo_root,
+                    pattern_analysis.findings,
+                    crossfile_taint,
+                )
+            except Exception:
+                pass
+
+        # Convert PatternFindings to Finding objects and append (after policy check)
+        if pattern_analysis is not None:
+            from core.models import FindingCategory, Severity, Evidence
+            _sev_map = {
+                "critical": Severity.CRITICAL,
+                "high": Severity.HIGH,
+                "medium": Severity.MEDIUM,
+                "low": Severity.LOW,
+            }
+            for pf in pattern_analysis.findings:
+                sev = _sev_map.get(pf.severity, Severity.MEDIUM)
+                evidence_objs = [
+                    Evidence(description=e, file=pf.file, line=pf.line)
+                    for e in pf.evidence
+                ]
+                finding = Finding(
+                    id=pf.vulnerability_id,
+                    title=pf.title,
+                    category=FindingCategory.SEMANTIC,
+                    severity=sev,
+                    description=pf.category,
+                    evidence=evidence_objs,
+                    tags=[pf.owasp_id, pf.cwe, pf.framework],
+                    metadata={
+                        "pattern_matched": pf.pattern_matched,
+                        "confidence": pf.confidence,
+                        "cvss_estimate": pf.cvss_estimate,
+                        "confirmed_by_taint": pf.confirmed_by_taint,
+                        "confirmed_by_llm": pf.confirmed_by_llm,
+                        "remediation": pf.remediation,
+                    },
+                )
+                all_findings.append(finding)
+
         return AnalysisResult(
             aibom=aibom,
             findings=all_findings,
@@ -107,5 +177,8 @@ class AITraceEngine:
             architecture_result=architecture_result,
             architecture_graph=architecture_graph,
             attack_path_findings=attack_path_findings,
+            pattern_analysis=pattern_analysis,
+            crossfile_taint=crossfile_taint,
+            llm_verification=llm_verification,
         )
 

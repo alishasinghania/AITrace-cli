@@ -335,6 +335,139 @@ def to_findings_json(
     return out
 
 
+def _pattern_analysis_section(pattern_analysis: Any) -> str:
+    """Render pattern analysis section for markdown report."""
+    if not pattern_analysis:
+        return ""
+    findings = getattr(pattern_analysis, "findings", [])
+    if not findings:
+        return ""
+    lines = ["", "## Pattern Analysis", ""]
+    lines.append(f"**{len(findings)} pattern-based finding(s)** across {pattern_analysis.files_scanned} files.")
+    lines.append("")
+
+    # Severity breakdown
+    sev_counts: Dict[str, int] = {}
+    for f in findings:
+        sev_counts[f.severity] = sev_counts.get(f.severity, 0) + 1
+    badges = []
+    for sev in ("critical", "high", "medium", "low"):
+        if sev_counts.get(sev, 0):
+            emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(sev, "")
+            badges.append(f"{emoji} {sev_counts[sev]} {sev}")
+    if badges:
+        lines.append(" · ".join(badges))
+        lines.append("")
+
+    # Framework summary
+    fw = getattr(pattern_analysis, "framework_summary", {})
+    if fw:
+        lines.append(f"**Frameworks detected:** {', '.join(f'{k} ({v})' for k, v in sorted(fw.items(), key=lambda x: -x[1])[:5])}")
+        lines.append("")
+
+    # Findings table
+    lines.append("| ID | Title | Severity | Confidence | Taint | LLM | File |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for f in sorted(findings, key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(x.severity, 9)):
+        taint_mark = "✔" if f.confirmed_by_taint else "·"
+        llm_mark = "✔" if f.confirmed_by_llm else ("✗" if f.dismissed_as_fp else "·")
+        sev_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(f.severity, "")
+        conf_emoji = {"high": "●", "medium": "◐", "low": "○"}.get(f.confidence, "")
+        file_short = f.file.split("/")[-1] if "/" in f.file else f.file
+        lines.append(f"| `{f.vulnerability_id}` | {f.title[:50]} | {sev_emoji} {f.severity} | {conf_emoji} {f.confidence} | {taint_mark} | {llm_mark} | `{file_short}:{f.line or '?'}` |")
+    lines.append("")
+
+    # Scan errors summary
+    errors = getattr(pattern_analysis, "scan_errors", [])
+    if errors:
+        lines.append(f"*{len(errors)} scan error(s) — run with --verbose to see details.*")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _crossfile_taint_section(crossfile_taint: Any) -> str:
+    """Render cross-file taint paths section."""
+    if not crossfile_taint:
+        return ""
+    paths = getattr(crossfile_taint, "taint_paths", [])
+    confirmed = [p for p in paths if p.confirmed]
+    if not confirmed:
+        return ""
+
+    lines = ["", "## Cross-File Taint Paths", ""]
+    stats = getattr(crossfile_taint, "graph_stats", {})
+    lines.append(
+        f"Call graph: **{stats.get('nodes', 0)}** functions, "
+        f"**{stats.get('sources', 0)}** sources, "
+        f"**{stats.get('sinks', 0)}** sinks, "
+        f"**{len(confirmed)}** confirmed path(s)."
+    )
+    lines.append("")
+
+    for tp in confirmed[:10]:  # Show at most 10 confirmed paths
+        source_short = tp.source_key.split("::")[-1] if "::" in tp.source_key else tp.source_key
+        sink_short = tp.sink_key.split("::")[-1] if "::" in tp.sink_key else tp.sink_key
+        hop_chain = " → ".join(
+            h.split("::")[-1] if "::" in h else h
+            for h in tp.hops
+            if "(sink not reached)" not in h
+        )
+        lines.append(f"**CONFIRMED** `{tp.sink_type}` path ({tp.hop_count} hop(s)):")
+        lines.append(f"  `{hop_chain}`")
+        if tp.confirms_pattern_ids:
+            lines.append(f"  Confirms: {', '.join(tp.confirms_pattern_ids)}")
+        lines.append("")
+
+    partial = [p for p in paths if p.partial]
+    if partial:
+        lines.append(f"*{len(partial)} partial path(s) (source reachable but sink not confirmed).*")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _llm_verification_section(llm_verification: Any) -> str:
+    """Render LLM verification section."""
+    if not llm_verification:
+        return ""
+    verifications = getattr(llm_verification, "verifications", [])
+    if not verifications:
+        return ""
+
+    lines = ["", "## LLM Verification", ""]
+    lines.append(
+        f"**{llm_verification.findings_verified}** verified · "
+        f"**{llm_verification.findings_dismissed}** false positives · "
+        f"**{llm_verification.findings_skipped}** skipped · "
+        f"**{llm_verification.api_calls_made}** API calls · "
+        f"**{llm_verification.total_tokens_used}** tokens"
+    )
+    lines.append("")
+
+    verified = [v for v in verifications if v.verified and not v.false_positive]
+    dismissed = [v for v in verifications if v.false_positive]
+
+    if verified:
+        lines.append("### Verified findings")
+        lines.append("")
+        for v in verified:
+            lines.append(f"**{v.finding_id}**: VERIFIED ({v.cvss_estimate}/10 CVSS · {v.exploit_complexity} complexity)")
+            lines.append(f"> {v.attack_scenario}")
+            if v.remediation:
+                lines.append(f"> **Fix:** {v.remediation}")
+            lines.append("")
+
+    if dismissed:
+        lines.append("### False positives")
+        lines.append("")
+        for v in dismissed:
+            lines.append(f"**{v.finding_id}**: FALSE POSITIVE — {v.false_positive_reason}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def to_risk_report_markdown(
     aibom: AIBOM,
     policy: PolicyReport | None,
@@ -348,6 +481,9 @@ def to_risk_report_markdown(
     repo_type: Optional[str] = None,
     architecture_graph: Optional[Dict[str, Any]] = None,
     attack_path_findings: Optional[Any] = None,
+    pattern_analysis: Optional[Any] = None,
+    crossfile_taint: Optional[Any] = None,
+    llm_verification: Optional[Any] = None,
 ) -> str:
     """
     Build a human-readable Enterprise Risk Report in Markdown, including
@@ -851,6 +987,11 @@ def to_risk_report_markdown(
     else:
         lines.append("- No specific actions recommended at this time.")
     lines.append("")
+
+    # Pattern analysis, taint paths, LLM verification (appended after main report)
+    lines.append(_pattern_analysis_section(pattern_analysis))
+    lines.append(_crossfile_taint_section(crossfile_taint))
+    lines.append(_llm_verification_section(llm_verification))
 
     return "\n".join(lines)
 

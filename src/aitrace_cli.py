@@ -70,6 +70,15 @@ def scan(
         "--exploit",
         help="Generate proof-of-concept exploit payloads from detected data flows.",
     ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help=(
+            "Semantically verify uncertain findings using Claude. "
+            "Requires ANTHROPIC_API_KEY environment variable. "
+            "Makes API calls with redacted code context."
+        ),
+    ),
 ) -> None:
     """
     Run AITrace analysis on a repository, optionally applying a policy.yaml and
@@ -88,6 +97,7 @@ def scan(
         typer.echo(f"Using policy file: {policy_path}")
 
     engine = AITraceEngine(repo_root)
+    engine.verify_with_llm = verify
     result = engine.analyze(policy_path=policy_path)
 
     out_path = Path(out_dir).expanduser().resolve()
@@ -143,6 +153,9 @@ def scan(
             result.repo_type,
             architecture_graph=result.architecture_graph,
             attack_path_findings=result.attack_path_findings,
+            pattern_analysis=result.pattern_analysis,
+            crossfile_taint=result.crossfile_taint,
+            llm_verification=result.llm_verification,
         )
         if exploit_payloads:
             risk_md += exploits_to_markdown(exploit_payloads)
@@ -215,7 +228,7 @@ def scan(
             typer.echo(f"Wrote {len(rag_poison.variants)} poison variants to aitrace-rag-poison-payload.txt.")
 
     from core.exporters.html_report import to_html_report
-    html_report = to_html_report(result, out_path)
+    html_report = to_html_report(result, out_path, exploit_payloads or None, verification_results or None)
     html_path = out_path / "aitrace-report.html"
     html_path.write_text(html_report, encoding="utf-8")
     typer.echo("Wrote interactive HTML report.")
