@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from .models import AIBOM, Finding, PolicyReport, PolicyRuleResult, Severity
+from ..models import AIBOM, Finding, PolicyReport, PolicyRuleResult, Severity
 
 
 @dataclass

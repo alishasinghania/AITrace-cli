@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .dataflow_analyzer import DataFlow, analyze_dataflows
-from .detectors._ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path
 
 # Agent invocation methods — async variants kept; bare "run" and "stream" removed
 # because they match subprocess.run(), file.stream(), etc. outside agent context.

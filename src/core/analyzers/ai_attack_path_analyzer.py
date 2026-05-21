@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from .models import AttackPathFinding
+from ..models import AttackPathFinding
 
 
 def _node_ids_by_kind(graph: Dict[str, Any]) -> Dict[str, List[str]]:

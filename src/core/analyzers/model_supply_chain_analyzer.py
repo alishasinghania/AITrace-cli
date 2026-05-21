@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-from .detectors._ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path
 
 # Model loading patterns: (chain_pattern, arg_name_for_model_id, source_label)
 # arg_name: "0" = first positional arg, or keyword name like "repo_id"

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .detectors._ast_utils import should_skip_path, walk_python_files, get_call_target_chain
+from ..utils.ast_utils import should_skip_path, walk_python_files, get_call_target_chain
 from .pattern_analyzer import PatternFinding
 
 

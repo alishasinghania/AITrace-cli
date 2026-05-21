@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..models import AIBOM, Finding, FindingCategory, PolicyReport, Severity
-from ..risk_scoring import compute_risk_score
+from ..governance.risk_scoring import compute_risk_score
 
 if TYPE_CHECKING:
     from ..architecture_inference import ArchitectureResult

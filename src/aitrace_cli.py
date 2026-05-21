@@ -8,7 +8,7 @@ from typing import Any, List, Optional
 
 import typer
 
-from core.cli_support import find_default_policy, resolve_repo_path
+from core.governance.cli_support import find_default_policy, resolve_repo_path
 from core.engine import AITraceEngine
 from core.exporters import (
     to_ai_component_mermaid,

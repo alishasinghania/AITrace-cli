@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from .detectors._ast_utils import walk_python_files, should_skip_path
+from ..utils.ast_utils import walk_python_files, should_skip_path
 
 # Extend path filter to skip dataflow_analyzer itself when used from discovery
 def _should_skip(path: Path, repo_root: Path) -> bool:

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from .detectors._ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path
 
 # Sensitive keywords in variable names -> risk level
 SENSITIVE_KEYWORDS: Dict[str, str] = {

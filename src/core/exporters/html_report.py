@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from core.engine import AnalysisResult
     from core.features.exploit_synthesizer import ExploitPayload
     from core.features.finding_verifier import VerificationResult
-    from core.risk_scoring import RiskScoreResult
+    from core.governance.risk_scoring import RiskScoreResult
 
 _SEV_COLOR: Dict[str, str] = {
     "CRITICAL": "#ef4444",
@@ -502,7 +502,7 @@ def to_html_report(
     verification_results: Optional[List["VerificationResult"]] = None,
 ) -> str:
     """Build and return a self-contained HTML report string."""
-    from core.risk_scoring import compute_risk_score
+    from core.governance.risk_scoring import compute_risk_score
     from core.exporters.component_diagram import to_ai_component_mermaid
     from core.models import FindingCategory
 

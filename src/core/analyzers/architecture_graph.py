@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .models import AIBOM, DataFlowGraph
+from ..models import AIBOM, DataFlowGraph
 
 
 # Node kinds for the architecture graph

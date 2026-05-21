@@ -6,5 +6,5 @@ and export utilities for generating AI Bills of Materials (AIBOM) and
 associated governance reports.
 """
 
-from .architecture_inference import ArchitectureResult, infer_architecture  # noqa: F401
+from .analyzers.architecture_inference import ArchitectureResult, infer_architecture  # noqa: F401
 from .engine import AITraceEngine, AnalysisResult  # noqa: F401
