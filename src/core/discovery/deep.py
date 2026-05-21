@@ -182,6 +182,16 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
         except (OSError, json.JSONDecodeError):
             continue
         servers = config.get("mcpServers") or config.get("mcp_servers") or {}
+        from core.detectors.mcp_detector import (
+            scan_tool_descriptions,
+            scan_companion_tool_files,
+            scan_python_mcp_server_file,
+            _BUILTIN_TOOL_NAMES,
+        )
+
+        # Track tool names across all servers in this config for shadowing detection
+        cross_server_tools: Dict[str, str] = {}  # tool_name -> first_server_name
+
         for name, cfg in servers.items():
             if not isinstance(cfg, dict):
                 continue
@@ -194,10 +204,79 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                 elif any("mcp" in str(a).lower() or "modelcontextprotocol" in str(a).lower() for a in args):
                     pkg = next((a for a in args if "mcp" in str(a).lower() or "modelcontextprotocol" in str(a).lower()), name)
 
-            from core.detectors.mcp_detector import scan_tool_descriptions
+            # --- hardcoded credentials in env block ---
+            from core.detectors.mcp_detector import _check_env_for_credentials
+            env = cfg.get("env") or {}
+            cred_evidence = _check_env_for_credentials(env, name, str(mcp_rel))
+            if cred_evidence:
+                findings.append(
+                    Finding(
+                        id=next_id("DEEP"),
+                        title=f"Hardcoded credentials in MCP server config: {name}",
+                        category=FindingCategory.SEMANTIC,
+                        severity=Severity.CRITICAL,
+                        description=(
+                            f"MCP server '{name}' ({mcp_rel}) has hardcoded credentials "
+                            "in its env block. Anyone with access to this config file — "
+                            "including via version control history — can read these secrets."
+                        ),
+                        evidence=[Evidence(
+                            description=ev[:200],
+                            file=str(mcp_rel),
+                        ) for ev in cred_evidence[:5]],
+                        tags=["mcp-server", "hardcoded-credentials", "secrets"],
+                    )
+                )
+
+            # --- inline tool descriptions ---
             suspicious_tools = scan_tool_descriptions(cfg)
+
+            # --- companion JSON tool files (e.g. mcp/filesystem_tools.json) ---
+            companion_evidence = scan_companion_tool_files(repo_root, name)
+            if companion_evidence:
+                suspicious_tools.extend(
+                    [ev.split(":")[0] for ev in companion_evidence if ev]
+                )
+
             suspicious = bool(suspicious_tools)
             trust_score = max(0, 100 - 50 * len(suspicious_tools))
+
+            # --- Python MCP server: response injection + tool shadowing ---
+            py_tool_names: List[str] = []
+            injection_evidence: List[str] = []
+            py_rel: str = ""
+            py_candidate: Optional[Path] = None
+            if str(command or "").lower() in ("python", "python3") and isinstance(args, list):
+                # Convert module path arg (e.g. "-m app.mcp.web_search_server") to file path
+                mod_arg = next(
+                    (a for a in args if isinstance(a, str) and not a.startswith("-")),
+                    None,
+                )
+                if mod_arg:
+                    py_rel = mod_arg.replace(".", "/") + ".py"
+                    py_candidate = repo_root / py_rel
+                    if py_candidate.exists():
+                        py_tool_names, injection_evidence = scan_python_mcp_server_file(py_candidate)
+
+            # Tool shadowing: check this server's tools against previous servers
+            shadowing_findings: List[str] = []
+            for tname in py_tool_names:
+                tname_lower = tname.lower()
+                if tname_lower in cross_server_tools:
+                    shadowing_findings.append(
+                        f"TOOL SHADOWING: '{tname}' also registered by '{cross_server_tools[tname_lower]}'"
+                    )
+                    trust_score -= 25
+                else:
+                    cross_server_tools[tname_lower] = name
+                # Flag generic built-in name collision
+                if tname_lower in _BUILTIN_TOOL_NAMES:
+                    shadowing_findings.append(
+                        f"BUILTIN COLLISION: '{tname}' shadows a common built-in tool name"
+                    )
+                    trust_score -= 20
+
+            trust_score = max(0, trust_score)
 
             mcp_servers.append(
                 MCPServer(
@@ -208,7 +287,7 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                     args=args if isinstance(args, list) else [],
                     package=pkg,
                     trust_score=trust_score,
-                    suspicious_description=suspicious,
+                    suspicious_description=suspicious or bool(injection_evidence),
                     suspicious_tools=suspicious_tools,
                 )
             )
@@ -223,21 +302,25 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                     tags=["mcp-server"],
                 )
             )
-            if suspicious:
+            if suspicious or companion_evidence:
+                all_poison_ev = [
+                    *([f"Inline: {t}" for t in suspicious_tools] if suspicious_tools else []),
+                    *([f"Companion file: {e}" for e in companion_evidence[:5]] if companion_evidence else []),
+                ]
                 findings.append(
                     Finding(
                         id=next_id("DEEP"),
-                        title=f"MCP tool injection detected: {name}",
+                        title=f"MCP poisoned tool description: {name}",
                         category=FindingCategory.SEMANTIC,
                         severity=Severity.CRITICAL,
                         description=(
                             f"MCP server '{name}' ({mcp_rel}) has tool(s) with descriptions "
-                            f"matching prompt-injection patterns: {', '.join(suspicious_tools)}. "
-                            "An attacker-controlled server can hijack agent behaviour via "
-                            "malicious tool descriptions read before each tool call."
+                            f"matching prompt-injection patterns. "
+                            "An attacker-controlled tool schema can hijack agent behaviour "
+                            "by embedding instructions the LLM reads before every tool call."
                         ),
                         evidence=[Evidence(
-                            description="Suspicious tool description(s) in MCP config",
+                            description="; ".join(all_poison_ev[:3]) or "Suspicious tool description",
                             file=str(mcp_rel),
                             extra={"suspicious_tools": suspicious_tools, "trust_score": trust_score},
                         )],
@@ -245,6 +328,69 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                         metadata={"suspicious_tools": suspicious_tools, "trust_score": trust_score},
                     )
                 )
+            if injection_evidence:
+                findings.append(
+                    Finding(
+                        id=next_id("DEEP"),
+                        title=f"MCP server response injection: {name}",
+                        category=FindingCategory.SEMANTIC,
+                        severity=Severity.HIGH,
+                        description=(
+                            f"MCP server '{name}' ({py_rel or mcp_rel}) "
+                            "returns tool results that contain instruction injection patterns. "
+                            "The LLM may follow injected commands embedded in tool return values."
+                        ),
+                        evidence=[Evidence(
+                            description=injection_evidence[0][:200],
+                            file=py_rel if py_rel else str(mcp_rel),
+                        )],
+                        tags=["mcp-server", "response-injection", "prompt-injection"],
+                    )
+                )
+            if shadowing_findings:
+                findings.append(
+                    Finding(
+                        id=next_id("DEEP"),
+                        title=f"MCP tool shadowing: {name}",
+                        category=FindingCategory.SEMANTIC,
+                        severity=Severity.HIGH,
+                        description=(
+                            f"MCP server '{name}' registers tool name(s) that conflict with "
+                            "other servers or built-in capabilities. The LLM may call the wrong "
+                            "server, enabling query interception or behaviour hijacking."
+                        ),
+                        evidence=[Evidence(
+                            description="; ".join(shadowing_findings[:3]),
+                            file=str(mcp_rel),
+                        )],
+                        tags=["mcp-server", "tool-shadowing"],
+                    )
+                )
+
+        # --- Broad JSON scan: catch poisoned tool files anywhere in the repo ---
+        from core.detectors.mcp_detector import scan_all_json_tool_files
+        broad_findings = scan_all_json_tool_files(repo_root)
+        # Deduplicate against companion findings already reported
+        _reported_files = {str(mcp_rel)}
+        for ev_str, ev_file in broad_findings:
+            if ev_file in _reported_files:
+                continue
+            _reported_files.add(ev_file)
+            findings.append(
+                Finding(
+                    id=next_id("DEEP"),
+                    title="Poisoned tool definition file detected",
+                    category=FindingCategory.SEMANTIC,
+                    severity=Severity.CRITICAL,
+                    description=(
+                        f"JSON tool definition file '{ev_file}' contains tool descriptions "
+                        "matching prompt-injection or credential patterns. Any agent that loads "
+                        "this schema will receive attacker-controlled instructions."
+                    ),
+                    evidence=[Evidence(description=ev_str[:200], file=ev_file)],
+                    tags=["mcp-server", "prompt-injection", "tool-schema"],
+                )
+            )
 
     return DeepDiscoveryResult(
         models=models, components=components, findings=findings, mcp_servers=mcp_servers

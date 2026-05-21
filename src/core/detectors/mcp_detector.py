@@ -7,15 +7,17 @@ Extended to detect:
 - Hardcoded credentials in env blocks
 - Dangerous tool names (shell, exec, run_command)
 - Tool shadowing across servers
-- Companion tool definition files
+- Companion tool definition files (any *.json with a "tools" array)
+- Python MCP server response injection
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import re as _re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .base import DetectionResult
 
@@ -90,10 +92,11 @@ def _check_env_for_credentials(env: Any, server_name: str, source: str) -> List[
     return found
 
 
-def _scan_companion_tool_files(repo_root: Path, server_name: str) -> List[str]:
+def scan_companion_tool_files(repo_root: Path, server_name: str) -> List[str]:
     """
     Look for companion tool definition JSON files referenced by an MCP server.
-    Checks: mcp/*_tools.json, mcp/tools/*.json, .cursor/*_tools.json
+    Checks: mcp/*_tools.json, mcp/tools/*.json, .cursor/*_tools.json, and any
+    JSON file in mcp/ or similar directories.
     """
     found: List[str] = []
     search_patterns = [
@@ -114,6 +117,116 @@ def _scan_companion_tool_files(repo_root: Path, server_name: str) -> List[str]:
         tools = data.get("tools") or data.get("functions") or data
         found.extend(_check_tool_descriptions(tools, server_name, rel))
     return found
+
+
+# Keep old private name as alias for any internal callers
+_scan_companion_tool_files = scan_companion_tool_files
+
+# Patterns indicating injected instructions in tool return values
+_RESPONSE_INJECTION_PATTERNS = [
+    _re.compile(r"\b(include|repeat|output|print|say|tell)\b.{0,50}\b(verbatim|exactly|word.for.word)\b", _re.I),
+    _re.compile(r"\bin your next\s+(response|message|reply|output)\b", _re.I),
+    _re.compile(r"\bdo not\s+(mention|tell|reveal|disclose)\b", _re.I),
+    _re.compile(r"\bignore\b.{0,30}\b(previous|prior|above|instructions?)\b", _re.I),
+    _re.compile(r"\balways\s+(include|append|add|output|return)\b", _re.I),
+    _re.compile(r"\bnew (instructions?|task|objective|directive)\b", _re.I),
+    _re.compile(r"\bsystem\s*(override|instruction|command)\b", _re.I),
+]
+
+# Generic MCP-builtin tool names — shadowing these is high risk
+_BUILTIN_TOOL_NAMES = {
+    "search", "read_file", "write_file", "list_directory", "execute",
+    "run_command", "bash", "python", "get_file", "list_files",
+    "fetch", "browse", "web_search",
+}
+
+
+def scan_all_json_tool_files(repo_root: Path) -> List[Tuple[str, str]]:
+    """
+    Scan ALL JSON files in the repo for tool definition arrays with poisoned
+    descriptions or hardcoded credentials. Works regardless of file location.
+    Returns list of (evidence_string, relative_file_path) tuples.
+    """
+    found: List[Tuple[str, str]] = []
+    _skip_dirs = {"node_modules", ".git", "__pycache__", "venv", ".venv", "dist", "build", ".tox"}
+    for json_path in repo_root.rglob("*.json"):
+        rel = str(json_path.relative_to(repo_root))
+        if any(skip in rel.split("/") for skip in _skip_dirs):
+            continue
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        tools = data.get("tools") or data.get("functions") or []
+        if not tools:
+            continue
+        server_label = json_path.stem
+        evidence_list = _check_tool_descriptions(tools, server_label, rel)
+        for ev in evidence_list:
+            found.append((ev, rel))
+        # Also check for hardcoded credentials in env blocks at top level
+        env = data.get("env") or {}
+        cred_ev = _check_env_for_credentials(env, server_label, rel)
+        for ev in cred_ev:
+            found.append((ev, rel))
+    return found
+
+
+def scan_python_mcp_server_file(py_path: Path) -> Tuple[List[str], List[str]]:
+    """
+    Parse a Python file that implements an MCP server.
+    Returns (tool_names, injection_evidence).
+    tool_names: names extracted from list_tools() return values.
+    injection_evidence: evidence strings if tool handlers inject instructions.
+    """
+    tool_names: List[str] = []
+    injection_evidence: List[str] = []
+    try:
+        source = py_path.read_text(encoding="utf-8", errors="ignore")
+        tree = ast.parse(source)
+    except Exception:
+        return tool_names, injection_evidence
+
+    handler_names = {"call_tool", "handle_tool_call", "dispatch_tool"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        # Extract tool names from list_tools()
+        if node.name == "list_tools":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Dict):
+                    for i, k in enumerate(sub.keys):
+                        if isinstance(k, ast.Constant) and k.value == "name":
+                            v = sub.values[i]
+                            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                                tool_names.append(v.value)
+
+        # Check tool handler methods for response injection
+        is_handler = (
+            node.name in handler_names
+            or node.name.startswith("_handle_")
+            or node.name.startswith("handle_")
+        )
+        if is_handler:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    val = sub.value
+                    if len(val) < 10:
+                        continue
+                    for pat in _RESPONSE_INJECTION_PATTERNS:
+                        if pat.search(val):
+                            lineno = getattr(sub, "lineno", "?")
+                            injection_evidence.append(
+                                f"RESPONSE INJECTION at line {lineno} in "
+                                f"{node.name}(): {val[:100]!r}"
+                            )
+                            break
+
+    return tool_names, injection_evidence
 
 
 def scan_tool_descriptions(cfg: Dict[str, Any]) -> List[str]:

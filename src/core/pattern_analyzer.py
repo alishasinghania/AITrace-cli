@@ -1823,6 +1823,730 @@ def detect_pat018(
 
 
 # ---------------------------------------------------------------------------
+# PAT-019: HuggingFace / SentenceTransformer load without integrity pin
+# ---------------------------------------------------------------------------
+
+# Model loader calls that pull from a remote registry
+_HF_LOAD_NAMES = {
+    "sentencetransformer", "from_pretrained", "hf_hub_download",
+    "snapshot_download",
+}
+# Keyword args that indicate a pinned commit hash
+_HF_INTEGRITY_KWARGS = {"revision", "sha256", "commit_hash"}
+# Pattern that looks like a real commit SHA (40 hex chars)
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _is_hf_load_call(node: ast.Call) -> bool:
+    attr = _call_attr(node)
+    if attr in _HF_LOAD_NAMES:
+        return True
+    chain = _call_chain_str(node)
+    return any(n in chain for n in ("sentencetransformer", "from_pretrained", "hf_hub_download"))
+
+
+def _has_integrity_pin(node: ast.Call) -> bool:
+    """Return True if the call has a revision= pointing to a commit hash, or sha256=."""
+    for kw in node.keywords:
+        if kw.arg in _HF_INTEGRITY_KWARGS:
+            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                val = kw.value.value.strip()
+                if _SHA_RE.match(val):
+                    return True  # proper commit hash
+            # sha256= present (even if not validated here) counts
+            if kw.arg == "sha256":
+                return True
+    return False
+
+
+def detect_pat019(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-019: HuggingFace / SentenceTransformer loaded without a commit-hash integrity pin."""
+    findings: List[PatternFinding] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not _is_hf_load_call(node):
+            continue
+        if _has_integrity_pin(node):
+            continue
+
+        # Extract the model id from the first positional arg
+        model_id = ""
+        if node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                model_id = first.value
+
+        # Skip obviously local paths
+        if model_id.startswith(("/", ".", "~")) or "\\" in model_id:
+            continue
+
+        lineno = getattr(node, "lineno", None)
+        call_str = _source_lines(source_text, lineno or 1)
+        framework = "huggingface"
+        loader = _call_attr(node)
+
+        findings.append(PatternFinding(
+            vulnerability_id="PAT-019",
+            title="AI model loaded without integrity pin — supply chain risk",
+            severity="high",
+            confidence="high",
+            category="LLM03 Supply Chain",
+            owasp_id="LLM03",
+            cwe="CWE-494",
+            file=file_path,
+            line=lineno,
+            function_name=None,
+            pattern_matched=f"{loader}({model_id!r}) — no revision= commit hash",
+            evidence=[
+                f"line {lineno}: {call_str}",
+                f"Model '{model_id}' loaded without a pinned commit SHA.",
+                "If the upstream account is compromised, malicious weights are downloaded silently.",
+            ],
+            framework=framework,
+            remediation=(
+                f"Pin the model to a specific commit: "
+                f"{loader}({model_id!r}, revision='<40-char-sha>'). "
+                "Mirror approved models to an internal artifact registry."
+            ),
+            cvss_estimate=7.5,
+        ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# PAT-020: Unauthenticated file upload endpoint feeding a RAG pipeline
+# ---------------------------------------------------------------------------
+
+# FastAPI / Flask / Starlette file upload parameter types
+_UPLOAD_TYPES = {"uploadfile", "file", "files", "filestorage"}
+# Auth dependency / decorator name fragments (case-insensitive)
+_AUTH_FRAGMENTS = {
+    "auth", "login", "token", "current_user", "get_current", "require",
+    "permission", "authorize", "oauth", "jwt", "session", "authenticated",
+    "principal", "security",
+}
+# RAG ingestion function name fragments
+_INGEST_FRAGMENTS = {"ingest", "index", "embed", "vectorize", "upsert", "add_document", "load"}
+
+
+def _func_has_auth(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Check if a function has auth via decorators, Depends(), or param names."""
+    # Check decorators
+    for dec in func.decorator_list:
+        dec_str = ast.unparse(dec).lower() if hasattr(ast, "unparse") else ""
+        if any(frag in dec_str for frag in _AUTH_FRAGMENTS):
+            return True
+
+    # Check parameters for auth dependency injection or auth-named params
+    for arg in func.args.args + func.args.kwonlyargs:
+        arg_lower = arg.arg.lower()
+        if any(frag in arg_lower for frag in _AUTH_FRAGMENTS):
+            return True
+        # Check default values / annotations for Depends(get_current_user)
+        if arg.annotation:
+            ann_str = ast.unparse(arg.annotation).lower() if hasattr(ast, "unparse") else ""
+            if any(frag in ann_str for frag in _AUTH_FRAGMENTS):
+                return True
+
+    # Check for Depends() calls in default args
+    for default in (func.args.defaults + func.args.kw_defaults):
+        if default is None:
+            continue
+        dep_str = ast.unparse(default).lower() if hasattr(ast, "unparse") else ""
+        if "depends" in dep_str or any(frag in dep_str for frag in _AUTH_FRAGMENTS):
+            return True
+
+    return False
+
+
+def _func_calls_ingest(func: ast.FunctionDef | ast.AsyncFunctionDef) -> Optional[str]:
+    """Return name of the first ingest-like call found in the function, or None."""
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call):
+            attr = _call_attr(node)
+            if any(frag in attr for frag in _INGEST_FRAGMENTS):
+                return attr
+    return None
+
+
+def detect_pat020(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-020: File upload endpoint with no auth check — knowledge base poisoning risk."""
+    findings: List[PatternFinding] = []
+
+    # Only check files that import FastAPI/Flask upload primitives
+    has_upload_import = any(
+        "uploadfile" in str(v).lower() or "filestorage" in str(v).lower()
+        or "file" in str(k).lower()
+        for k, v in import_map.items()
+    )
+    if not has_upload_import:
+        # Fall back: check source text for UploadFile usage
+        if "UploadFile" not in source_text and "FileStorage" not in source_text:
+            return findings
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        # Detect file upload parameters
+        upload_param = None
+        for arg in func.args.args + func.args.kwonlyargs:
+            ann = arg.annotation
+            if ann is None:
+                continue
+            ann_str = ast.unparse(ann).lower() if hasattr(ast, "unparse") else ""
+            if any(t in ann_str for t in _UPLOAD_TYPES):
+                upload_param = arg.arg
+                break
+
+        if upload_param is None:
+            continue
+
+        # Check for auth
+        if _func_has_auth(func):
+            continue
+
+        lineno = getattr(func, "lineno", None)
+        ingest_call = _func_calls_ingest(func)
+        severity = "critical" if ingest_call else "high"
+        evidence = [
+            f"line {lineno}: endpoint '{func.name}' accepts file upload via '{upload_param}'",
+            "No authentication dependency or decorator detected.",
+        ]
+        if ingest_call:
+            evidence.append(
+                f"File is passed to '{ingest_call}()' — directly poisons the knowledge base / vector store."
+            )
+
+        findings.append(PatternFinding(
+            vulnerability_id="PAT-020",
+            title="Unauthenticated file upload endpoint — RAG poisoning risk",
+            severity=severity,
+            confidence="high",
+            category="LLM04 Data Poisoning",
+            owasp_id="LLM04",
+            cwe="CWE-306",
+            file=file_path,
+            line=lineno,
+            function_name=func.name,
+            pattern_matched=f"{func.name}({upload_param}: UploadFile) — no auth",
+            evidence=evidence,
+            framework="fastapi/flask",
+            remediation=(
+                "Add authentication: FastAPI → add `current_user: User = Depends(get_current_user)`. "
+                "Scan uploaded content for prompt-injection patterns before indexing. "
+                "Require admin role for knowledge-base ingestion."
+            ),
+            cvss_estimate=9.1,
+        ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# PAT-021: MCP server response injection (Python-implemented MCP tool)
+# ---------------------------------------------------------------------------
+
+_MCP_RESPONSE_INJECTION_PATS = [
+    re.compile(r"\b(include|repeat|output|say)\b.{0,50}\b(verbatim|exactly|word.for.word)\b", re.I),
+    re.compile(r"\bin your next\s+(response|message|reply|output)\b", re.I),
+    re.compile(r"\bignore\b.{0,30}\b(previous|prior|instructions?)\b", re.I),
+    re.compile(r"\balways\s+(include|append|add|output)\b", re.I),
+    re.compile(r"\bnew (instructions?|task|objective|directive)\b", re.I),
+    re.compile(r"\bdo not\s+(mention|reveal|tell)\b", re.I),
+]
+_MCP_HANDLER_NAMES = {"call_tool", "handle_tool_call", "dispatch_tool"}
+
+
+def detect_pat021(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-021: MCP server tool handler returns injected instructions."""
+    findings: List[PatternFinding] = []
+
+    # Only scan files that look like Python MCP servers
+    has_list_tools = "list_tools" in source_text
+    has_call_tool = "call_tool" in source_text or "_handle_" in source_text
+    if not (has_list_tools or has_call_tool):
+        return findings
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        is_handler = (
+            func.name in _MCP_HANDLER_NAMES
+            or func.name.startswith("_handle_")
+            or func.name.startswith("handle_")
+        )
+        if not is_handler:
+            continue
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            val = node.value
+            if len(val) < 15:
+                continue
+            for pat in _MCP_RESPONSE_INJECTION_PATS:
+                if pat.search(val):
+                    lineno = getattr(node, "lineno", None)
+                    findings.append(PatternFinding(
+                        vulnerability_id="PAT-021",
+                        title="MCP server response injection — tool return hijacks agent",
+                        severity="high",
+                        confidence="high",
+                        category="LLM01 Prompt Injection",
+                        owasp_id="LLM01",
+                        cwe="CWE-74",
+                        file=file_path,
+                        line=lineno,
+                        function_name=func.name,
+                        pattern_matched=f"instruction injection in {func.name}() return value",
+                        evidence=[
+                            f"line {lineno}: {_source_lines(source_text, lineno or 1)}",
+                            f"Injected string: {val[:120]!r}",
+                            "Tool return value is read by the LLM as trusted context — injected instructions are followed.",
+                        ],
+                        framework="mcp",
+                        remediation=(
+                            "Never include imperative instructions in tool return values. "
+                            "Strip instruction patterns from tool responses before returning. "
+                            "Apply output filtering on all MCP server responses."
+                        ),
+                        cvss_estimate=8.0,
+                    ))
+                    break  # one finding per constant
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Repo-level: Known-vulnerable AI package version check
+# ---------------------------------------------------------------------------
+
+# (package_name_lower, max_bad_version_exclusive, severity, description)
+_KNOWN_VULN_PACKAGES: List[Tuple[str, str, str, str]] = [
+    ("langchain", "0.2.0", "critical",
+     "PALChain/SQLDatabaseChain arbitrary code execution; multiple prompt injection CVEs"),
+    ("langchain-experimental", "0.0.61", "critical",
+     "PythonREPL sandbox bypass — arbitrary code execution via crafted prompts"),
+    ("langchain-community", "0.2.0", "high",
+     "Multiple tool injection and SSRF vulnerabilities"),
+    ("llama-index", "0.10.0", "high",
+     "Prompt injection via malicious document loaders"),
+    ("transformers", "4.38.0", "high",
+     "Pickle deserialization vulnerability in model loading (CVE-2024-*)"),
+    ("crewai", "0.28.0", "medium",
+     "Agent goal hijack via crafted task descriptions"),
+]
+
+_PINNED_VERSION_RE = re.compile(
+    r"^([a-zA-Z0-9_.-]+)\s*==\s*([^\s;#]+)", re.MULTILINE
+)
+_REQUIREMENTS_FILES = (
+    "requirements.txt", "requirements-dev.txt", "requirements_dev.txt",
+    "requirements/base.txt", "requirements/prod.txt",
+)
+
+
+def _parse_version(v: str) -> Tuple[int, ...]:
+    """Parse '0.0.131' → (0, 0, 131). Non-numeric parts become 0."""
+    parts = []
+    for p in v.strip().split(".")[:4]:
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def _version_lt(a: str, b: str) -> bool:
+    """Return True if version string a < b."""
+    return _parse_version(a) < _parse_version(b)
+
+
+def _check_vulnerable_dependencies(repo_root: Path) -> List[PatternFinding]:
+    """Scan requirements files for known-vulnerable AI package versions."""
+    findings: List[PatternFinding] = []
+    seen: Set[str] = set()
+
+    for req_rel in _REQUIREMENTS_FILES:
+        req_path = repo_root / req_rel
+        if not req_path.exists():
+            continue
+        try:
+            content = req_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        for match in _PINNED_VERSION_RE.finditer(content):
+            pkg_raw, ver_raw = match.group(1), match.group(2)
+            pkg_lower = pkg_raw.lower().replace("_", "-")
+            lineno = content[: match.start()].count("\n") + 1
+
+            for vuln_pkg, max_safe, severity, description in _KNOWN_VULN_PACKAGES:
+                if pkg_lower != vuln_pkg:
+                    continue
+                if not _version_lt(ver_raw, max_safe):
+                    continue  # version is safe
+                key = f"{vuln_pkg}@{ver_raw}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(PatternFinding(
+                    vulnerability_id="PAT-022",
+                    title=f"Known-vulnerable AI package: {pkg_raw}=={ver_raw}",
+                    severity=severity,
+                    confidence="high",
+                    category="LLM03 Supply Chain",
+                    owasp_id="LLM03",
+                    cwe="CWE-1104",
+                    file=req_rel,
+                    line=lineno,
+                    function_name=None,
+                    pattern_matched=f"{pkg_raw}=={ver_raw} < {max_safe} (known-vulnerable)",
+                    evidence=[
+                        f"line {lineno}: {pkg_raw}=={ver_raw}",
+                        f"All versions < {max_safe} are vulnerable: {description}",
+                    ],
+                    framework="supply-chain",
+                    remediation=(
+                        f"Upgrade {pkg_raw} to >={max_safe}. "
+                        "Run `pip-audit -r requirements.txt` in CI to catch future CVEs."
+                    ),
+                    cvss_estimate=9.0 if severity == "critical" else 7.5,
+                ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# PAT-023: Inter-agent output promoted to trusted system context
+# ---------------------------------------------------------------------------
+
+# Phrases that signal an agent result is being elevated to trusted/system level
+_TRUST_ELEVATION_RE = re.compile(
+    r"(trusted\s+source|trusted\s+context|system\s+context|previous\s+research"
+    r"|verified\s+source|internal\s+data|authoritative|official\s+context"
+    r"|from\s+the\s+system|context\s+from\s+(agent|crew|research))",
+    re.I,
+)
+
+# Parameter names that indicate system-level context injection
+_SYSTEM_PARAM_NAMES = {
+    "system", "system_prompt", "system_message", "context",
+    "system_context", "instructions", "preamble",
+}
+
+# Agent call attributes that produce output
+_AGENT_OUTPUT_ATTRS = {
+    "kickoff", "kickoff_async", "run", "arun", "invoke", "ainvoke",
+    "chat", "stream", "initiate_chat",
+}
+
+
+def detect_pat023(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-023: Agent/crew output spliced into system context without sanitization."""
+    findings: List[PatternFinding] = []
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        # Step 1: track variables assigned from agent/crew calls
+        # e.g.  crew_output = crew.kickoff()
+        agent_output_vars: Dict[str, int] = {}  # var_name -> lineno
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not isinstance(node.value, ast.Call):
+                continue
+            call = node.value
+            attr = _call_attr(call)
+            if attr not in _AGENT_OUTPUT_ATTRS:
+                continue
+            chain = _call_chain_str(call)
+            if not any(frag in chain for frag in _AGENT_CHAIN_FRAGMENTS):
+                continue
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    agent_output_vars[tgt.id] = getattr(node, "lineno", 0)
+
+        if not agent_output_vars:
+            continue
+
+        # Step 2: track variables that are f-strings / format-strings containing
+        # an agent output var — one level of indirection
+        # e.g.  system_context = f"... {crew_output} ..."
+        derived_vars: Dict[str, Tuple[int, str, bool]] = {}
+        # var_name -> (lineno, source_agent_var, has_trust_lang)
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign):
+                continue
+            # Check all names referenced in the RHS
+            rhs_names = _names_in_expr(node.value)
+            matched = rhs_names & set(agent_output_vars)
+            if not matched:
+                continue
+            # Check for trust-elevation language in string constants in RHS
+            has_trust = False
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    if _TRUST_ELEVATION_RE.search(sub.value):
+                        has_trust = True
+                        break
+            source_var = next(iter(matched))
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    derived_vars[tgt.id] = (
+                        getattr(node, "lineno", 0), source_var, has_trust
+                    )
+
+        # Step 3: find ANY call with a system-context keyword arg that
+        # references an agent output var OR a derived var
+        all_tracked = {**{v: (ln, v, False) for v, ln in agent_output_vars.items()},
+                       **derived_vars}
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg not in _SYSTEM_PARAM_NAMES:
+                    continue
+                names_in_kw = _names_in_expr(kw.value)
+                # Also check if kw value IS directly one of the tracked vars
+                matched = names_in_kw & set(all_tracked)
+                if not matched:
+                    continue
+
+                var = next(iter(matched))
+                assign_line, source_var, has_trust_lang = all_tracked[var]
+                call_line = getattr(node, "lineno", None)
+
+                # Also scan the source text around the kw value for trust language
+                if not has_trust_lang:
+                    for sub in ast.walk(kw.value):
+                        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                            if _TRUST_ELEVATION_RE.search(sub.value):
+                                has_trust_lang = True
+                                break
+
+                confidence = "high" if has_trust_lang else "medium"
+                severity = "critical" if has_trust_lang else "high"
+
+                # Avoid duplicate findings at the same call site
+                key = (func.name, call_line, kw.arg)
+                if any(
+                    f.function_name == func.name and f.line == call_line
+                    for f in findings
+                ):
+                    continue
+
+                findings.append(PatternFinding(
+                    vulnerability_id="PAT-023",
+                    title="Agent output promoted to trusted system context — indirect prompt injection",
+                    severity=severity,
+                    confidence=confidence,
+                    category="LLM01 Prompt Injection (indirect)",
+                    owasp_id="LLM01",
+                    cwe="CWE-74",
+                    file=file_path,
+                    line=call_line,
+                    function_name=_get_func_name(func),
+                    pattern_matched=(
+                        f"agent output (via '{source_var}') used as {kw.arg}= "
+                        + ("with trust-elevation language" if has_trust_lang else "in call")
+                    ),
+                    evidence=[
+                        f"line {agent_output_vars.get(source_var, assign_line)}: "
+                        f"'{source_var}' assigned from agent/crew call",
+                        *(
+                            [f"line {assign_line}: '{var}' derived from '{source_var}' "
+                             f"(f-string/format with trust-elevation language)"]
+                            if var != source_var else []
+                        ),
+                        f"line {call_line}: '{var}' passed as {kw.arg}= — "
+                        "agent content flows into system-level context",
+                        "External multi-hop agent content treated as trusted instructions. "
+                        "An attacker controlling upstream content can inject system-level directives.",
+                    ],
+                    framework="langchain/crewai",
+                    remediation=(
+                        "Never promote agent or crew output to system-level context. "
+                        "Pass it as user-role content with clear delimiters: "
+                        "messages=[{\"role\":\"user\",\"content\":"
+                        "f\"<research>{crew_output}</research>\\n\\nUser: ...\"}]. "
+                        "Apply the same injection detection to inter-agent messages as to user input."
+                    ),
+                    cvss_estimate=9.0 if has_trust_lang else 7.5,
+                ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# PAT-024: Irreversible tool action without human-in-the-loop confirmation
+# ---------------------------------------------------------------------------
+
+# Irreversible action signatures: (call chain fragment, action type)
+_IRREVERSIBLE_CALLS: List[Tuple[str, str]] = [
+    # Email
+    ("sendmail", "email_send"),
+    ("send_message", "email_send"),
+    ("starttls", "email_send"),       # smtplib pattern
+    ("smtp", "email_send"),
+    # Payment / billing
+    ("stripe", "payment"),
+    ("create_charge", "payment"),
+    ("create_payment_intent", "payment"),
+    ("paypal", "payment"),
+    ("braintree", "payment"),
+    # Destructive filesystem
+    ("rmtree", "file_delete"),
+    ("unlink", "file_delete"),
+    # HTTP DELETE / destructive API
+    ("requests.delete", "api_delete"),
+    ("httpx.delete", "api_delete"),
+    ("aiohttp.delete", "api_delete"),
+    # Database destructive
+    ("drop_table", "db_destructive"),
+    ("truncate", "db_destructive"),
+]
+
+# Human approval patterns — any of these in the function body means it's gated
+_APPROVAL_FRAGMENTS = {
+    "interrupt", "human_in_the_loop", "humanapproval", "requires_approval",
+    "ask_human", "await_human", "confirmation", "confirm", "humantool",
+    "human_approval", "approve", "get_approval", "request_approval",
+    "humaninput", "human_input",
+}
+
+_ACTION_TYPE_LABELS = {
+    "email_send": "email sending",
+    "payment": "payment processing",
+    "file_delete": "file deletion",
+    "api_delete": "API DELETE call",
+    "db_destructive": "destructive database operation",
+}
+
+
+def _func_has_approval_gate(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if any human-approval pattern is present in the function."""
+    # Check function name itself
+    func_lower = func.name.lower()
+    if any(frag in func_lower for frag in _APPROVAL_FRAGMENTS):
+        return True
+    # Walk body for references to approval patterns
+    for node in ast.walk(func):
+        if isinstance(node, ast.Name) and any(frag in node.id.lower() for frag in _APPROVAL_FRAGMENTS):
+            return True
+        if isinstance(node, ast.Attribute) and any(frag in node.attr.lower() for frag in _APPROVAL_FRAGMENTS):
+            return True
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if any(frag in node.value.lower() for frag in _APPROVAL_FRAGMENTS):
+                return True
+    return False
+
+
+def detect_pat024(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-024: Irreversible tool action (email, payment, delete) with no human confirmation."""
+    findings: List[PatternFinding] = []
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        # Skip test functions and helper utilities
+        if func.name.startswith("test_") or func.name.startswith("_mock"):
+            continue
+
+        # Find irreversible action calls inside the function
+        irreversible_found: List[Tuple[str, str, int]] = []  # (fragment, action_type, lineno)
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            chain = _call_chain_str(node)
+            attr = _call_attr(node)
+            full = f"{chain}.{attr}" if chain else attr
+            for frag, action_type in _IRREVERSIBLE_CALLS:
+                if frag in full:
+                    irreversible_found.append((frag, action_type, getattr(node, "lineno", 0)))
+                    break
+
+        if not irreversible_found:
+            continue
+
+        # Check for human approval gate
+        if _func_has_approval_gate(func):
+            continue
+
+        frag, action_type, action_line = irreversible_found[0]
+        label = _ACTION_TYPE_LABELS.get(action_type, action_type)
+        func_line = getattr(func, "lineno", None)
+
+        findings.append(PatternFinding(
+            vulnerability_id="PAT-024",
+            title=f"Irreversible {label} without human-in-the-loop confirmation",
+            severity="critical",
+            confidence="high",
+            category="LLM08 Excessive Agency",
+            owasp_id="LLM08",
+            cwe="CWE-285",
+            file=file_path,
+            line=func_line,
+            function_name=_get_func_name(func),
+            pattern_matched=f"{frag}() called in {func.name}() — no approval gate",
+            evidence=[
+                f"line {func_line}: function '{func.name}' performs {label}",
+                f"line {action_line}: {frag}() called directly — no interrupt/confirm step",
+                "LLM can autonomously trigger this action for any recipient/target it decides upon.",
+                "No allowlist, no human review, no confirmation dialog before execution.",
+            ],
+            framework="langchain",
+            remediation=(
+                f"Add human-in-the-loop before {label}: "
+                "implement an interrupt/confirmation step that shows the LLM's intended action "
+                "and waits for explicit user approval before executing. "
+                "Define a recipient/target allowlist and reject calls outside it. "
+                "Log all invocations with full parameters for audit."
+            ),
+            cvss_estimate=9.1,
+        ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -1845,6 +2569,11 @@ _DETECTORS: List[Callable] = [
     detect_pat016,
     detect_pat017,
     detect_pat018,
+    detect_pat019,
+    detect_pat020,
+    detect_pat021,
+    detect_pat023,
+    detect_pat024,
 ]
 
 
@@ -1947,6 +2676,13 @@ def analyze_patterns(repo_root: Path) -> PatternAnalysisResult:
 
         all_findings.extend(file_findings)
 
+    # PAT-022: repo-level known-vulnerable AI package versions
+    try:
+        vuln_dep_findings = _check_vulnerable_dependencies(repo_root)
+        all_findings.extend(vuln_dep_findings)
+    except Exception as e:
+        scan_errors.append(f"PAT-022 CVE check: {e}")
+
     # PAT-012: repo-level Lethal Trifecta
     if cond_a_signals and cond_b_signals and cond_c_signals:
         fa, la = cond_a_signals[0]
@@ -1983,7 +2719,7 @@ def analyze_patterns(repo_root: Path) -> PatternAnalysisResult:
     return PatternAnalysisResult(
         findings=all_findings,
         files_scanned=files_scanned,
-        patterns_evaluated=len(_DETECTORS) + 1,  # +1 for PAT-012 repo-level
+        patterns_evaluated=len(_DETECTORS) + 2,  # +1 PAT-012 repo-level, +1 PAT-022 CVE check
         scan_errors=scan_errors,
         framework_summary=framework_summary,
     )

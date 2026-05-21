@@ -335,6 +335,36 @@ def to_findings_json(
     return out
 
 
+def _semantic_findings_section(findings: List[Finding]) -> str:
+    """Render a dedicated section for SEMANTIC security findings (MCP poisoning, etc.)."""
+    semantic = [f for f in (findings or []) if f.category == FindingCategory.SEMANTIC]
+    if not semantic:
+        return ""
+    # Sort: critical first
+    _sev_order = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2,
+                  Severity.LOW: 3, Severity.INFO: 4}
+    semantic.sort(key=lambda f: _sev_order.get(f.severity, 5))
+    lines = ["", "## Security Findings", ""]
+    lines.append(
+        f"**{len(semantic)} semantic security finding(s)** detected during deep analysis.\n"
+    )
+    for f in semantic:
+        badge = SEVERITY_BADGES.get(f.severity, "•")
+        sev_str = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+        lines.append(f"### {badge} {f.title}")
+        lines.append(f"**Severity:** {sev_str.upper()}  |  **Category:** {', '.join(f.tags or [])}")
+        lines.append("")
+        lines.append(f.description)
+        lines.append("")
+        for ev in (f.evidence or []):
+            ev_desc = getattr(ev, "description", str(ev))
+            ev_file = getattr(ev, "file", "")
+            loc = f" *(in `{ev_file}`)*" if ev_file else ""
+            lines.append(f"- {ev_desc}{loc}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _pattern_analysis_section(pattern_analysis: Any) -> str:
     """Render pattern analysis section for markdown report."""
     if not pattern_analysis:
@@ -987,6 +1017,9 @@ def to_risk_report_markdown(
     else:
         lines.append("- No specific actions recommended at this time.")
     lines.append("")
+
+    # Semantic security findings (MCP poisoning, response injection, tool shadowing, etc.)
+    lines.append(_semantic_findings_section(findings))
 
     # Pattern analysis, taint paths, LLM verification (appended after main report)
     lines.append(_pattern_analysis_section(pattern_analysis))
