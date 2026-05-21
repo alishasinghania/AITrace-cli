@@ -5,8 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aitrace-cli"
 version = "0.1.0"
+description = "AI Bill of Materials and Security Scanner"
 requires-python = ">=3.9"
-dependencies = ["typer>=0.12.3", "PyYAML>=6.0.2"]
+dependencies = [
+    "typer>=0.12.3",
+    "PyYAML>=6.0.2",
+]
+
+[project.optional-dependencies]
+verify = [
+    "litellm>=1.40.0",
+    "keyring>=24.0.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock>=3.0",
+]
 
 [project.scripts]
 aitrace = "aitrace_cli:main"
@@ -16,3 +30,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
