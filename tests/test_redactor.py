@@ -3,7 +3,7 @@ from __future__ import annotations
 """Tests for src/core/credentials/redactor.py"""
 
 import pytest
-from core.credentials.redactor import (
+from core.features.credentials.redactor import (
     redact_code_context,
     count_redactions,
     is_safe_to_send,

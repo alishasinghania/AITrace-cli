@@ -11,8 +11,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from core.pattern_analyzer import PatternFinding
-from core.crossfile_taint import CrossFileTaintResult
+from core.analyzers.pattern_analyzer import PatternFinding
+from core.analyzers.crossfile_taint import CrossFileTaintResult
 from core.features.llm_verifier import (
     LLMVerificationResult,
     VerificationResult,
@@ -366,7 +366,7 @@ def test_no_litellm_returns_empty_result():
 
 def test_verify_findings_uses_provider_config():
     """verify_findings uses model/key from ProviderConfig when provided."""
-    from core.credentials.resolver import ProviderConfig
+    from core.features.credentials.resolver import ProviderConfig
 
     finding = _pf("PAT-001", severity="high")
     pc = ProviderConfig(
@@ -583,7 +583,7 @@ def test_parse_failed_sets_error_field():
 
 def test_local_provider_config_no_api_key():
     """Ollama provider_config with no key should still work (key=None is valid for local)."""
-    from core.credentials.resolver import ProviderConfig
+    from core.features.credentials.resolver import ProviderConfig
 
     finding = _pf("PAT-001", severity="high")
     pc = ProviderConfig(provider="ollama", model="ollama/llama3")

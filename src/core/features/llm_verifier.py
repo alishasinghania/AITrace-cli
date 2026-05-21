@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
-    from core.pattern_analyzer import PatternFinding
-    from core.crossfile_taint import CrossFileTaintResult
-    from core.credentials.resolver import ProviderConfig
+    from core.analyzers.pattern_analyzer import PatternFinding
+    from core.analyzers.crossfile_taint import CrossFileTaintResult
+    from core.features.credentials.resolver import ProviderConfig
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -126,7 +126,7 @@ def build_verification_context(
 def _redact_code(code: str) -> str:
     """Apply privacy redaction before sending code to an external API."""
     try:
-        from core.credentials.redactor import redact_code_context
+        from core.features.credentials.redactor import redact_code_context
         return redact_code_context(code)
     except ImportError:
         pass
