@@ -334,10 +334,71 @@ def _should_skip(path: Path, repo_root: Path) -> bool:
     return False
 
 
+def _scan_fstring_exposures(repo_root: Path) -> List[SensitiveExposure]:
+    """
+    Cross-module taint: scan f-strings for sensitive variable names embedded
+    in string templates that are passed to LLM sinks.
+
+    Catches patterns like:
+        system_prompt = f"...{DB_PASSWORD}...{INTERNAL_API_KEY}..."
+        client.messages.create(system=system_prompt, ...)
+
+    where DB_PASSWORD is imported from config.py — invisible to intra-function analysis.
+    """
+    exposures: List[SensitiveExposure] = []
+
+    for path in walk_python_files_local(repo_root):
+        try:
+            rel = str(path.relative_to(repo_root))
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(source)
+        except (SyntaxError, OSError, ValueError):
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            # Look for assignments where the RHS is an f-string (JoinedStr)
+            if not isinstance(node.value, ast.JoinedStr):
+                continue
+            # Collect variable names embedded in the f-string
+            fstring_vars: Set[str] = set()
+            for piece in ast.walk(node.value):
+                if isinstance(piece, ast.Name):
+                    fstring_vars.add(piece.id)
+            # Check if any embedded var looks sensitive
+            for var in fstring_vars:
+                risk = _var_contains_sensitive(var)
+                if not risk:
+                    continue
+                # Check if the assigned variable is used in an LLM call nearby
+                # (heuristic: flag the f-string assignment itself as exposure)
+                exposures.append(SensitiveExposure(
+                    variable=var,
+                    sink="f-string template (cross-module taint)",
+                    file=rel,
+                    line=getattr(node, "lineno", None),
+                    risk=risk,
+                    external_provider=True,
+                ))
+    return exposures
+
+
+def walk_python_files_local(repo_root: Path):
+    """Walk Python files, skipping common non-source dirs."""
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules",
+                 ".tox", "dist", "build", "eggs", ".eggs", "site-packages"}
+    for path in repo_root.rglob("*.py"):
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        yield path
+
+
 def analyze_sensitive_exposures(repo_root: Path) -> SensitiveExposureResult:
     """Analyze Python files for sensitive variables flowing into LLM sinks."""
     repo_root = Path(repo_root).resolve()
-    all_exposures: List[SensitiveExposure] = []
+    # Include cross-module f-string taint findings
+    all_exposures: List[SensitiveExposure] = _scan_fstring_exposures(repo_root)
     seen: Set[tuple] = set()
 
     for path in repo_root.rglob("*.py"):

@@ -45,7 +45,7 @@ SOURCE_RISK: Dict[str, str] = {
 # Source patterns: (chain_patterns, source_type)
 # source_type must be a key in SOURCE_RISK; risk is derived via SOURCE_RISK.get(source_type)
 SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
-    # HTTP request user input
+    # HTTP request user input — Flask / raw ASGI
     (["request", "json"], "user_input"),
     (["request", "args"], "user_input"),
     (["request", "form"], "user_input"),
@@ -57,6 +57,24 @@ SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
     (["flask", "request", "args"], "user_input"),
     (["flask", "request", "form"], "user_input"),
     (["flask", "request", "files"], "user_input"),
+    # FastAPI — Pydantic model fields read from request body
+    # e.g. async def chat(body: ChatRequest): ... body.message
+    (["body", "message"], "user_input"),
+    (["body", "query"], "user_input"),
+    (["body", "prompt"], "user_input"),
+    (["body", "input"], "user_input"),
+    (["body", "text"], "user_input"),
+    (["body", "content"], "user_input"),
+    # FastAPI — common Pydantic schema field names used directly as params
+    (["message"], "user_input"),
+    (["query"], "user_input"),
+    (["user_query"], "user_input"),
+    (["user_input"], "user_input"),
+    (["user_message"], "user_input"),
+    (["chat_input"], "user_input"),
+    # FastAPI — await request.json() / request.body()
+    (["request", "body"], "user_input"),
+    (["request", "json"], "user_input"),
     (["input"], "user_input"),
     (["sys", "argv"], "user_input"),
     # Database fields — require cursor/session/db context to avoid matching generic .execute()
@@ -106,6 +124,36 @@ SINK_PATTERNS: List[Tuple[List[str], str]] = [
     (["generativeai", "generate_content"], "generativeai.generate_content"),
     (["chat", "completions", "create"], "LLM ChatCompletion.create"),
     (["messages", "create"], "LLM messages.create"),
+    # LangChain specific multi-token patterns — unambiguous
+    (["chain", "invoke"], "LangChain chain.invoke"),
+    (["llm", "invoke"], "LangChain LLM invoke"),
+    (["agent", "invoke"], "LangChain Agent invoke"),
+    (["retrieval_chain", "invoke"], "LangChain RetrievalChain"),
+    (["qa_chain", "invoke"], "LangChain QA chain"),
+    (["agent_executor", "invoke"], "LangChain AgentExecutor"),
+    (["query_engine", "query"], "LlamaIndex query engine"),
+    (["index", "query"], "LlamaIndex index query"),
+    (["as_query_engine"], "LlamaIndex query engine"),
+    # LangChain specific multi-token patterns — unambiguous
+    (["chain", "invoke"], "LangChain chain.invoke"),
+    (["llm", "invoke"], "LangChain LLM invoke"),
+    (["agent", "invoke"], "LangChain Agent invoke"),
+    (["retrieval_chain", "invoke"], "LangChain RetrievalChain"),
+    (["qa_chain", "invoke"], "LangChain QA chain"),
+    (["agent_executor", "invoke"], "LangChain AgentExecutor"),
+    (["query_engine", "query"], "LlamaIndex query engine"),
+    (["index", "query"], "LlamaIndex index query"),
+    (["as_query_engine"], "LlamaIndex query engine"),
+    # LangChain specific multi-token patterns — unambiguous
+    (["chain", "invoke"], "LangChain chain.invoke"),
+    (["llm", "invoke"], "LangChain LLM invoke"),
+    (["agent", "invoke"], "LangChain Agent invoke"),
+    (["retrieval_chain", "invoke"], "LangChain RetrievalChain"),
+    (["qa_chain", "invoke"], "LangChain QA chain"),
+    (["agent_executor", "invoke"], "LangChain AgentExecutor"),
+    (["query_engine", "query"], "LlamaIndex query engine"),
+    (["index", "query"], "LlamaIndex index query"),
+    (["as_query_engine"], "LlamaIndex query engine"),
     # Generic single-token patterns — only matched when SINK_PROVIDER_INDICATORS present in chain
     (["invoke"], "LangChain LLM invoke"),
     (["generate"], "LLM generate"),
@@ -261,6 +309,13 @@ def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
         if chain and chain[-1].lower() in ("json", "args", "form", "data"):
             if len(chain) >= 2 and chain[0].lower() in ("request", "req"):
                 return ("user_input", _get_source_risk("user_input"))
+        # FastAPI Pydantic attrs — checked independently (not nested inside json/args/form check)
+        _FASTAPI_ATTRS = {
+            "message", "query", "prompt", "input", "text",
+            "content", "user_query", "user_input", "user_message",
+        }
+        if len(chain) >= 2 and chain[-1].lower() in _FASTAPI_ATTRS:
+            return ("user_input", _get_source_risk("user_input"))
     if isinstance(node, ast.Subscript):
         if isinstance(node.value, ast.Attribute):
             chain = _get_attr_chain(node.value)

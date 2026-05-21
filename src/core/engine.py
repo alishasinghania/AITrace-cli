@@ -46,6 +46,8 @@ class AITraceEngine:
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root.resolve()
+        self.verify_with_llm: bool = False
+        self.provider_config: Optional[Any] = None  # ProviderConfig from credentials subsystem
 
     def analyze(self, policy_path: Optional[Path] = None) -> AnalysisResult:
         # Surface discovery
@@ -126,6 +128,7 @@ class AITraceEngine:
                     self.repo_root,
                     pattern_analysis.findings,
                     crossfile_taint,
+                    provider_config=getattr(self, "provider_config", None),
                 )
             except Exception:
                 pass

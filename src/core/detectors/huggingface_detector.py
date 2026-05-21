@@ -20,6 +20,9 @@ HF_AST_PATTERNS = {
     "BertModel", "GPT2LMHeadModel", "T5ForConditionalGeneration",
     "StableDiffusionPipeline", "DiffusionPipeline", "AutoencoderKL",
     "transformers", "diffusers", "load_model", "PreTrainedModel",
+    # Sentence Transformers — used for embedding models in RAG pipelines
+    "SentenceTransformer", "sentence_transformers", "SentenceTransformerEmbeddings",
+    "HuggingFaceEmbeddings", "HuggingFaceBgeEmbeddings", "HuggingFaceInferenceAPI",
 }
 # "pipeline" alone matches redis.pipeline; require explicit HF context
 HF_PIPELINE_REQUIRED = {"transformers", "diffusers", "from_pretrained"}
