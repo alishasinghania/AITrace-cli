@@ -11,6 +11,8 @@ import ast
 import re
 from pathlib import Path
 
+from ..utils.ast_utils import should_skip_path
+
 # Entry-point files that indicate an application (standalone runnable app)
 APP_ENTRY_POINTS = ("app.py", "main.py", "server.py", "wsgi.py", "run.py", "manage.py")
 
@@ -52,19 +54,6 @@ def _count_subdirs(path: Path) -> int:
     return sum(1 for p in path.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
-def _should_skip_for_classifier(path: Path, repo_root: Path) -> bool:
-    """Skip venv, site-packages, tests, examples when scanning for app patterns."""
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    parts = set(rel.parts)
-    if parts & {"venv", ".venv", "site-packages", "node_modules", ".git"}:
-        return True
-    if "test" in parts or "tests" in parts or "examples" in parts:
-        return True
-    return False
-
 
 def _is_known_framework(repo_root: Path) -> bool:
     """Detect known framework packages via pyproject.toml or setup.py."""
@@ -101,7 +90,7 @@ def _is_known_framework(repo_root: Path) -> bool:
 def _has_fastapi_or_flask(repo_root: Path) -> bool:
     """Detect FastAPI or Flask app creation in Python files."""
     for py_path in repo_root.rglob("*.py"):
-        if _should_skip_for_classifier(py_path, repo_root):
+        if should_skip_path(py_path, repo_root):
             continue
         try:
             content = py_path.read_text(encoding="utf-8", errors="ignore")

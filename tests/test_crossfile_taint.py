@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from core.crossfile_taint import (
+from core.analyzers.crossfile_taint import (
     CrossFileTaintResult,
     FunctionNode,
     TaintPath,
@@ -23,7 +23,7 @@ from core.crossfile_taint import (
     _detect_source,
     _sink_types_for_func,
 )
-from core.pattern_analyzer import PatternFinding
+from core.analyzers.pattern_analyzer import PatternFinding
 import ast
 
 

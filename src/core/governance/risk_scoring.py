@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from .models import AIBOM, Finding, FindingCategory, PolicyReport
+from ..models import AIBOM, Finding, FindingCategory, PolicyReport
 
 if TYPE_CHECKING:
     from .architecture_inference import ArchitectureResult

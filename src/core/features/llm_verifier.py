@@ -1,8 +1,9 @@
 """
-LLM Verifier — uses Anthropic API to semantically verify uncertain security findings.
+LLM Verifier — semantically verifies uncertain security findings via LLM.
 
-Only runs when --verify flag is passed. Uses claude-haiku-4-5-20251001 for
-speed and cost efficiency. Applies privacy redaction before sending code context.
+Uses litellm for provider-agnostic routing (OpenAI, Anthropic, Ollama, etc.).
+Only runs when --verify flag is passed.
+Code context is redacted before any external API call.
 """
 
 from __future__ import annotations
@@ -12,11 +13,12 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
-    from core.pattern_analyzer import PatternFinding
-    from core.crossfile_taint import CrossFileTaintResult
+    from core.analyzers.pattern_analyzer import PatternFinding
+    from core.analyzers.crossfile_taint import CrossFileTaintResult
+    from core.features.credentials.resolver import ProviderConfig
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -40,8 +42,10 @@ class VerificationResult:
     exploit_complexity: str        # "low" | "medium" | "high"
     requires_authentication: bool
     model_used: str
+    provider: str
     tokens_used: int
-    verification_time_ms: int
+    latency_ms: int
+    verification_time_ms: int      # alias for latency_ms (backwards compat)
     error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -62,7 +66,9 @@ class VerificationResult:
             "exploit_complexity": self.exploit_complexity,
             "requires_authentication": self.requires_authentication,
             "model_used": self.model_used,
+            "provider": self.provider,
             "tokens_used": self.tokens_used,
+            "latency_ms": self.latency_ms,
             "verification_time_ms": self.verification_time_ms,
             "error": self.error,
         }
@@ -77,6 +83,8 @@ class LLMVerificationResult:
     findings_skipped: int
     findings_errored: int
     total_tokens_used: int
+    provider_used: str = ""
+    model_used: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -87,31 +95,49 @@ class LLMVerificationResult:
             "findings_skipped": self.findings_skipped,
             "findings_errored": self.findings_errored,
             "total_tokens_used": self.total_tokens_used,
+            "provider_used": self.provider_used,
+            "model_used": self.model_used,
         }
 
 
 # ---------------------------------------------------------------------------
-# Privacy redaction
+# Context building (public — used by engine.py and tests)
 # ---------------------------------------------------------------------------
 
-_REDACTION_PATTERNS: List[tuple] = [
-    (re.compile(r'sk-[A-Za-z0-9]{20,}'), '[REDACTED_API_KEY]'),
-    (re.compile(r'(?i)bearer\s+[A-Za-z0-9_\-]{20,}'), '[REDACTED_TOKEN]'),
-    (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED_AWS_KEY]'),
-    (re.compile(r'postgresql://[^@\s]+@[^\s/]+'), 'postgresql://[REDACTED]@[REDACTED]'),
-    (re.compile(r'mysql://[^@\s]+@[^\s/]+'), 'mysql://[REDACTED]@[REDACTED]'),
-    (re.compile(r'-----BEGIN[\w\s]+PRIVATE KEY-----.*?-----END[\w\s]+PRIVATE KEY-----',
-                re.DOTALL), '[REDACTED_PRIVATE_KEY]'),
-    (re.compile(r'(?i)(password|passwd|secret|api_key)\s*=\s*["\'][^"\']{8,}["\']'),
-     r'\1=[REDACTED]'),
-    (re.compile(r'ghp_[A-Za-z0-9]{36,}'), '[REDACTED_GITHUB_TOKEN]'),
-    (re.compile(r'xox[bpoa]-[A-Za-z0-9\-]{20,}'), '[REDACTED_SLACK_TOKEN]'),
-]
+def build_verification_context(
+    repo_root: Path,
+    finding: "PatternFinding",
+    taint_result: "CrossFileTaintResult",
+    max_tokens: int = 3500,
+) -> Dict[str, str]:
+    """
+    Build the code context dict for *finding*.
 
+    Public so that engine.py and tests can call it without going through
+    the full verification pipeline.
+    """
+    return _gather_context(repo_root, finding, taint_result, max_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Redaction — delegates to credentials.redactor, falls back to local copy
+# ---------------------------------------------------------------------------
 
 def _redact_code(code: str) -> str:
-    """Apply privacy redaction patterns to code before sending to API."""
-    for pattern, replacement in _REDACTION_PATTERNS:
+    """Apply privacy redaction before sending code to an external API."""
+    try:
+        from core.features.credentials.redactor import redact_code_context
+        return redact_code_context(code)
+    except ImportError:
+        pass
+    # Minimal local fallback (subset of patterns)
+    _local_patterns = [
+        (re.compile(r'sk-[A-Za-z0-9]{20,}'), '[REDACTED_API_KEY]'),
+        (re.compile(r'(?i)bearer\s+[A-Za-z0-9_\-]{20,}'), '[REDACTED_TOKEN]'),
+        (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED_AWS_KEY]'),
+        (re.compile(r'(?i)(password|passwd|secret|api_key)\s*=\s*["\'][^"\']{8,}["\']'), r'\1=[REDACTED]'),
+    ]
+    for pattern, replacement in _local_patterns:
         try:
             code = pattern.sub(replacement, code)
         except Exception:
@@ -130,13 +156,12 @@ def _read_function_context(file_path: Path, line: int, source_lines: List[str]) 
         source = "\n".join(source_lines)
         tree = ast.parse(source)
     except Exception:
-        # Fall back to a window around the line
         start = max(0, line - 10)
         end = min(len(source_lines), line + 30)
-        numbered = [f"# line {i + 1}: {l}" for i, l in enumerate(source_lines[start:end], start=start)]
-        return "\n".join(numbered)
+        return "\n".join(
+            f"# line {i + 1}: {l}" for i, l in enumerate(source_lines[start:end], start=start)
+        )
 
-    # Find the function containing this line
     best_func = None
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -148,18 +173,18 @@ def _read_function_context(file_path: Path, line: int, source_lines: List[str]) 
     if best_func is None:
         start = max(0, line - 10)
         end = min(len(source_lines), line + 30)
-        numbered = [f"# line {i + 1}: {l}" for i, l in enumerate(source_lines[start:end], start=start)]
-        return "\n".join(numbered)
+        return "\n".join(
+            f"# line {i + 1}: {l}" for i, l in enumerate(source_lines[start:end], start=start)
+        )
 
-    # Include ±5 lines before function for decorator context
     start = max(0, best_func.lineno - 6)
     end = min(len(source_lines), getattr(best_func, "end_lineno", best_func.lineno + 50))
-    numbered = [f"# line {i + 1}: {l}" for i, l in enumerate(source_lines[start:end], start=start)]
-    return "\n".join(numbered)
+    return "\n".join(
+        f"# line {i + 1}: {l}" for i, l in enumerate(source_lines[start:end], start=start)
+    )
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars per token."""
     return len(text) // 4
 
 
@@ -169,7 +194,6 @@ def _gather_context(
     taint_result: "CrossFileTaintResult",
     max_tokens: int = 3500,
 ) -> Dict[str, str]:
-    """Gather code context for a finding."""
     context: Dict[str, str] = {
         "primary_function": "",
         "imports": "",
@@ -184,25 +208,21 @@ def _gather_context(
     except OSError:
         return context
 
-    # Import block: first 30 lines
     import_lines = source_lines[:30]
     context["imports"] = _redact_code("\n".join(
         f"# line {i + 1}: {l}" for i, l in enumerate(import_lines)
     ))
 
-    # Primary function context
     line = finding.line or 1
     primary_fn = _read_function_context(file_path, line, source_lines)
     context["primary_function"] = _redact_code(primary_fn)
 
-    # Taint path summary
     if finding.taint_path:
         hops = [h for h in finding.taint_path if "(sink not reached)" not in h]
         context["taint_path_summary"] = "Taint path: " + " → ".join(hops)
     else:
         context["taint_path_summary"] = "Static taint analysis did not find a confirmed path."
 
-    # Supporting functions from taint path (max 3)
     supporting_parts: List[str] = []
     token_budget = max_tokens - _estimate_tokens(
         context["imports"] + context["primary_function"] + context["taint_path_summary"]
@@ -233,7 +253,7 @@ def _gather_context(
 
 
 # ---------------------------------------------------------------------------
-# Selection logic
+# Finding selection
 # ---------------------------------------------------------------------------
 
 _PRIORITY_ORDER = ["PAT-012", "PAT-013", "PAT-002", "PAT-003"]
@@ -243,8 +263,6 @@ def _select_findings(
     findings: List["PatternFinding"],
     max_findings: int,
 ) -> List["PatternFinding"]:
-    """Select which findings to verify, in priority order."""
-    # Exclusions
     skippable: set = set()
     for f in findings:
         if f.confirmed_by_taint:
@@ -258,7 +276,6 @@ def _select_findings(
 
     candidates = [f for f in findings if id(f) not in skippable]
 
-    # Sort by priority
     def priority_key(f: "PatternFinding") -> int:
         if f.vulnerability_id in _PRIORITY_ORDER:
             return _PRIORITY_ORDER.index(f.vulnerability_id)
@@ -273,7 +290,7 @@ def _select_findings(
 
 
 # ---------------------------------------------------------------------------
-# API interaction
+# Prompt templates
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
@@ -294,10 +311,7 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _build_user_prompt(
-    finding: "PatternFinding",
-    context: Dict[str, str],
-) -> str:
+def _build_user_prompt(finding: "PatternFinding", context: Dict[str, str]) -> str:
     return f"""Review this security finding from an AI application.
 
 FINDING:
@@ -356,6 +370,10 @@ _SIMPLIFIED_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Response parsing
+# ---------------------------------------------------------------------------
+
 def _strip_markdown_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
@@ -370,7 +388,6 @@ def _parse_llm_response(text: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to extract JSON object from response
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             try:
@@ -380,10 +397,78 @@ def _parse_llm_response(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# litellm API call
+# ---------------------------------------------------------------------------
+
+def _call_litellm(
+    model: str,
+    api_key: Optional[str],
+    base_url: Optional[str],
+    prompt: str,
+    simplified: bool = False,
+) -> Tuple[Optional[str], int, Optional[str]]:
+    """
+    Call litellm with retry. Returns (response_text, tokens_used, error).
+    api_key is passed as a local parameter — never stored or logged.
+    """
+    try:
+        import litellm  # type: ignore
+    except ImportError:
+        return None, 0, "litellm not installed — run: pip install 'aitrace-cli[verify]'"
+
+    system = _SYSTEM_PROMPT
+    user = _SIMPLIFIED_PROMPT if simplified else prompt
+
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": 1024,
+    }
+    if api_key:
+        kwargs["api_key"] = api_key
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    backoff = 2
+    for attempt in range(3):
+        try:
+            response = litellm.completion(**kwargs)
+            text = ""
+            if response.choices:
+                text = response.choices[0].message.content or ""
+            usage = getattr(response, "usage", None)
+            tokens = 0
+            if usage:
+                tokens = getattr(usage, "total_tokens", 0) or (
+                    getattr(usage, "prompt_tokens", 0) + getattr(usage, "completion_tokens", 0)
+                )
+            return text, tokens, None
+        except Exception as exc:
+            err_str = str(exc)
+            # Rate limit / overloaded — retry with backoff
+            if any(code in err_str for code in ("429", "529", "rate_limit", "overloaded")):
+                if attempt < 2:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+            return None, 0, err_str
+
+    return None, 0, "max_retries_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# Result construction
+# ---------------------------------------------------------------------------
+
 def _build_verification_result(
     finding: "PatternFinding",
     parsed: Dict[str, Any],
     model: str,
+    provider: str,
     tokens: int,
     elapsed_ms: int,
     error: Optional[str] = None,
@@ -405,55 +490,15 @@ def _build_verification_result(
         exploit_complexity=str(parsed.get("exploit_complexity", "medium")),
         requires_authentication=bool(parsed.get("requires_authentication", False)),
         model_used=model,
+        provider=provider,
         tokens_used=tokens,
+        latency_ms=elapsed_ms,
         verification_time_ms=elapsed_ms,
         error=error,
     )
 
 
-def _call_api_with_retry(
-    client: Any,
-    model: str,
-    prompt: str,
-    simplified: bool = False,
-) -> tuple[Optional[str], int, Optional[str]]:
-    """Call Anthropic API with exponential backoff. Returns (response_text, tokens, error)."""
-    system = _SYSTEM_PROMPT
-    user = prompt if not simplified else _SIMPLIFIED_PROMPT
-
-    backoff = 2
-    for attempt in range(3):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=1024,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            text = response.content[0].text if response.content else ""
-            tokens = getattr(response.usage, "input_tokens", 0) + getattr(response.usage, "output_tokens", 0)
-            return text, tokens, None
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "529" in err_str or "rate_limit" in err_str.lower():
-                if attempt < 2:
-                    time.sleep(backoff)
-                    backoff *= 2
-                    continue
-            return None, 0, err_str
-
-    return None, 0, "max_retries_exceeded"
-
-
-# ---------------------------------------------------------------------------
-# Post-verification updater
-# ---------------------------------------------------------------------------
-
-def _apply_verification(
-    finding: "PatternFinding",
-    result: VerificationResult,
-) -> None:
-    """Mutate finding based on verification result."""
+def _apply_verification(finding: "PatternFinding", result: VerificationResult) -> None:
     if result.error:
         return
     if result.verified:
@@ -475,47 +520,53 @@ def verify_findings(
     repo_root: Path,
     pattern_findings: List["PatternFinding"],
     taint_result: "CrossFileTaintResult",
+    provider_config: Optional["ProviderConfig"] = None,
+    # Legacy parameters — kept for backwards compatibility with existing tests
     api_key: Optional[str] = None,
     model: str = "claude-haiku-4-5-20251001",
     max_findings_to_verify: int = 10,
 ) -> LLMVerificationResult:
     """
-    Semantically verify uncertain findings using the Anthropic API.
+    Semantically verify uncertain findings using an LLM via litellm.
 
-    Requires ANTHROPIC_API_KEY env var or api_key parameter.
-    Only runs when called explicitly (triggered by --verify flag).
+    Credential resolution is handled by ProviderConfig (passed by engine.py).
+    The legacy api_key/model parameters are still accepted for backwards compat.
     """
-    import os
+    _empty = LLMVerificationResult(
+        verifications=[],
+        api_calls_made=0,
+        findings_verified=0,
+        findings_dismissed=0,
+        findings_skipped=len(pattern_findings),
+        findings_errored=0,
+        total_tokens_used=0,
+    )
 
-    # Lazy import so the tool doesn't crash when anthropic isn't installed
+    # Resolve model + key from provider_config (preferred) or legacy params
+    resolved_model = model
+    resolved_key: Optional[str] = None
+    resolved_provider = "anthropic"
+    resolved_base_url: Optional[str] = None
+
+    if provider_config is not None:
+        resolved_model = provider_config.model
+        resolved_key = provider_config.api_key
+        resolved_provider = provider_config.provider
+        resolved_base_url = provider_config.base_url
+    elif api_key:
+        resolved_key = api_key
+    else:
+        # No provider config — try litellm without explicit key
+        # (litellm will pick up env vars itself)
+        pass
+
+    # Verify litellm is importable
     try:
-        import anthropic
+        import litellm  # noqa: F401
     except ImportError:
-        return LLMVerificationResult(
-            verifications=[],
-            api_calls_made=0,
-            findings_verified=0,
-            findings_dismissed=0,
-            findings_skipped=len(pattern_findings),
-            findings_errored=0,
-            total_tokens_used=0,
-        )
+        return _empty
 
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        return LLMVerificationResult(
-            verifications=[],
-            api_calls_made=0,
-            findings_verified=0,
-            findings_dismissed=0,
-            findings_skipped=len(pattern_findings),
-            findings_errored=0,
-            total_tokens_used=0,
-        )
-
-    client = anthropic.Anthropic(api_key=key)
     repo_root = Path(repo_root).resolve()
-
     selected = _select_findings(pattern_findings, max_findings_to_verify)
     skipped = len(pattern_findings) - len(selected)
 
@@ -527,22 +578,24 @@ def verify_findings(
     n_errored = 0
 
     for finding in selected:
-        # Rate limiting
         time.sleep(0.1)
 
         context = _gather_context(repo_root, finding, taint_result)
         prompt = _build_user_prompt(finding, context)
 
         start = time.time()
-        text, tokens, error = _call_api_with_retry(client, model, prompt)
+        text, tokens, error = _call_litellm(
+            resolved_model, resolved_key, resolved_base_url, prompt
+        )
         elapsed_ms = int((time.time() - start) * 1000)
         api_calls += 1
         total_tokens += tokens
 
         if error or not text:
-            # Retry with simplified prompt
             time.sleep(0.1)
-            text2, tokens2, error2 = _call_api_with_retry(client, model, prompt, simplified=True)
+            text2, tokens2, error2 = _call_litellm(
+                resolved_model, resolved_key, resolved_base_url, prompt, simplified=True
+            )
             api_calls += 1
             total_tokens += tokens2
             if error2 or not text2:
@@ -562,8 +615,10 @@ def verify_findings(
                     cvss_estimate=finding.cvss_estimate,
                     exploit_complexity="medium",
                     requires_authentication=False,
-                    model_used=model,
+                    model_used=resolved_model,
+                    provider=resolved_provider,
                     tokens_used=tokens2,
+                    latency_ms=elapsed_ms,
                     verification_time_ms=elapsed_ms,
                     error=error2 or "empty_response",
                 )
@@ -575,18 +630,19 @@ def verify_findings(
 
         parsed = _parse_llm_response(text)
         if parsed is None:
-            # Try simplified retry
             time.sleep(0.1)
-            text3, tokens3, error3 = _call_api_with_retry(client, model, prompt, simplified=True)
+            text3, tokens3, error3 = _call_litellm(
+                resolved_model, resolved_key, resolved_base_url, prompt, simplified=True
+            )
             api_calls += 1
             total_tokens += tokens3
-            if text3:
-                parsed = _parse_llm_response(text3) or {}
-            else:
-                parsed = {}
+            parsed = (_parse_llm_response(text3) if text3 else None) or {}
 
-        vr = _build_verification_result(finding, parsed, model, tokens, elapsed_ms,
-                                         error=None if parsed else "parse_failed")
+        vr = _build_verification_result(
+            finding, parsed, resolved_model, resolved_provider,
+            tokens, elapsed_ms,
+            error=None if parsed else "parse_failed",
+        )
         verifications.append(vr)
         _apply_verification(finding, vr)
 
@@ -597,6 +653,10 @@ def verify_findings(
         if vr.error:
             n_errored += 1
 
+    # Clear key from provider_config after all calls
+    if provider_config is not None:
+        provider_config.clear_key()
+
     return LLMVerificationResult(
         verifications=verifications,
         api_calls_made=api_calls,
@@ -605,4 +665,6 @@ def verify_findings(
         findings_skipped=skipped,
         findings_errored=n_errored,
         total_tokens_used=total_tokens,
+        provider_used=resolved_provider,
+        model_used=resolved_model,
     )

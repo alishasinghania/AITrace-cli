@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .detectors import (
+from ..detectors import (
     DetectionResult,
     detect_agents,
     detect_huggingface,
@@ -21,7 +21,7 @@ from .detectors import (
     detect_rag,
     detect_shadow_ai,
 )
-from .models import AIBOM
+from ..models import AIBOM
 
 # Blocklist: evidence that is noise, not meaningful AI architecture (applied at detection merge)
 _ARCH_COMPONENT_BLOCKLIST = (

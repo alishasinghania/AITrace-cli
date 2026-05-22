@@ -4,11 +4,11 @@ import json
 import webbrowser
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import typer
 
-from core.cli_support import find_default_policy, resolve_repo_path
+from core.governance.cli_support import find_default_policy, resolve_repo_path
 from core.engine import AITraceEngine
 from core.exporters import (
     to_ai_component_mermaid,
@@ -74,9 +74,36 @@ def scan(
         False,
         "--verify",
         help=(
-            "Semantically verify uncertain findings using Claude. "
-            "Requires ANTHROPIC_API_KEY environment variable. "
+            "Semantically verify uncertain findings using an LLM. "
+            "Requires a stored credential (run: aitrace configure) or env var. "
             "Makes API calls with redacted code context."
+        ),
+    ),
+    verify_model: Optional[str] = typer.Option(
+        None,
+        "--verify-model",
+        help=(
+            "LLM model for verification. Any litellm model string is accepted, e.g. "
+            "'claude-haiku-4-5-20251001', 'gpt-4o-mini', 'ollama/llama3'. "
+            "Default: claude-haiku-4-5-20251001"
+        ),
+    ),
+    secret_ref: Optional[str] = typer.Option(
+        None,
+        "--secret-ref",
+        help=(
+            "Resolve the API key from an external secret store. "
+            "Formats: aws:secretsmanager:region:name, gcp:secretmanager:project/secret/versions/latest, "
+            "azure:keyvault:https://vault.azure.net/secrets/name, "
+            "hashicorp:vault:http://127.0.0.1:8200/v1/secret/data/aitrace, env:MY_VAR"
+        ),
+    ),
+    dry_run_verify: bool = typer.Option(
+        False,
+        "--dry-run-verify",
+        help=(
+            "Show which findings would be sent for LLM verification and the redacted "
+            "code context — without making any API calls."
         ),
     ),
 ) -> None:
@@ -96,9 +123,40 @@ def scan(
     if policy_path:
         typer.echo(f"Using policy file: {policy_path}")
 
+    # --- Credential resolution for --verify --------------------------------
+    provider_config = None
+    if verify or dry_run_verify:
+        chosen_model = verify_model or "claude-haiku-4-5-20251001"
+        try:
+            from core.features.credentials import ProviderConfig, detect_provider, resolve_api_key, CredentialNotFoundError
+            provider = detect_provider(chosen_model)
+            pc = ProviderConfig(provider=provider, model=chosen_model)
+            try:
+                provider_config = resolve_api_key(pc, secret_ref=secret_ref)
+                if not pc.is_local:
+                    typer.echo(
+                        f"  ✓ Credential resolved via {provider_config.resolution_method} "
+                        f"({provider_config.masked_key})"
+                    )
+            except CredentialNotFoundError as exc:
+                typer.echo(f"  ✗ {exc}", err=True)
+                if verify:
+                    typer.echo("  Continuing without LLM verification.", err=True)
+                    verify = False
+                    dry_run_verify = False
+        except ImportError:
+            pass
+
     engine = AITraceEngine(repo_root)
     engine.verify_with_llm = verify
+    if provider_config is not None:
+        engine.provider_config = provider_config
     result = engine.analyze(policy_path=policy_path)
+
+    # --- Dry-run verify mode -----------------------------------------------
+    if dry_run_verify:
+        _dry_run_verify(result, repo_root)
+        return
 
     out_path = Path(out_dir).expanduser().resolve()
     out_path.mkdir(parents=True, exist_ok=True)
@@ -294,6 +352,162 @@ risk:
 """
     target.write_text(template, encoding="utf-8")
     typer.echo(f"Wrote starter policy file to {target}")
+
+
+def _dry_run_verify(result: Any, repo_root: Path) -> None:
+    """Print which findings would be sent for LLM verification and their redacted context."""
+    from core.features.llm_verifier import _select_findings, build_verification_context, _build_user_prompt
+    from core.features.credentials.redactor import is_safe_to_send, count_redactions, redact_code_context
+
+    pattern_analysis = getattr(result, "pattern_analysis", None)
+    crossfile_taint = getattr(result, "crossfile_taint", None)
+
+    if pattern_analysis is None:
+        typer.echo("No pattern analysis results to verify.")
+        return
+
+    findings = getattr(pattern_analysis, "findings", [])
+    selected = _select_findings(findings, 10)
+
+    if not selected:
+        typer.echo("No findings selected for verification (all confirmed/dismissed/low).")
+        return
+
+    typer.echo(f"\n{'=' * 70}")
+    typer.echo(f"DRY RUN: {len(selected)} finding(s) would be sent for LLM verification")
+    typer.echo(f"{'=' * 70}\n")
+
+    class _EmptyTaint:
+        call_graph: dict = {}
+
+    taint = crossfile_taint or _EmptyTaint()
+
+    for i, f in enumerate(selected, 1):
+        context = build_verification_context(repo_root, f, taint)
+        prompt = _build_user_prompt(f, context)
+        safe, fired = is_safe_to_send(prompt)
+        n_redacted = count_redactions(prompt, redact_code_context(prompt))
+        typer.echo(f"[{i}] {f.vulnerability_id} — {f.title}")
+        typer.echo(f"     File: {f.file}:{f.line or '?'}  Severity: {f.severity}")
+        typer.echo(f"     Prompt size: ~{len(prompt) // 4} tokens")
+        typer.echo(f"     Redactions applied: {n_redacted}")
+        if not safe:
+            typer.echo(f"     ⚠ Potential sensitive patterns detected: {', '.join(fired)}", err=True)
+        else:
+            typer.echo("     ✓ No sensitive patterns detected in prompt")
+        typer.echo("")
+
+
+@app.command()
+def configure(
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        help="Provider to configure (e.g. anthropic, openai, google). Auto-detected if --model is set.",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Model string to infer provider from (e.g. claude-haiku-4-5-20251001).",
+    ),
+    delete: bool = typer.Option(
+        False,
+        "--delete",
+        help="Delete the stored key for this provider instead of writing one.",
+    ),
+    list_providers: bool = typer.Option(
+        False,
+        "--list",
+        help="List all providers with stored credentials.",
+    ),
+) -> None:
+    """
+    Securely store or manage API keys for LLM verification.
+
+    Keys are stored in the OS keychain (macOS Keychain, Windows Credential Manager,
+    or Linux libsecret). Never stored in plaintext or environment variables.
+
+    Usage:
+      aitrace configure --provider anthropic
+      aitrace configure --model gpt-4o-mini
+      aitrace configure --provider openai --delete
+      aitrace configure --list
+    """
+    try:
+        from core.features.credentials import detect_provider
+        from core.features.credentials import keychain as _kc
+        from core.features.credentials import config_store as _cs
+    except ImportError as exc:
+        typer.echo(f"Credentials subsystem unavailable: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if list_providers:
+        kc_available = _kc.is_available()
+        stored_config = _cs.list_stored_providers()
+        if not kc_available and not stored_config:
+            typer.echo("No credentials stored (keyring not available and config store empty).")
+            return
+        typer.echo("Stored credentials:")
+        if stored_config:
+            for p in stored_config:
+                typer.echo(f"  • {p}  (encrypted config store)")
+        if kc_available:
+            typer.echo("  (OS keychain entries cannot be enumerated — use --delete to remove)")
+        return
+
+    # Resolve provider name
+    resolved_provider = provider
+    if resolved_provider is None and model:
+        resolved_provider = detect_provider(model)
+        typer.echo(f"Detected provider: {resolved_provider}")
+    if not resolved_provider:
+        typer.echo("Specify --provider or --model to identify the provider.", err=True)
+        raise typer.Exit(1)
+
+    if delete:
+        kc_ok = _kc.delete_key(resolved_provider)
+        cs_ok = _cs.delete_provider_key(resolved_provider)
+        if kc_ok or cs_ok:
+            typer.echo(f"✓ Deleted stored key for '{resolved_provider}'.")
+        else:
+            typer.echo(f"No stored key found for '{resolved_provider}'.", err=True)
+        return
+
+    # Store new key
+    import getpass
+    try:
+        key = getpass.getpass(f"Enter API key for '{resolved_provider}' (input hidden): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        typer.echo("\nAborted.", err=True)
+        raise typer.Exit(1)
+
+    if not key:
+        typer.echo("Empty key — nothing stored.", err=True)
+        raise typer.Exit(1)
+
+    # Validate display format: first 4 + *** + last 4
+    display = f"{key[:4]}***{key[-4:]}" if len(key) >= 12 else f"{key[:2]}***"
+
+    # Try keychain first, fall back to encrypted config store
+    if _kc.is_available():
+        if _kc.write_key(resolved_provider, key):
+            # Clear key from local variable scope
+            key = ""
+            typer.echo(f"✓ Saved {display} to OS keychain for provider '{resolved_provider}'.")
+            return
+
+    if _cs.write_provider_key(resolved_provider, key):
+        key = ""
+        typer.echo(f"✓ Saved {display} to encrypted config store for provider '{resolved_provider}'.")
+        return
+
+    key = ""
+    typer.echo(
+        "Could not save to keychain or encrypted config store. "
+        "Install 'keyring' or 'cryptography': pip install 'aitrace-cli[verify]'",
+        err=True,
+    )
+    raise typer.Exit(1)
 
 
 def main() -> None:

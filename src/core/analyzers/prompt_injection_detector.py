@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .dataflow_analyzer import DataFlow, analyze_dataflows
-from .detectors._ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path, get_call_chain, get_attr_chain
 
 # Agent invocation methods — async variants kept; bare "run" and "stream" removed
 # because they match subprocess.run(), file.stream(), etc. outside agent context.
@@ -50,6 +50,23 @@ HIGH_RISK_TOOLS = {
     "searchtool", "browsertool", "shelltool", "pythontool", "gmailtoolspec",
     "serperapitool", "webtool", "bash", "shell", "python_repl", "code_interpreter",
     "execute",
+    # PythonREPL variants — LangChain code execution tools
+    "pythonrepltool", "pythonrepl", "repl", "python_repl_tool",
+    "baseshelltool", "shell_tool",
+}
+
+# Dangerous code execution patterns — variable names and call patterns
+# that indicate LLM output flows into exec() / eval() / cursor.execute()
+EXEC_SINK_NAMES = {
+    "exec", "eval", "compile", "subprocess", "os.system",
+    "cursor.execute", "conn.execute", "db.execute",
+}
+
+# Variable names that suggest they hold LLM-generated content
+LLM_OUTPUT_NAMES = {
+    "llm_output", "llm_response", "response", "completion", "generated",
+    "ai_output", "model_output", "agent_output", "result", "answer",
+    "generated_code", "generated_sql", "sql_query", "code",
 }
 
 # User input variable name heuristics — require "user_" prefix or explicit input-context suffix.
@@ -62,26 +79,6 @@ USER_INPUT_NAMES = {
 }
 
 
-def _get_call_chain(node: ast.Call) -> List[str]:
-    chain: List[str] = []
-    n = node.func
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
-
-
-def _get_attr_chain(node: ast.expr) -> List[str]:
-    chain: List[str] = []
-    n = node
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
 
 
 def _is_sanitization_call(node: ast.Call) -> bool:
@@ -89,7 +86,7 @@ def _is_sanitization_call(node: ast.Call) -> bool:
     if isinstance(node.func, ast.Name):
         return node.func.id.lower() in SANITIZATION_NAMES
     if isinstance(node.func, ast.Attribute):
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         chain_lower = ".".join(c.lower() for c in chain)
         return any(s in chain_lower for s in SANITIZATION_NAMES)
     return False
@@ -119,22 +116,35 @@ def _get_strings_in(node: ast.expr) -> Set[str]:
     return out
 
 
+_FASTAPI_INPUT_PARAMS = {
+    "message", "query", "user_query", "user_input", "user_message",
+    "prompt", "input", "text", "content", "chat_input", "question",
+}
+
+
 def _is_user_input_source(node: ast.expr) -> bool:
-    """Check if RHS of assignment is a user input source."""
+    """Check if RHS is a user input source — Flask, FastAPI, WebSocket."""
     if isinstance(node, ast.Call):
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         chain_str = ".".join(chain).lower()
-        if "request" in chain_str and ("json" in chain_str or "args" in chain_str or "form" in chain_str or "files" in chain_str):
+        if "request" in chain_str and (
+            "json" in chain_str or "args" in chain_str
+            or "form" in chain_str or "files" in chain_str
+        ):
             return True
         if "input" in chain_str and len(chain) <= 2:
             return True
         if "get_json" in chain_str or "get_data" in chain_str:
             return True
     if isinstance(node, ast.Attribute):
-        chain = _get_attr_chain(node)
+        chain = get_attr_chain(node)
         if chain and chain[0].lower() in ("request", "req"):
             if any(c in chain[-1].lower() for c in ("json", "args", "form", "data", "files")):
                 return True
+        if len(chain) >= 2 and chain[-1].lower() in _FASTAPI_INPUT_PARAMS:
+            return True
+    if isinstance(node, ast.Name) and node.id.lower() in _FASTAPI_INPUT_PARAMS:
+        return True
     return False
 
 
@@ -256,14 +266,14 @@ class _PromptInjectionVisitor(ast.NodeVisitor):
 
         # Track agent assignment
         if isinstance(node.value, ast.Call):
-            chain = _get_call_chain(node.value)
+            chain = get_call_chain(node.value)
             chain_str = ".".join(c.lower() for c in chain)
             if any(ap.lower() in chain_str for ap in AGENT_PATTERNS):
                 self.agent_vars.update(targets)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         chain_lower = [c.lower() for c in chain]
 
         # Agent creation with tools
@@ -299,45 +309,97 @@ class _PromptInjectionVisitor(ast.NodeVisitor):
                     if _is_high_risk_tool(s):
                         self.tools_in_file.add(s)
 
-        # Agent invocation: agent.invoke(user_input)
-        if len(chain) >= 2 and chain[-1].lower() in INVOKE_METHODS:
+        # Agent invocation: agent.invoke/run(user_input or f-string)
+        _INVOKE_AND_RUN = INVOKE_METHODS | {"run", "arun"}
+        if len(chain) >= 2 and chain[-1].lower() in _INVOKE_AND_RUN:
+            receiver_name = chain[0] if chain else ""
+            is_agent = (
+                receiver_name in self.agent_vars
+                or receiver_name.lower() in ("agent", "self")
+                or "agent" in receiver_name.lower()
+            )
+
+            def _tainted(n):
+                if isinstance(n, ast.Name):
+                    nm = n.id
+                    return (
+                        nm in self.user_input_vars or self._var_looks_like_user_input(nm),
+                        nm, nm in self.sanitized_vars,
+                    )
+                if isinstance(n, ast.JoinedStr):
+                    for p in ast.walk(n):
+                        if isinstance(p, ast.Name):
+                            nm = p.id
+                            if nm in self.user_input_vars or self._var_looks_like_user_input(nm):
+                                return True, f"f-string:{nm}", nm in self.sanitized_vars
+                if isinstance(n, ast.Dict):
+                    for v in (n.values or []):
+                        ok, r, s = _tainted(v)
+                        if ok:
+                            return True, f"dict:{r}", s
+                return False, "", False
+
             if node.args:
-                arg = node.args[0]
-                if isinstance(arg, ast.Name):
-                    arg_name = arg.id
-                    receiver_name = chain[0] if chain else ""
-                    is_agent = receiver_name in self.agent_vars
-                    is_user_input = arg_name in self.user_input_vars or self._var_looks_like_user_input(arg_name)
-                    is_sanitized = arg_name in self.sanitized_vars
-                    if is_agent and is_user_input and not is_sanitized:
-                        tools_list = list(self.tools_in_file)[:10] if self.tools_in_file else ["tools (inferred)"]
-                        self.risks.append(PromptInjectionRisk(
-                            type="agent_tools",
-                            severity="low" if is_sanitized else ("high" if self.tools_in_file else "medium"),
-                            sanitized=is_sanitized,
-                            source_file=self.file_path,
-                            sink_file=self.file_path,
-                            evidence=f"agent.invoke({arg_name}) with tools" + (" (mitigated)" if is_sanitized else ""),
-                            agent_framework=self._agent_framework or "agent",
-                            tools=tools_list,
-                            input_source=arg_name,
-                            risk="high" if self.tools_in_file else "medium",
-                            file=self.file_path,
-                            line=getattr(node, "lineno", None),
-                        ))
+                tainted, arg_repr, is_san = _tainted(node.args[0])
+                if is_agent and tainted and not is_san:
+                    tl = list(self.tools_in_file)[:10] if self.tools_in_file else ["tools (inferred)"]
+                    self.risks.append(PromptInjectionRisk(
+                        type="agent_tools",
+                        severity="critical" if self.tools_in_file else "high",
+                        sanitized=False,
+                        source_file=self.file_path,
+                        sink_file=self.file_path,
+                        evidence=f"agent.{chain[-1]}({arg_repr}) — user input reaches agent",
+                        agent_framework=self._agent_framework or "agent",
+                        tools=tl,
+                        input_source=arg_repr,
+                        risk="critical" if self.tools_in_file else "high",
+                        file=self.file_path,
+                        line=getattr(node, "lineno", None),
+                    ))
+
+        # PythonREPL / exec() — user input into code execution
+        _cs = ".".join(chain_lower)
+        if any(rt in _cs for rt in ("pythonrepl", "python_repl", "exec", "eval", "repl")):
+            for arg in node.args:
+                refs = {n.id for n in ast.walk(arg) if isinstance(n, ast.Name)}
+                if refs & self.user_input_vars or any(
+                    self._var_looks_like_user_input(r) for r in refs
+                ):
+                    self.risks.append(PromptInjectionRisk(
+                        type="code_execution", severity="critical", sanitized=False,
+                        source_file=self.file_path, sink_file=self.file_path,
+                        evidence=f"User input into {_cs} — RCE risk",
+                        agent_framework="python_repl", tools=["PythonREPLTool"],
+                        input_source=str(refs & self.user_input_vars or refs),
+                        risk="critical", file=self.file_path,
+                        line=getattr(node, "lineno", None),
+                    ))
+
+        # cursor.execute(sql) — LLM-generated SQL without parameterization
+        if len(chain_lower) >= 2 and chain_lower[-1] == "execute" and any(
+            x in chain_lower for x in ("cursor", "conn", "db")
+        ):
+            for arg in node.args:
+                refs = {n.id for n in ast.walk(arg) if isinstance(n, ast.Name)}
+                sql_vars = {
+                    r for r in refs if any(
+                        kw in r.lower()
+                        for kw in ("sql", "query", "result", "response", "output", "generated", "statement")
+                    )
+                }
+                if sql_vars:
+                    self.risks.append(PromptInjectionRisk(
+                        type="sql_injection_via_llm", severity="critical", sanitized=False,
+                        source_file=self.file_path, sink_file=self.file_path,
+                        evidence=f"cursor.execute({list(sql_vars)[0]}) — LLM SQL without parameterization",
+                        agent_framework="", tools=[],
+                        input_source=str(sql_vars), risk="critical",
+                        file=self.file_path, line=getattr(node, "lineno", None),
+                    ))
+
         self.generic_visit(node)
 
-
-def _should_skip(path: Path, repo_root: Path) -> bool:
-    if should_skip_path(path, repo_root):
-        return True
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    if "core" in rel.parts and "prompt_injection_detector" in rel.parts:
-        return True
-    return False
 
 
 def analyze_prompt_injection(
@@ -375,7 +437,7 @@ def analyze_prompt_injection(
 
     # 2. Agent + tools flows (with sanitization)
     for path in repo_root.rglob("*.py"):
-        if path.suffix != ".py" or _should_skip(path, repo_root):
+        if path.suffix != ".py" or should_skip_path(path, repo_root):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
