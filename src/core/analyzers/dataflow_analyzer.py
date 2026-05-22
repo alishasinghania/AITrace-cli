@@ -13,20 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from ..utils.ast_utils import walk_python_files, should_skip_path
+from ..utils.ast_utils import walk_python_files, should_skip_path, get_call_chain, get_attr_chain
 
 # Extend path filter to skip dataflow_analyzer itself when used from discovery
-def _should_skip(path: Path, repo_root: Path) -> bool:
-    if should_skip_path(path, repo_root):
-        return True
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    if "core" in rel.parts and "dataflow_analyzer" in rel.parts:
-        return True
-    return False
-
 
 # ---------------------------------------------------------------------------
 # Source risk classification: risk level by source type
@@ -77,16 +66,16 @@ SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
     (["request", "json"], "user_input"),
     (["input"], "user_input"),
     (["sys", "argv"], "user_input"),
-    # Database fields — require cursor/session/db context to avoid matching generic .execute()
+    # Database fields
     (["cursor", "execute"], "external_api"),
     (["session", "query"], "external_api"),
     (["db", "execute"], "external_api"),
     (["conn", "execute"], "external_api"),
     (["fetchall"], "external_api"),
     (["fetchone"], "external_api"),
-    # Specific file-read patterns only — bare ["load"] and ["read"] taint every file operation
+    # Specific file-read patterns only
     (["open"], "file_read"),
-    (["loads"], "file_read"),         # json.loads / yaml.safe_load result
+    (["loads"], "file_read"),
     (["read_csv"], "file_read"),
     (["read_json"], "file_read"),
     (["load_json"], "file_read"),
@@ -108,9 +97,7 @@ SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
 ]
 
 # Sink patterns: (chain_contains, sink_label)
-# Multi-token patterns are matched directly; single-token generics require SINK_PROVIDER_INDICATORS.
 SINK_PATTERNS: List[Tuple[List[str], str]] = [
-    # Fully-qualified, unambiguous LLM API calls
     (["openai", "chat", "completions", "create"], "openai.ChatCompletion.create"),
     (["client", "chat", "completions", "create"], "client.chat.completions.create"),
     (["openai", "completion", "create"], "openai.Completion.create"),
@@ -124,7 +111,6 @@ SINK_PATTERNS: List[Tuple[List[str], str]] = [
     (["generativeai", "generate_content"], "generativeai.generate_content"),
     (["chat", "completions", "create"], "LLM ChatCompletion.create"),
     (["messages", "create"], "LLM messages.create"),
-    # LangChain specific multi-token patterns — unambiguous
     (["chain", "invoke"], "LangChain chain.invoke"),
     (["llm", "invoke"], "LangChain LLM invoke"),
     (["agent", "invoke"], "LangChain Agent invoke"),
@@ -134,36 +120,12 @@ SINK_PATTERNS: List[Tuple[List[str], str]] = [
     (["query_engine", "query"], "LlamaIndex query engine"),
     (["index", "query"], "LlamaIndex index query"),
     (["as_query_engine"], "LlamaIndex query engine"),
-    # LangChain specific multi-token patterns — unambiguous
-    (["chain", "invoke"], "LangChain chain.invoke"),
-    (["llm", "invoke"], "LangChain LLM invoke"),
-    (["agent", "invoke"], "LangChain Agent invoke"),
-    (["retrieval_chain", "invoke"], "LangChain RetrievalChain"),
-    (["qa_chain", "invoke"], "LangChain QA chain"),
-    (["agent_executor", "invoke"], "LangChain AgentExecutor"),
-    (["query_engine", "query"], "LlamaIndex query engine"),
-    (["index", "query"], "LlamaIndex index query"),
-    (["as_query_engine"], "LlamaIndex query engine"),
-    # LangChain specific multi-token patterns — unambiguous
-    (["chain", "invoke"], "LangChain chain.invoke"),
-    (["llm", "invoke"], "LangChain LLM invoke"),
-    (["agent", "invoke"], "LangChain Agent invoke"),
-    (["retrieval_chain", "invoke"], "LangChain RetrievalChain"),
-    (["qa_chain", "invoke"], "LangChain QA chain"),
-    (["agent_executor", "invoke"], "LangChain AgentExecutor"),
-    (["query_engine", "query"], "LlamaIndex query engine"),
-    (["index", "query"], "LlamaIndex index query"),
-    (["as_query_engine"], "LlamaIndex query engine"),
-    # Generic single-token patterns — only matched when SINK_PROVIDER_INDICATORS present in chain
     (["invoke"], "LangChain LLM invoke"),
     (["generate"], "LLM generate"),
     (["pipeline"], "transformers pipeline"),
-    # "run" and "create" removed: too generic even with provider checks.
-    # chain.run() is LangChain-deprecated; openai/anthropic .create() caught by patterns above.
 ]
 
 # Provider names that confirm a generic single-token sink is an LLM call.
-# Removed "chain", "index", "query_engine" — too common in non-LLM code.
 SINK_PROVIDER_INDICATORS = {
     "openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral",
     "litellm", "llm", "langchain", "llamaindex", "llama_index",
@@ -242,19 +204,6 @@ class DataFlowAnalysisResult:
         }
 
 
-def _get_call_chain(node: ast.Call) -> List[str]:
-    """Get full call chain e.g. ['openai', 'chat', 'completions', 'create']."""
-    chain: List[str] = []
-    n = node.func
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    elif isinstance(n, ast.Call):
-        chain.extend(_get_call_chain(n))
-    return list(reversed(chain))
-
 
 def _get_assign_targets(node: ast.Assign) -> List[str]:
     """Get assigned variable names from Assign node."""
@@ -269,17 +218,6 @@ def _get_assign_targets(node: ast.Assign) -> List[str]:
     return names
 
 
-def _get_attr_chain(node: ast.expr) -> List[str]:
-    """Get attribute chain e.g. request.json -> ['request','json']."""
-    chain: List[str] = []
-    n = node
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
-
 
 def _get_source_risk(source_type: str) -> str:
     """Derive risk level from source type using SOURCE_RISK mapping."""
@@ -288,7 +226,7 @@ def _get_source_risk(source_type: str) -> str:
 
 def _is_source_call(node: ast.Call) -> Optional[Tuple[str, str]]:
     """Return (source_type, risk) if node is a source call."""
-    chain = _get_call_chain(node)
+    chain = get_call_chain(node)
     chain_str = ".".join(chain).lower()
     for pattern, source_type in SOURCE_PATTERNS:
         pat_str = ".".join(pattern).lower()
@@ -302,7 +240,7 @@ def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
     if isinstance(node, ast.Call):
         return _is_source_call(node)
     if isinstance(node, ast.Attribute):
-        chain = _get_attr_chain(node)
+        chain = get_attr_chain(node)
         for pattern, source_type in SOURCE_PATTERNS:
             if len(pattern) <= len(chain) and pattern == [c.lower() for c in chain[-len(pattern):]]:
                 return (source_type, _get_source_risk(source_type))
@@ -318,7 +256,7 @@ def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
             return ("user_input", _get_source_risk("user_input"))
     if isinstance(node, ast.Subscript):
         if isinstance(node.value, ast.Attribute):
-            chain = _get_attr_chain(node.value)
+            chain = get_attr_chain(node.value)
             if chain and chain[0].lower() in ("request", "req") and chain[-1].lower() in ("args", "form"):
                 return ("user_input", _get_source_risk("user_input"))
         if isinstance(node.value, ast.Name) and node.value.id.lower() == "sys":
@@ -330,7 +268,7 @@ def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
 
 def _is_sanitization_call(node: ast.Call) -> bool:
     """Return True if this call is a sanitization function (escape, sanitize, guardrails, etc.)."""
-    chain = _get_call_chain(node)
+    chain = get_call_chain(node)
     chain_lower = ".".join(c.lower() for c in chain)
     for pattern in SANITIZATION_PATTERNS:
         pat_str = ".".join(p.lower() for p in pattern)
@@ -344,7 +282,7 @@ _GENERIC_SINK_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
 
 def _is_sink_call(node: ast.Call) -> Optional[str]:
     """Return sink label if node is an LLM sink."""
-    chain = _get_call_chain(node)
+    chain = get_call_chain(node)
     chain_set = set(c.lower() for c in chain)
     for pattern, label in SINK_PATTERNS:
         if not _chain_matches(chain, pattern):
@@ -478,7 +416,7 @@ def analyze_dataflows(repo_root: Path) -> DataFlowAnalysisResult:
     seen: Set[Tuple[str, str, str, Optional[int]]] = set()
 
     for path in repo_root.rglob("*.py"):
-        if path.suffix != ".py" or _should_skip(path, repo_root):
+        if path.suffix != ".py" or should_skip_path(path, repo_root):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))

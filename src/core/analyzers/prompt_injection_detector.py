@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .dataflow_analyzer import DataFlow, analyze_dataflows
-from ..utils.ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path, get_call_chain, get_attr_chain
 
 # Agent invocation methods — async variants kept; bare "run" and "stream" removed
 # because they match subprocess.run(), file.stream(), etc. outside agent context.
@@ -79,26 +79,6 @@ USER_INPUT_NAMES = {
 }
 
 
-def _get_call_chain(node: ast.Call) -> List[str]:
-    chain: List[str] = []
-    n = node.func
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
-
-
-def _get_attr_chain(node: ast.expr) -> List[str]:
-    chain: List[str] = []
-    n = node
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
 
 
 def _is_sanitization_call(node: ast.Call) -> bool:
@@ -106,7 +86,7 @@ def _is_sanitization_call(node: ast.Call) -> bool:
     if isinstance(node.func, ast.Name):
         return node.func.id.lower() in SANITIZATION_NAMES
     if isinstance(node.func, ast.Attribute):
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         chain_lower = ".".join(c.lower() for c in chain)
         return any(s in chain_lower for s in SANITIZATION_NAMES)
     return False
@@ -145,7 +125,7 @@ _FASTAPI_INPUT_PARAMS = {
 def _is_user_input_source(node: ast.expr) -> bool:
     """Check if RHS is a user input source — Flask, FastAPI, WebSocket."""
     if isinstance(node, ast.Call):
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         chain_str = ".".join(chain).lower()
         if "request" in chain_str and (
             "json" in chain_str or "args" in chain_str
@@ -157,7 +137,7 @@ def _is_user_input_source(node: ast.expr) -> bool:
         if "get_json" in chain_str or "get_data" in chain_str:
             return True
     if isinstance(node, ast.Attribute):
-        chain = _get_attr_chain(node)
+        chain = get_attr_chain(node)
         if chain and chain[0].lower() in ("request", "req"):
             if any(c in chain[-1].lower() for c in ("json", "args", "form", "data", "files")):
                 return True
@@ -286,14 +266,14 @@ class _PromptInjectionVisitor(ast.NodeVisitor):
 
         # Track agent assignment
         if isinstance(node.value, ast.Call):
-            chain = _get_call_chain(node.value)
+            chain = get_call_chain(node.value)
             chain_str = ".".join(c.lower() for c in chain)
             if any(ap.lower() in chain_str for ap in AGENT_PATTERNS):
                 self.agent_vars.update(targets)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         chain_lower = [c.lower() for c in chain]
 
         # Agent creation with tools
@@ -421,17 +401,6 @@ class _PromptInjectionVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _should_skip(path: Path, repo_root: Path) -> bool:
-    if should_skip_path(path, repo_root):
-        return True
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    if "core" in rel.parts and "prompt_injection_detector" in rel.parts:
-        return True
-    return False
-
 
 def analyze_prompt_injection(
     repo_root: Path,
@@ -468,7 +437,7 @@ def analyze_prompt_injection(
 
     # 2. Agent + tools flows (with sanitization)
     for path in repo_root.rglob("*.py"):
-        if path.suffix != ".py" or _should_skip(path, repo_root):
+        if path.suffix != ".py" or should_skip_path(path, repo_root):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))

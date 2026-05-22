@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from ..utils.ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path, get_call_chain
 
 # Sensitive keywords in variable names -> risk level
 SENSITIVE_KEYWORDS: Dict[str, str] = {
@@ -130,16 +130,6 @@ def _var_contains_sensitive(name: str) -> Optional[str]:
     return None
 
 
-def _get_call_chain(node: ast.Call) -> List[str]:
-    chain: List[str] = []
-    n = node.func
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
-
 
 def _chain_matches(chain: List[str], pattern: List[str]) -> bool:
     chain_lower = [c.lower() for c in chain]
@@ -153,7 +143,7 @@ def _chain_matches(chain: List[str], pattern: List[str]) -> bool:
 
 
 def _is_llm_sink(node: ast.Call) -> Optional[str]:
-    chain = _get_call_chain(node)
+    chain = get_call_chain(node)
     chain_set = set(c.lower() for c in chain)
     # Single-token generic patterns that require a provider indicator in the chain
     _GENERIC_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
@@ -197,7 +187,7 @@ EXTERNAL_PROVIDER_SINKS = {"OpenAI API", "Anthropic API", "Cohere API", "LLM API
 
 def _is_secret_source_call(node: ast.Call, file_path: str = "") -> bool:
     """Return True if call is a secret source (os.getenv, dotenv, boto3 secrets, config)."""
-    chain = _get_call_chain(node)
+    chain = get_call_chain(node)
     chain_lower = ".".join(c.lower() for c in chain)
     fp_lower = file_path.lower()
     # os.environ, os.getenv, environ.get
@@ -322,17 +312,6 @@ class _SensitiveVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _should_skip(path: Path, repo_root: Path) -> bool:
-    if should_skip_path(path, repo_root):
-        return True
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    if "core" in rel.parts and "sensitive_data_detector" in rel.parts:
-        return True
-    return False
-
 
 def _scan_fstring_exposures(repo_root: Path) -> List[SensitiveExposure]:
     """
@@ -402,7 +381,7 @@ def analyze_sensitive_exposures(repo_root: Path) -> SensitiveExposureResult:
     seen: Set[tuple] = set()
 
     for path in repo_root.rglob("*.py"):
-        if path.suffix != ".py" or _should_skip(path, repo_root):
+        if path.suffix != ".py" or should_skip_path(path, repo_root):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
