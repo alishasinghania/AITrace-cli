@@ -72,9 +72,10 @@ class TestRedactCodeContext:
         assert "AIzaSyBxxxxxxxxxxxxxx" not in result
 
     def test_redacts_stripe_key(self):
-        code = "sk = 'sk_live_ABCDEFGHIJKLMNOPQRST'"
+        # Use test-mode prefix (sk_test_) — live prefix triggers GitHub secret scanning
+        code = "sk = 'sk_test_ABCDEFGHIJKLMNOPQRST'"
         result = redact_code_context(code)
-        assert "sk_live_ABCDEFGHIJ" not in result
+        assert "sk_test_ABCDEFGHIJ" not in result
 
     def test_redacts_hf_token(self):
         code = "hf_token = 'hf_ABCDEFGHIJKLMNOPQRSTUVWXYZabcd'"
