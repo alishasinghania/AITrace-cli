@@ -131,14 +131,140 @@ def _eval_risk_rules(policy: Dict[str, Any], findings: List[Finding]) -> Optiona
     )
 
 
-def evaluate_policy(config: PolicyConfig, aibom: AIBOM, findings: List[Finding]) -> PolicyReport:
+def _eval_ai_controls_rules(
+    policy: Dict[str, Any],
+    aibom: AIBOM,
+    findings: List[Finding],
+    analysis_results: Optional[Dict[str, Any]] = None,
+) -> Optional[PolicyRuleResult]:
+    """
+    Evaluate AI-specific security control rules.
+
+    Supported policy.yaml keys under ai_controls:
+      no_code_execution_tools: true   — fail if PythonREPL/exec tool detected
+      no_shadow_ai: true              — fail if undeclared AI SDK imports found
+      mcp_trust_score_minimum: 60     — fail if any MCP server below threshold
+      no_user_data_to_external_llm: true  — fail if taint confirms user→external LLM
+      no_hardcoded_credentials: true  — fail if PAT-010 findings present (default True)
+      require_output_validation: false — warn if PAT-011 present
+    """
+    cfg = policy.get("ai_controls")
+    if not isinstance(cfg, dict):
+        return None
+
+    violations: List[str] = []
+    results_info = analysis_results or {}
+
+    # Rule: no_code_execution_tools
+    if cfg.get("no_code_execution_tools", False):
+        pattern_analysis = results_info.get("pattern_analysis")
+        if pattern_analysis:
+            rce_findings = [
+                f for f in getattr(pattern_analysis, "findings", [])
+                if getattr(f, "vulnerability_id", "") == "PAT-002"
+                and not getattr(f, "dismissed_as_fp", False)
+            ]
+            if rce_findings:
+                violations.append(
+                    f"Code execution tools (PythonREPL/exec) detected in {len(rce_findings)} location(s). "
+                    "Policy requires no_code_execution_tools=true."
+                )
+
+    # Rule: no_shadow_ai
+    if cfg.get("no_shadow_ai", False):
+        shadow_findings = [
+            f for f in findings
+            if "shadow" in f.id.lower() or "shadow" in f.title.lower()
+        ]
+        if shadow_findings:
+            violations.append(
+                f"Shadow AI detected: {len(shadow_findings)} undeclared AI SDK(s) used in code."
+            )
+
+    # Rule: mcp_trust_score_minimum
+    min_trust = cfg.get("mcp_trust_score_minimum")
+    if min_trust is not None:
+        low_trust = [
+            s for s in aibom.mcp_servers
+            if getattr(s, "trust_score", 100) < int(min_trust)
+        ]
+        if low_trust:
+            violations.append(
+                f"{len(low_trust)} MCP server(s) below trust score threshold "
+                f"{min_trust}: {[s.name for s in low_trust]}"
+            )
+
+    # Rule: no_user_data_to_external_llm
+    if cfg.get("no_user_data_to_external_llm", False):
+        crossfile_taint = results_info.get("crossfile_taint")
+        if crossfile_taint:
+            llm_paths = [
+                tp for tp in getattr(crossfile_taint, "taint_paths", [])
+                if tp.confirmed and tp.sink_type == "llm"
+            ]
+            if llm_paths:
+                violations.append(
+                    f"Cross-file taint analysis confirmed {len(llm_paths)} path(s) "
+                    "from external user input to LLM sink."
+                )
+
+    # Rule: no_hardcoded_credentials (default True — always check)
+    if cfg.get("no_hardcoded_credentials", True):
+        pattern_analysis = results_info.get("pattern_analysis")
+        if pattern_analysis:
+            cred_findings = [
+                f for f in getattr(pattern_analysis, "findings", [])
+                if getattr(f, "vulnerability_id", "") == "PAT-010"
+                and not getattr(f, "dismissed_as_fp", False)
+            ]
+            if cred_findings:
+                violations.append(
+                    f"Hardcoded credentials detected in {len(cred_findings)} location(s). "
+                    "Never commit API keys or passwords to source code."
+                )
+
+    if not violations:
+        return PolicyRuleResult(
+            rule_id="ai_controls",
+            passed=True,
+            severity=Severity.INFO,
+            message="All AI security controls pass.",
+        )
+
+    fail_build = cfg.get("fail_build", True)
+    return PolicyRuleResult(
+        rule_id="ai_controls",
+        passed=False,
+        severity=Severity.CRITICAL if fail_build else Severity.HIGH,
+        message=f"AI security control violations ({len(violations)}): " + " | ".join(violations),
+        affected_components=[s.id for s in aibom.mcp_servers],
+    )
+
+
+def evaluate_policy(
+    config: PolicyConfig,
+    aibom: AIBOM,
+    findings: List[Finding],
+    analysis_results: Optional[Dict[str, Any]] = None,
+) -> PolicyReport:
     raw = config.raw
     results: List[PolicyRuleResult] = []
 
-    for fn in (_eval_license_rules, _eval_model_rules, _eval_risk_rules):
-        result = fn(raw, aibom if fn is not _eval_risk_rules else findings)  # type: ignore[arg-type]
-        if result:
-            results.append(result)
+    lic = _eval_license_rules(raw, aibom)
+    if lic:
+        results.append(lic)
+
+    mod = _eval_model_rules(raw, aibom)
+    if mod:
+        results.append(mod)
+
+    risk = _eval_risk_rules(raw, findings)
+    if risk:
+        results.append(risk)
+
+    ai = _eval_ai_controls_rules(raw, aibom, findings, analysis_results)
+    if ai:
+        results.append(ai)
 
     passed = all(r.passed for r in results) if results else True
     return PolicyReport(passed=passed, results=results)

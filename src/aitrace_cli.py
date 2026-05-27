@@ -249,7 +249,8 @@ def scan(
         typer.echo("Wrote findings (JSON).")
 
     if verbose and result.architecture_graph:
-        from core.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
+        # architecture_graph module lives under analyzers/ after restructure
+        from core.analyzers.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
         (out_path / "aitrace-architecture-graph.json").write_text(
             architecture_graph_to_json(result.architecture_graph),
             encoding="utf-8",
@@ -348,6 +349,19 @@ risk:
   # Maximum severity allowed before failing the build.
   # One of: info, low, medium, high, critical
   max_severity: high
+  fail_build: true
+
+ai_controls:
+  # Fail build if code execution tools (PythonREPLTool, exec) are found
+  no_code_execution_tools: false
+  # Fail build if AI SDKs are used without being declared in requirements
+  no_shadow_ai: false
+  # Minimum trust score for MCP servers (0-100). Lower = more suspicious.
+  mcp_trust_score_minimum: 60
+  # Fail build if taint analysis confirms user input reaches external LLM
+  no_user_data_to_external_llm: false
+  # Fail build if hardcoded credentials are found
+  no_hardcoded_credentials: true
   fail_build: true
 """
     target.write_text(template, encoding="utf-8")

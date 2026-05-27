@@ -79,11 +79,8 @@ class AITraceEngine:
 
         all_findings: List[Finding] = [*surface.findings, *deep.findings, *semantic.findings]
 
-        policy_report: Optional[PolicyReport] = None
-        if policy_path is not None and policy_path.exists():
-            policy_config = load_policy(policy_path)
-            policy_report = evaluate_policy(policy_config, aibom, all_findings)
-
+        # Policy evaluation moved to AFTER pattern analysis so analysis_results
+        # (pattern_analysis, crossfile_taint) can be passed to ai_controls rules.
         dataflow_analysis = analyze_dataflows(self.repo_root)
         sensitive_exposures = analyze_sensitive_exposures(self.repo_root)
         model_supply_chain = analyze_model_supply_chain(self.repo_root, policy_path=policy_path)
@@ -133,7 +130,21 @@ class AITraceEngine:
             except Exception:
                 pass
 
-        # Convert PatternFindings to Finding objects and append (after policy check)
+        # Policy evaluation — runs AFTER pattern analysis so ai_controls rules have access
+        policy_report: Optional[PolicyReport] = None
+        if policy_path is not None and policy_path.exists():
+            policy_config = load_policy(policy_path)
+            policy_report = evaluate_policy(
+                policy_config,
+                aibom,
+                all_findings,
+                analysis_results={
+                    "pattern_analysis": pattern_analysis,
+                    "crossfile_taint": crossfile_taint,
+                },
+            )
+
+        # Convert PatternFindings to Finding objects and append
         if pattern_analysis is not None:
             from core.models import FindingCategory, Severity, Evidence
             _sev_map = {
@@ -148,10 +159,17 @@ class AITraceEngine:
                     Evidence(description=e, file=pf.file, line=pf.line)
                     for e in pf.evidence
                 ]
+                # Assign category based on confirmation state
+                if getattr(pf, "confirmed_by_llm", False) and not getattr(pf, "dismissed_as_fp", False):
+                    cat = FindingCategory.LLM_VERIFIED
+                elif getattr(pf, "confirmed_by_taint", False):
+                    cat = FindingCategory.TAINT_CONFIRMED
+                else:
+                    cat = FindingCategory.PATTERN
                 finding = Finding(
                     id=pf.vulnerability_id,
                     title=pf.title,
-                    category=FindingCategory.SEMANTIC,
+                    category=cat,
                     severity=sev,
                     description=pf.category,
                     evidence=evidence_objs,

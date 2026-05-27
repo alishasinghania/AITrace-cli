@@ -431,6 +431,13 @@ def _build_mcp_components(aibom: AIBOM) -> Tuple[List[Dict[str, Any]], Set[str]]
         }
         if m.package:
             comp_dict["properties"].append({"name": "aitrace:package", "value": m.package})
+        # Serialise security evidence collected by mcp_detector
+        if getattr(m, "security_findings", None):
+            for i, finding in enumerate(m.security_findings):
+                comp_dict["properties"].append({
+                    "name": f"aitrace:mcp:security:{i}",
+                    "value": finding,
+                })
         components.append(comp_dict)
         refs.add(m.id)
     return components, refs
