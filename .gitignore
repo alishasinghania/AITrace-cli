@@ -2,9 +2,14 @@ _ref_discovery/
 _ref_metadata/
 .DS_Store
 aitrace-out/
+aitrace-out-test/
+aitrace-out-baseline/
 *.egg-info/
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 dist/
 build/
+.venv/
+venv/
 CLAUDE.md

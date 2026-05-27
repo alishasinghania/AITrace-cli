@@ -20,6 +20,9 @@ class FindingCategory(str, Enum):
     DEEP = "deep"
     SEMANTIC = "semantic"
     POLICY = "policy"
+    PATTERN = "pattern"                  # from pattern_analyzer (structural vulnerability shapes)
+    TAINT_CONFIRMED = "taint_confirmed"  # pattern confirmed by crossfile_taint BFS
+    LLM_VERIFIED = "llm_verified"        # verified by llm_verifier API call
 
 
 class Severity(str, Enum):
@@ -73,6 +76,8 @@ class MCPServer:
     trust_score: int = 100
     suspicious_description: bool = False
     suspicious_tools: List[str] = field(default_factory=list)
+    # Human-readable security evidence strings populated by mcp_detector
+    security_findings: List[str] = field(default_factory=list)
 
 
 @dataclass

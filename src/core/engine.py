@@ -4,19 +4,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
 
-from .architecture_graph import build_architecture_graph
-from .ai_attack_path_analyzer import analyze_attack_paths
-from .architecture_inference import ArchitectureResult, infer_architecture
-from .dataflow_analyzer import DataFlowAnalysisResult, analyze_dataflows
-from .model_supply_chain_analyzer import ModelSupplyChainResult, analyze_model_supply_chain
-from .prompt_injection_detector import PromptInjectionResult, analyze_prompt_injection
-from .sensitive_data_detector import SensitiveExposureResult, analyze_sensitive_exposures
+from .analyzers.architecture_graph import build_architecture_graph
+from .analyzers.ai_attack_path_analyzer import analyze_attack_paths
+from .analyzers.architecture_inference import ArchitectureResult, infer_architecture
+from .analyzers.dataflow_analyzer import DataFlowAnalysisResult, analyze_dataflows
+from .analyzers.model_supply_chain_analyzer import ModelSupplyChainResult, analyze_model_supply_chain
+from .analyzers.prompt_injection_detector import PromptInjectionResult, analyze_prompt_injection
+from .analyzers.sensitive_data_detector import SensitiveExposureResult, analyze_sensitive_exposures
 from .discovery import DeepDiscoveryResult, SemanticDiscoveryResult, SurfaceDiscoveryResult
 from .discovery import discover_deep, discover_semantic, discover_surface
 from .discovery.surface import AGENT_PACKAGES, AGENT_TOOL_PACKAGES
 from .models import AIBOM, AttackPathFinding, Finding, PolicyReport
-from .policy import evaluate_policy, load_policy
-from .repo_classifier import classify_repository
+from .governance.policy import evaluate_policy, load_policy
+from .governance.repo_classifier import classify_repository
 
 
 @dataclass
@@ -79,11 +79,8 @@ class AITraceEngine:
 
         all_findings: List[Finding] = [*surface.findings, *deep.findings, *semantic.findings]
 
-        policy_report: Optional[PolicyReport] = None
-        if policy_path is not None and policy_path.exists():
-            policy_config = load_policy(policy_path)
-            policy_report = evaluate_policy(policy_config, aibom, all_findings)
-
+        # Policy evaluation moved to AFTER pattern analysis so analysis_results
+        # (pattern_analysis, crossfile_taint) can be passed to ai_controls rules.
         dataflow_analysis = analyze_dataflows(self.repo_root)
         sensitive_exposures = analyze_sensitive_exposures(self.repo_root)
         model_supply_chain = analyze_model_supply_chain(self.repo_root, policy_path=policy_path)
@@ -104,13 +101,13 @@ class AITraceEngine:
         crossfile_taint = None
         llm_verification = None
         try:
-            from core.pattern_analyzer import analyze_patterns
+            from core.analyzers.pattern_analyzer import analyze_patterns
             pattern_analysis = analyze_patterns(self.repo_root)
         except Exception as e:
             pass  # Never crash scan due to pattern analyzer
 
         try:
-            from core.crossfile_taint import analyze_crossfile_taint
+            from core.analyzers.crossfile_taint import analyze_crossfile_taint
             if pattern_analysis is not None:
                 crossfile_taint = analyze_crossfile_taint(
                     self.repo_root,
@@ -133,7 +130,21 @@ class AITraceEngine:
             except Exception:
                 pass
 
-        # Convert PatternFindings to Finding objects and append (after policy check)
+        # Policy evaluation — runs AFTER pattern analysis so ai_controls rules have access
+        policy_report: Optional[PolicyReport] = None
+        if policy_path is not None and policy_path.exists():
+            policy_config = load_policy(policy_path)
+            policy_report = evaluate_policy(
+                policy_config,
+                aibom,
+                all_findings,
+                analysis_results={
+                    "pattern_analysis": pattern_analysis,
+                    "crossfile_taint": crossfile_taint,
+                },
+            )
+
+        # Convert PatternFindings to Finding objects and append
         if pattern_analysis is not None:
             from core.models import FindingCategory, Severity, Evidence
             _sev_map = {
@@ -148,10 +159,17 @@ class AITraceEngine:
                     Evidence(description=e, file=pf.file, line=pf.line)
                     for e in pf.evidence
                 ]
+                # Assign category based on confirmation state
+                if getattr(pf, "confirmed_by_llm", False) and not getattr(pf, "dismissed_as_fp", False):
+                    cat = FindingCategory.LLM_VERIFIED
+                elif getattr(pf, "confirmed_by_taint", False):
+                    cat = FindingCategory.TAINT_CONFIRMED
+                else:
+                    cat = FindingCategory.PATTERN
                 finding = Finding(
                     id=pf.vulnerability_id,
                     title=pf.title,
-                    category=FindingCategory.SEMANTIC,
+                    category=cat,
                     severity=sev,
                     description=pf.category,
                     evidence=evidence_objs,

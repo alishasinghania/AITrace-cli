@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from core.pattern_analyzer import (
+from core.analyzers.pattern_analyzer import (
     PatternFinding,
     PatternAnalysisResult,
     analyze_patterns,

@@ -278,6 +278,17 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
 
             trust_score = max(0, trust_score)
 
+            # Collect all security evidence strings for this server
+            server_security_findings: list[str] = []
+            if cred_evidence:
+                server_security_findings.extend(cred_evidence)
+            if companion_evidence:
+                server_security_findings.extend(companion_evidence[:10])
+            if injection_evidence:
+                server_security_findings.extend(injection_evidence[:5])
+            if shadowing_findings:
+                server_security_findings.extend(shadowing_findings[:5])
+
             mcp_servers.append(
                 MCPServer(
                     id=next_id("MCP"),
@@ -289,6 +300,7 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
                     trust_score=trust_score,
                     suspicious_description=suspicious or bool(injection_evidence),
                     suspicious_tools=suspicious_tools,
+                    security_findings=server_security_findings,
                 )
             )
             findings.append(

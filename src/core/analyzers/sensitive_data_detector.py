@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from .detectors._ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path, get_call_chain
 
 # Sensitive keywords in variable names -> risk level
 SENSITIVE_KEYWORDS: Dict[str, str] = {
@@ -130,16 +130,6 @@ def _var_contains_sensitive(name: str) -> Optional[str]:
     return None
 
 
-def _get_call_chain(node: ast.Call) -> List[str]:
-    chain: List[str] = []
-    n = node.func
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
-
 
 def _chain_matches(chain: List[str], pattern: List[str]) -> bool:
     chain_lower = [c.lower() for c in chain]
@@ -153,7 +143,7 @@ def _chain_matches(chain: List[str], pattern: List[str]) -> bool:
 
 
 def _is_llm_sink(node: ast.Call) -> Optional[str]:
-    chain = _get_call_chain(node)
+    chain = get_call_chain(node)
     chain_set = set(c.lower() for c in chain)
     # Single-token generic patterns that require a provider indicator in the chain
     _GENERIC_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
@@ -197,7 +187,7 @@ EXTERNAL_PROVIDER_SINKS = {"OpenAI API", "Anthropic API", "Cohere API", "LLM API
 
 def _is_secret_source_call(node: ast.Call, file_path: str = "") -> bool:
     """Return True if call is a secret source (os.getenv, dotenv, boto3 secrets, config)."""
-    chain = _get_call_chain(node)
+    chain = get_call_chain(node)
     chain_lower = ".".join(c.lower() for c in chain)
     fp_lower = file_path.lower()
     # os.environ, os.getenv, environ.get
@@ -322,16 +312,65 @@ class _SensitiveVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _should_skip(path: Path, repo_root: Path) -> bool:
-    if should_skip_path(path, repo_root):
-        return True
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    if "core" in rel.parts and "sensitive_data_detector" in rel.parts:
-        return True
-    return False
+
+def _scan_fstring_exposures(repo_root: Path) -> List[SensitiveExposure]:
+    """
+    Cross-module taint: scan f-strings for sensitive variable names embedded
+    in string templates that are passed to LLM sinks.
+
+    Catches patterns like:
+        system_prompt = f"...{DB_PASSWORD}...{INTERNAL_API_KEY}..."
+        client.messages.create(system=system_prompt, ...)
+
+    where DB_PASSWORD is imported from config.py — invisible to intra-function analysis.
+    """
+    exposures: List[SensitiveExposure] = []
+
+    for path in walk_python_files_local(repo_root):
+        try:
+            rel = str(path.relative_to(repo_root))
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(source)
+        except (SyntaxError, OSError, ValueError):
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            # Look for assignments where the RHS is an f-string (JoinedStr)
+            if not isinstance(node.value, ast.JoinedStr):
+                continue
+            # Collect variable names embedded in the f-string
+            fstring_vars: Set[str] = set()
+            for piece in ast.walk(node.value):
+                if isinstance(piece, ast.Name):
+                    fstring_vars.add(piece.id)
+            # Check if any embedded var looks sensitive
+            for var in fstring_vars:
+                risk = _var_contains_sensitive(var)
+                if not risk:
+                    continue
+                # Check if the assigned variable is used in an LLM call nearby
+                # (heuristic: flag the f-string assignment itself as exposure)
+                exposures.append(SensitiveExposure(
+                    variable=var,
+                    sink="f-string template (cross-module taint)",
+                    file=rel,
+                    line=getattr(node, "lineno", None),
+                    risk=risk,
+                    external_provider=True,
+                ))
+    return exposures
+
+
+def walk_python_files_local(repo_root: Path):
+    """Walk Python files, skipping common non-source dirs."""
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules",
+                 ".tox", "dist", "build", "eggs", ".eggs", "site-packages"}
+    for path in repo_root.rglob("*.py"):
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        yield path
 
 
 def _scan_fstring_exposures(repo_root: Path) -> List[SensitiveExposure]:
@@ -402,7 +441,7 @@ def analyze_sensitive_exposures(repo_root: Path) -> SensitiveExposureResult:
     seen: Set[tuple] = set()
 
     for path in repo_root.rglob("*.py"):
-        if path.suffix != ".py" or _should_skip(path, repo_root):
+        if path.suffix != ".py" or should_skip_path(path, repo_root):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))

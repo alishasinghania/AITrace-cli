@@ -177,3 +177,18 @@ model_sources:
 ---
 
 *Built for security engineers who need to prove risk, not just report it.*
+
+---
+
+## Development
+
+```bash
+# Install with dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/ -v
+
+# Run a quick smoke scan against this repo
+PYTHONPATH=src python3 -m aitrace_cli scan . --out-dir aitrace-out
+```

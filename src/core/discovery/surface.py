@@ -71,18 +71,32 @@ AGENT_PACKAGES: Dict[str, str] = {
     "babyagi": "BabyAGI",
 }
 
+# Expanded from 2 entries — covers full MCP ecosystem
 MCP_PACKAGES: Dict[str, str] = {
     "mcp": "MCP Python SDK",
     "modelcontextprotocol": "Model Context Protocol",
+    "fastmcp": "FastMCP",
+    "mcp-server-filesystem": "MCP Filesystem Server",
+    "mcp-server-github": "MCP GitHub Server",
+    "mcp-server-postgres": "MCP Postgres Server",
+    "mcp-server-sqlite": "MCP SQLite Server",
+    "anthropic-mcp": "Anthropic MCP",
 }
 
-# Packages commonly used as agent tools (web search, browser automation, git, etc.)
+# Packages commonly used as agent tools — expanded from 5 entries
 AGENT_TOOL_PACKAGES: Dict[str, str] = {
     "duckduckgo-search": "DuckDuckGo Search",
     "duckduckgo_search": "DuckDuckGo Search",
     "playwright": "Playwright",
     "gitpython": "GitPython",
     "selenium": "Selenium",
+    "tavily-python": "Tavily Search",
+    "serpapi": "SerpAPI",
+    "e2b": "E2B Code Interpreter",
+    "composio": "Composio",
+    "browserbase": "Browserbase",
+    "firecrawl-py": "Firecrawl",
+    "apify-client": "Apify",
 }
 
 CLOUD_PACKAGES: Dict[str, str] = {
@@ -92,6 +106,131 @@ CLOUD_PACKAGES: Dict[str, str] = {
     "azure-core": "Azure",
     "azure-identity": "Azure",
 }
+
+# ---------------------------------------------------------------------------
+# Category dicts — each represents a distinct AI capability category.
+# Keep separate so downstream code can classify components by category.
+# All are merged into ALL_AI_PACKAGES for lookup.
+# ---------------------------------------------------------------------------
+
+VECTOR_STORE_PACKAGES: Dict[str, str] = {
+    # Production vector databases
+    "chromadb": "ChromaDB",
+    "pinecone-client": "Pinecone",
+    "pinecone": "Pinecone",
+    "weaviate-client": "Weaviate",
+    "weaviate": "Weaviate",
+    "qdrant-client": "Qdrant",
+    "qdrant": "Qdrant",
+    "pymilvus": "Milvus",
+    "milvus": "Milvus",
+    "faiss-cpu": "FAISS",
+    "faiss-gpu": "FAISS",
+    "faiss": "FAISS",
+    "opensearch-py": "OpenSearch",
+    "pgvector": "pgvector",
+    "lancedb": "LanceDB",
+    "marqo": "Marqo",
+    "turbopuffer": "Turbopuffer",
+    "elasticsearch": "Elasticsearch (vector)",
+    "redis": "Redis (vector)",
+}
+
+EMBEDDING_PACKAGES: Dict[str, str] = {
+    "sentence-transformers": "Sentence Transformers",
+    "tiktoken": "OpenAI Tokenizer",
+    "voyageai": "Voyage AI",
+    "nomic": "Nomic Embed",
+    "fastembed": "FastEmbed",
+    "cohere-embeddings": "Cohere Embeddings",
+}
+
+GUARDRAIL_PACKAGES: Dict[str, str] = {
+    "guardrails-ai": "Guardrails AI",
+    "nemoguardrails": "NeMo Guardrails",
+    "llm-guard": "LLM Guard",
+    "rebuff": "Rebuff",
+    "presidio-analyzer": "Microsoft Presidio",
+    "detoxify": "Detoxify",
+    "langkit": "LangKit",
+}
+
+OBSERVABILITY_PACKAGES: Dict[str, str] = {
+    "langfuse": "Langfuse",
+    "langsmith": "LangSmith",
+    "arize-ai": "Arize AI",
+    "whylogs": "WhyLogs",
+    "phoenix": "Arize Phoenix",
+    "helicone": "Helicone",
+    "trulens-eval": "TruLens",
+    "deepeval": "DeepEval",
+}
+
+NEW_AGENT_PACKAGES: Dict[str, str] = {
+    # New 2024-2025 agent frameworks not in AGENT_PACKAGES yet
+    "pydantic-ai": "Pydantic AI",
+    "pydantic_ai": "Pydantic AI",
+    "agno": "Agno",
+    "dspy-ai": "DSPy",
+    "dspy": "DSPy",
+    "instructor": "Instructor",
+    "guidance": "Guidance",
+    "phidata": "Phidata",
+    "phi": "Phidata",
+    "openai-agents": "OpenAI Agents SDK",
+    "google-adk": "Google ADK",
+    "letta": "Letta (MemGPT)",
+    "memgpt": "MemGPT",
+    "controlflow": "ControlFlow",
+}
+
+# ---------------------------------------------------------------------------
+# Consolidated lookup — single dict for scanning, preserves category separation.
+# Future: add new category dict above and merge it here.
+# ---------------------------------------------------------------------------
+ALL_AI_PACKAGES: Dict[str, str] = {
+    **AI_PACKAGES,
+    **AGENT_PACKAGES,
+    **MCP_PACKAGES,
+    **AGENT_TOOL_PACKAGES,
+    **CLOUD_PACKAGES,
+    **VECTOR_STORE_PACKAGES,
+    **EMBEDDING_PACKAGES,
+    **GUARDRAIL_PACKAGES,
+    **OBSERVABILITY_PACKAGES,
+    **NEW_AGENT_PACKAGES,
+}
+
+
+def get_package_category(package_name: str) -> str:
+    """
+    Return the category string for a given package name.
+
+    Used by downstream code (exporters, risk scoring) to classify
+    components without reimplementing the registry lookup.
+
+    Returns one of: vector_store | embedding | guardrail | observability |
+    agent_framework | mcp | llm_sdk | cloud | agent_tool | unknown
+    """
+    norm = package_name.lower().replace("-", "_").replace(" ", "_")
+
+    _registry: List[Tuple[Dict[str, str], str]] = [
+        (VECTOR_STORE_PACKAGES, "vector_store"),
+        (EMBEDDING_PACKAGES, "embedding"),
+        (GUARDRAIL_PACKAGES, "guardrail"),
+        (OBSERVABILITY_PACKAGES, "observability"),
+        (NEW_AGENT_PACKAGES, "agent_framework"),
+        (MCP_PACKAGES, "mcp"),
+        (AGENT_PACKAGES, "agent_framework"),
+        (AGENT_TOOL_PACKAGES, "agent_tool"),
+        (AI_PACKAGES, "llm_sdk"),
+        (CLOUD_PACKAGES, "cloud"),
+    ]
+    for pkg_dict, category in _registry:
+        for key in pkg_dict:
+            if key.lower().replace("-", "_") == norm:
+                return category
+    return "unknown"
 
 
 @dataclass
@@ -211,7 +350,7 @@ def _normalize_import_to_ai_package(module: str) -> Optional[str]:
             return "google-generativeai"
         if "cloud" in parts and "aiplatform" in parts:
             return "vertexai"
-    if first in AI_PACKAGES or first in AGENT_PACKAGES or first in MCP_PACKAGES or first in CLOUD_PACKAGES:
+    if first in ALL_AI_PACKAGES:
         return first
     if first in _IMPORT_TO_AGENT_TOOL:
         return _IMPORT_TO_AGENT_TOOL[first]
@@ -292,7 +431,7 @@ def _scan_python_imports(root: Path) -> Set[str]:
     from ..detectors._ast_utils import should_skip_path
 
     imported: Set[str] = set()
-    all_known = {**AI_PACKAGES, **AGENT_PACKAGES, **MCP_PACKAGES, **CLOUD_PACKAGES, **AGENT_TOOL_PACKAGES}
+    all_known = ALL_AI_PACKAGES
     for path in root.rglob("*.py"):
         if should_skip_path(path, root):
             continue
@@ -362,25 +501,29 @@ def _build_findings_for_components(
         comp_by_name[k] = c
         comp_by_name[k.replace("-", "_")] = c
 
+    # AI-category tag map — used for finding tags
+    _cat_tag_map = {
+        "agent_framework": "ai-agent",
+        "agent_tool": "agent-tool",
+        "mcp": "mcp",
+        "llm_sdk": "ai-library",
+        "cloud": "cloud-provider",
+        "vector_store": "vector-store",
+        "embedding": "embedding",
+        "guardrail": "guardrail",
+        "observability": "observability",
+    }
+
     # AI, agent, MCP, cloud, and agent tool components from manifests/imports/config
-    for pkg, label in {**AI_PACKAGES, **AGENT_PACKAGES, **MCP_PACKAGES, **CLOUD_PACKAGES, **AGENT_TOOL_PACKAGES}.items():
+    for pkg, label in ALL_AI_PACKAGES.items():
         comp = comp_by_name.get(pkg)
         if not comp:
             continue
-        is_ai = pkg in AI_PACKAGES
-        is_agent = pkg in AGENT_PACKAGES
-        is_agent_tool = pkg in AGENT_TOOL_PACKAGES
-        is_mcp = pkg in MCP_PACKAGES
-        if is_agent:
-            category_tag = "ai-agent"
-        elif is_agent_tool:
-            category_tag = "agent-tool"
-        elif is_mcp:
-            category_tag = "mcp"
-        elif is_ai:
-            category_tag = "ai-library"
-        else:
-            category_tag = "cloud-provider"
+        ai_category = get_package_category(pkg)
+        category_tag = _cat_tag_map.get(ai_category, "ai-library")
+        # Annotate component with AI category for downstream use
+        if ai_category != "unknown" and "ai_category" not in comp.properties:
+            comp.properties["ai_category"] = ai_category
 
         inferred = comp.properties.get("aitrace:inferred")
         if inferred == "config-reference":
@@ -393,12 +536,14 @@ def _build_findings_for_components(
             desc = f"Package '{pkg}' appears in project manifests."
             evidence_desc = "Detected in manifest"
 
+        # llm_sdk findings are MEDIUM (direct LLM exposure); everything else LOW
+        sev = Severity.MEDIUM if ai_category == "llm_sdk" else Severity.LOW
         findings.append(
             Finding(
                 id=next_id(),
                 title=f"{label} dependency discovered",
                 category=FindingCategory.SURFACE,
-                severity=Severity.MEDIUM if is_ai else Severity.LOW,
+                severity=sev,
                 description=desc,
                 component_id=comp.id,
                 evidence=[Evidence(description=evidence_desc, file=str(repo_root))],
@@ -424,7 +569,7 @@ def _build_findings_for_components(
 
     # Imports without explicit manifest entries (heuristic)
     for module in imported_modules:
-        if module in AI_PACKAGES or module in AGENT_PACKAGES or module in MCP_PACKAGES or module in CLOUD_PACKAGES or module in AGENT_TOOL_PACKAGES:
+        if module in ALL_AI_PACKAGES:
             if module not in comp_by_name:
                 findings.append(
                     Finding(
@@ -466,18 +611,21 @@ def discover_surface(repo_root: Path) -> SurfaceDiscoveryResult:
         comp_by_name[k.replace("-", "_")] = c
 
     # Add inferred components for AI/agent/MCP/cloud/agent-tool packages imported or referenced but not in manifests
-    all_known = {**AI_PACKAGES, **AGENT_PACKAGES, **MCP_PACKAGES, **CLOUD_PACKAGES, **AGENT_TOOL_PACKAGES}
     for module in imported_modules:
-        if module in all_known and module not in comp_by_name:
+        if module in ALL_AI_PACKAGES and module not in comp_by_name:
             infer_source = "config-reference" if module in ref_providers else "import-analysis"
             pkg_id = f"pkg:pypi/{module}"  # inferred PyPI, no version
+            infer_props: Dict[str, Any] = {"aitrace:inferred": infer_source}
+            ai_cat = get_package_category(module)
+            if ai_cat != "unknown":
+                infer_props["ai_category"] = ai_cat
             inferred = Component(
                 id=pkg_id,
                 name=module,
                 type=ComponentType.LIBRARY,
                 version=None,
                 purl=pkg_id,
-                properties={"aitrace:inferred": infer_source},
+                properties=infer_props,
             )
             components.append(inferred)
             comp_by_name[module] = inferred

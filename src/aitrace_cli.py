@@ -8,7 +8,7 @@ from typing import Any, List, Optional
 
 import typer
 
-from core.cli_support import find_default_policy, resolve_repo_path
+from core.governance.cli_support import find_default_policy, resolve_repo_path
 from core.engine import AITraceEngine
 from core.exporters import (
     to_ai_component_mermaid,
@@ -128,7 +128,7 @@ def scan(
     if verify or dry_run_verify:
         chosen_model = verify_model or "claude-haiku-4-5-20251001"
         try:
-            from core.credentials import ProviderConfig, detect_provider, resolve_api_key, CredentialNotFoundError
+            from core.features.credentials import ProviderConfig, detect_provider, resolve_api_key, CredentialNotFoundError
             provider = detect_provider(chosen_model)
             pc = ProviderConfig(provider=provider, model=chosen_model)
             try:
@@ -249,7 +249,8 @@ def scan(
         typer.echo("Wrote findings (JSON).")
 
     if verbose and result.architecture_graph:
-        from core.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
+        # architecture_graph module lives under analyzers/ after restructure
+        from core.analyzers.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
         (out_path / "aitrace-architecture-graph.json").write_text(
             architecture_graph_to_json(result.architecture_graph),
             encoding="utf-8",
@@ -349,6 +350,19 @@ risk:
   # One of: info, low, medium, high, critical
   max_severity: high
   fail_build: true
+
+ai_controls:
+  # Fail build if code execution tools (PythonREPLTool, exec) are found
+  no_code_execution_tools: false
+  # Fail build if AI SDKs are used without being declared in requirements
+  no_shadow_ai: false
+  # Minimum trust score for MCP servers (0-100). Lower = more suspicious.
+  mcp_trust_score_minimum: 60
+  # Fail build if taint analysis confirms user input reaches external LLM
+  no_user_data_to_external_llm: false
+  # Fail build if hardcoded credentials are found
+  no_hardcoded_credentials: true
+  fail_build: true
 """
     target.write_text(template, encoding="utf-8")
     typer.echo(f"Wrote starter policy file to {target}")
@@ -357,7 +371,7 @@ risk:
 def _dry_run_verify(result: Any, repo_root: Path) -> None:
     """Print which findings would be sent for LLM verification and their redacted context."""
     from core.features.llm_verifier import _select_findings, build_verification_context, _build_user_prompt
-    from core.credentials.redactor import is_safe_to_send, count_redactions, redact_code_context
+    from core.features.credentials.redactor import is_safe_to_send, count_redactions, redact_code_context
 
     pattern_analysis = getattr(result, "pattern_analysis", None)
     crossfile_taint = getattr(result, "crossfile_taint", None)
@@ -434,9 +448,9 @@ def configure(
       aitrace configure --list
     """
     try:
-        from core.credentials import detect_provider
-        from core.credentials import keychain as _kc
-        from core.credentials import config_store as _cs
+        from core.features.credentials import detect_provider
+        from core.features.credentials import keychain as _kc
+        from core.features.credentials import config_store as _cs
     except ImportError as exc:
         typer.echo(f"Credentials subsystem unavailable: {exc}", err=True)
         raise typer.Exit(1)

@@ -3,10 +3,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..models import AIBOM, Finding, FindingCategory, PolicyReport, Severity
-from ..risk_scoring import compute_risk_score
+from ..governance.risk_scoring import compute_risk_score
 
 if TYPE_CHECKING:
-    from ..architecture_inference import ArchitectureResult
+    from ..analyzers.architecture_inference import ArchitectureResult
 from .component_diagram import to_ai_component_mermaid
 from .provider_summary import findings_to_detections, summarize_providers
 
@@ -196,6 +196,8 @@ def to_risk_report_json(
     repo_type: Optional[str] = None,
     architecture_graph: Optional[Dict[str, Any]] = None,
     attack_path_findings: Optional[Any] = None,
+    pattern_analysis: Optional[Any] = None,
+    crossfile_taint: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Build an Enterprise Risk Report JSON document.
@@ -211,6 +213,8 @@ def to_risk_report_json(
         prompt_injection_risks,
         dataflow_analysis,
         repo_type=repo_type,
+        pattern_analysis=pattern_analysis,
+        crossfile_taint=crossfile_taint,
     )
     arch_dict = architecture_result.to_dict() if architecture_result else {"architecture_types": ["Unknown"], "components": [], "confidence": "low"}
     report: Dict[str, Any] = {
@@ -333,6 +337,25 @@ def to_findings_json(
     if architecture_result:
         out["architecture"] = architecture_result.to_dict()
     return out
+
+
+def _finding_source_badge(finding: "Finding") -> str:
+    """Return a short emoji+text badge indicating how the finding was produced."""
+    from ..models import FindingCategory
+    cat = finding.category
+    if cat == FindingCategory.LLM_VERIFIED:
+        return "🤖 llm"
+    if cat == FindingCategory.TAINT_CONFIRMED:
+        return "🔗 taint"
+    if cat == FindingCategory.PATTERN:
+        return "📐 pattern"
+    if cat == FindingCategory.SEMANTIC:
+        return "🔍 semantic"
+    if cat == FindingCategory.SURFACE:
+        return "📦 surface"
+    if cat == FindingCategory.DEEP:
+        return "🗄 deep"
+    return "·"
 
 
 def _semantic_findings_section(findings: List[Finding]) -> str:
@@ -543,6 +566,8 @@ def to_risk_report_markdown(
         prompt_injection_risks,
         dataflow_analysis,
         repo_type=repo_type,
+        pattern_analysis=pattern_analysis,
+        crossfile_taint=crossfile_taint,
     )
     lines.append("## Risk Assessment")
     lines.append("")

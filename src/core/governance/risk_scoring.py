@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from .models import AIBOM, Finding, FindingCategory, PolicyReport
+from ..models import AIBOM, Finding, FindingCategory, PolicyReport
 
 if TYPE_CHECKING:
     from .architecture_inference import ArchitectureResult
@@ -106,6 +106,8 @@ def compute_risk_score(
     prompt_injection_risks: Optional[Any] = None,
     dataflow_analysis: Optional[Any] = None,
     repo_type: Optional[str] = None,
+    pattern_analysis: Optional[Any] = None,   # PatternAnalysisResult — avoid circular import
+    crossfile_taint: Optional[Any] = None,    # CrossFileTaintResult — avoid circular import
 ) -> RiskScoreResult:
     """
     Compute AI security risk across five dimensions.
@@ -166,6 +168,21 @@ def compute_risk_score(
     if has_providers and not has_shadow_ai:
         ext_score += 12
         ext_factors.append("External AI/LLM usage detected")
+
+    # PAT-010: hardcoded credentials found by pattern analyzer
+    if pattern_analysis is not None:
+        pat_findings = getattr(pattern_analysis, "findings", [])
+        hardcoded = [
+            f for f in pat_findings
+            if getattr(f, "vulnerability_id", "") == "PAT-010"
+            and not getattr(f, "dismissed_as_fp", False)
+        ]
+        if hardcoded:
+            ext_score = min(ext_score + 10, 25)
+            ext_factors.append(
+                f"Hardcoded credentials detected ({len(hardcoded)} instance(s))"
+            )
+
     dimensions.append(
         RiskDimension("External AI Exposure", min(ext_score, 25), 25, ext_factors)
     )
@@ -202,6 +219,22 @@ def compute_risk_score(
     if aibom.models and not has_sensitive:
         data_score += 5
         data_factors.append("Model artifacts (potential data exposure)")
+
+    # PAT-001 / PAT-018: RAG injection / external data-to-LLM flows
+    if pattern_analysis is not None:
+        pat_findings = getattr(pattern_analysis, "findings", [])
+        rag_injection = [
+            f for f in pat_findings
+            if getattr(f, "vulnerability_id", "") in ("PAT-001", "PAT-018")
+            and not getattr(f, "dismissed_as_fp", False)
+        ]
+        if rag_injection and not has_sensitive:
+            data_score = min(data_score + 15, 25)
+            data_factors.append(
+                f"Pattern analyzer: {len(rag_injection)} RAG injection / "
+                "external data-to-LLM flow(s) detected"
+            )
+
     dimensions.append(
         RiskDimension("Data Exposure to LLMs", min(data_score, 25), 25, data_factors)
     )
@@ -227,6 +260,33 @@ def compute_risk_score(
     if has_mcp and not has_prompt_injection:
         exec_score += 10
         exec_factors.append("MCP servers (tool execution)")
+
+    # Pattern analyzer findings — structural vulnerability shapes
+    if pattern_analysis is not None:
+        pat_findings = getattr(pattern_analysis, "findings", [])
+        # Only count non-dismissed findings
+        active = [f for f in pat_findings if not getattr(f, "dismissed_as_fp", False)]
+        critical_pats = [f for f in active if getattr(f, "severity", "") == "critical"]
+        high_pats = [f for f in active if getattr(f, "severity", "") == "high"]
+        confirmed_pats = [f for f in active if getattr(f, "confirmed_by_taint", False)]
+
+        if critical_pats and not has_prompt_injection:
+            exec_score = 20  # cap immediately
+            exec_factors.append(
+                f"Pattern analyzer: {len(critical_pats)} CRITICAL vulnerability "
+                f"pattern(s) detected (PAT-002 RCE, PAT-003 SQL, PAT-012 Lethal Trifecta, etc.)"
+            )
+        elif high_pats and not has_prompt_injection:
+            exec_score = min(exec_score + 15, 20)
+            exec_factors.append(
+                f"Pattern analyzer: {len(high_pats)} HIGH severity pattern(s) detected"
+            )
+
+        if confirmed_pats:
+            exec_factors.append(
+                f"Cross-file taint confirmed {len(confirmed_pats)} attack path(s)"
+            )
+
     dimensions.append(
         RiskDimension("Execution Risk", min(exec_score, 20), 20, exec_factors)
     )

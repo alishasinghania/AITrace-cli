@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
-from .detectors._ast_utils import should_skip_path
+from ..utils.ast_utils import should_skip_path, get_call_chain
 
 # Model loading patterns: (chain_pattern, arg_name_for_model_id, source_label)
 # arg_name: "0" = first positional arg, or keyword name like "repo_id"
@@ -65,16 +65,6 @@ URL_PATTERNS = {
     "gcs": re.compile(r"storage\.googleapis|gs://", re.I),
 }
 
-
-def _get_call_chain(node: ast.Call) -> List[str]:
-    chain: List[str] = []
-    n = node.func
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
 
 
 def _chain_matches(chain: List[str], pattern: List[str]) -> bool:
@@ -318,7 +308,7 @@ class _ModelLoadVisitor(ast.NodeVisitor):
         self.sources: List[ModelSource] = []
 
     def visit_Call(self, node: ast.Call) -> None:
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         chain_lower = [c.lower() for c in chain]
 
         for pattern, arg_spec, source_label in MODEL_LOAD_PATTERNS:
@@ -346,17 +336,6 @@ class _ModelLoadVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _should_skip(path: Path, repo_root: Path) -> bool:
-    if should_skip_path(path, repo_root):
-        return True
-    try:
-        rel = path.relative_to(repo_root)
-    except ValueError:
-        return True
-    if "core" in rel.parts and "model_supply_chain_analyzer" in rel.parts:
-        return True
-    return False
-
 
 def analyze_model_supply_chain(
     repo_root: Path,
@@ -376,7 +355,7 @@ def analyze_model_supply_chain(
     seen: Set[Tuple[str, str, Optional[int]]] = set()
 
     for path in repo_root.rglob("*.py"):
-        if path.suffix != ".py" or _should_skip(path, repo_root):
+        if path.suffix != ".py" or should_skip_path(path, repo_root):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))

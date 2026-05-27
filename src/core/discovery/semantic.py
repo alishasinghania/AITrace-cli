@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
+from ..utils.ast_utils import should_skip_path, get_call_chain
 from ..models import (
     DataFlowEdge,
     DataFlowGraph,
@@ -93,11 +94,6 @@ AGENT_PATTERNS = (
 )
 
 
-def _should_skip_path(path: Path, repo_root: Path) -> bool:
-    """Skip non-production code (uses aitrace.yaml ignore_paths)."""
-    from ..detectors._ast_utils import should_skip_path
-    return should_skip_path(path, repo_root)
-
 
 def _call_target_name(node: ast.Call) -> Optional[str]:
     """Extract the call target name (attr or id) for pattern matching."""
@@ -107,17 +103,6 @@ def _call_target_name(node: ast.Call) -> Optional[str]:
         return node.func.id.lower()
     return None
 
-
-def _get_call_chain(node: ast.Call) -> List[str]:
-    """Get full call chain e.g. ['openai', 'ChatCompletion', 'create']."""
-    chain: List[str] = []
-    n = node.func
-    while isinstance(n, ast.Attribute):
-        chain.append(n.attr)
-        n = n.value
-    if isinstance(n, ast.Name):
-        chain.append(n.id)
-    return list(reversed(chain))
 
 
 def _match_semantic_node(target: str, chain: List[str]) -> Optional[Tuple[str, str]]:
@@ -253,7 +238,7 @@ class _SemanticFlowVisitor(ast.NodeVisitor):
             self.generic_visit(node)
             return
 
-        chain = _get_call_chain(node)
+        chain = get_call_chain(node)
         matched = _match_semantic_node(target, chain)
 
         # LLM inference: record (pattern, file) for deduplication, no per-call finding
@@ -423,7 +408,7 @@ def discover_semantic(repo_root: Path) -> SemanticDiscoveryResult:
     llm_calls: List[Tuple[str, str]] = []  # (pattern, file)
 
     for path in repo_root.rglob("*.py"):
-        if _should_skip_path(path, repo_root):
+        if should_skip_path(path, repo_root):
             continue
 
         try:

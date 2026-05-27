@@ -3,7 +3,7 @@ from __future__ import annotations
 """Tests for src/core/credentials/redactor.py"""
 
 import pytest
-from core.credentials.redactor import (
+from core.features.credentials.redactor import (
     redact_code_context,
     count_redactions,
     is_safe_to_send,
@@ -72,9 +72,9 @@ class TestRedactCodeContext:
         assert "AIzaSyBxxxxxxxxxxxxxx" not in result
 
     def test_redacts_stripe_key(self):
-        code = "sk = 'sk_live_ABCDEFGHIJKLMNOPQRSTUVWXyz'"
+        code = "sk = 'sk_live_ABCDEFGHIJKLMNOPQRST'"
         result = redact_code_context(code)
-        assert "sk_live_ABCDEFGHIJKLMNOP" not in result
+        assert "sk_live_ABCDEFGHIJ" not in result
 
     def test_redacts_hf_token(self):
         code = "hf_token = 'hf_ABCDEFGHIJKLMNOPQRSTUVWXYZabcd'"
