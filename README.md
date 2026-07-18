@@ -92,12 +92,27 @@ By default, all files are written into the **scanned repository root**. Use `-o`
 ## How it works
 
 ```mermaid
-flowchart LR
-    A["📁 Codebase"] --> B["① Discovery\nAI packages · MCP configs · model artifacts"]
-    B --> C["② Path Analysis\nAST · cross-file call graph · taint tracing"]
-    C --> D["③ Exploit Synthesis\nPoC payloads · static verdicts"]
-    C --> E["④ Report\naitrace-report.html"]
-    D --> E
+flowchart TD
+    subgraph PIPELINE["  Analysis Pipeline  "]
+        direction LR
+        S["SURFACE\n─────────\nmanifests\nAST imports\nMCP configs"]
+        D["DEEP\n─────────\nmodel files\nHuggingFace\nconfig refs"]
+        SE["SEMANTIC\n─────────\nLLM call patterns\nRAG flows\nagent shapes"]
+    end
+
+    subgraph SEC["  Security Analysis  "]
+        direction LR
+        T["Taint Tracker"] ~~~ PI["Prompt Injection"] ~~~ MCP["MCP Inspector"] ~~~ PAT["Pattern Analyzer\nPAT-001 … PAT-023"]
+    end
+
+    subgraph EXP["  Exploit & Verification  "]
+        direction LR
+        SYN["Exploit Synthesizer"] ~~~ VER["Static Verifier"] ~~~ RAG["RAG Poison Simulator"]
+    end
+
+    OUT(["HTML Report  ·  AI SBOM  ·  Policy Gate"])
+
+    PIPELINE --> SEC --> EXP --> OUT
 ```
 
 1. **Discovery** — Inventories AI packages, agent frameworks, vector stores, MCP servers, and model artifacts from manifests and imports.
