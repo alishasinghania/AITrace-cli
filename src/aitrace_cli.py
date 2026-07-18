@@ -22,7 +22,7 @@ from core.exporters import (
     to_spdx_json,
 )
 
-app = typer.Typer(help="AITrace - AI Bill of Materials and governance CLI")
+app = typer.Typer(help="AITrace - Attack path analysis and exploit synthesis for AI applications.")
 
 
 def _clone_if_url(path: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -80,7 +80,7 @@ class OutputFormat(str, Enum):
 def scan(
     path: Optional[str] = typer.Argument(
         None,
-        help="Path to the repository to scan (defaults to current directory).",
+        help="Local path or remote GitHub URL to scan (defaults to current directory).",
     ),
     policy: Optional[str] = typer.Option(
         None,
@@ -161,9 +161,9 @@ def scan(
     ),
 ) -> None:
     """
-    Run AITrace analysis on a repository and write a complete HTML report
-    (opens in the default browser). Optionally apply policy.yaml and emit
-    machine-readable formats via -f / --verbose.
+    Scan a local path or remote GitHub URL. Traces attack paths across files,
+    detects AI security vulnerabilities, and writes aitrace-report.html
+    (opens in browser). Use --exploit to generate PoC payloads from confirmed paths.
     """
     path, _tmp_clone = _clone_if_url(path)
     repo_root = resolve_repo_path(path)
