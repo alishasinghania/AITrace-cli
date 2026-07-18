@@ -287,7 +287,7 @@ def _parse_pyproject(path: Path) -> Iterable[Tuple[str, Optional[str]]]:
     # Try tomllib (Python 3.11+) - requires bytes
     try:
         import tomllib
-        data = tomllib.loads(content.encode("utf-8"))
+        data = tomllib.loads(content)
     except ImportError:
         data = None
     if data:
