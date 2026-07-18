@@ -91,6 +91,50 @@ By default, all files are written into the **scanned repository root**. Use `-o`
 
 ## How it works
 
+```mermaid
+flowchart LR
+    subgraph SRC["Repository"]
+        direction TB
+        s1["manifests\nrequirements.txt\npyproject.toml"]
+        s2["Python source\n.py files"]
+        s3["MCP configs\nmcp.json"]
+        s4["model artifacts\n.gguf · .pt · config.json"]
+    end
+
+    subgraph D["① Discovery"]
+        direction TB
+        d1["AI package inventory"]
+        d2["agent / RAG shapes"]
+        d3["MCP server configs"]
+        d1 --- d2 --- d3
+    end
+
+    subgraph P["② Path Analysis"]
+        direction TB
+        p1["AST parser\nevery .py file"]
+        p2["cross-file\ncall graph"]
+        p3["taint tracing\nsource → sink"]
+        p4["pattern shapes\nPAT-001 … PAT-023"]
+        p1 --> p2 --> p3
+        p2 -.-> p4
+    end
+
+    subgraph E["③ Exploit Synthesis\n--exploit flag"]
+        direction TB
+        e1["PoC payloads\nper confirmed sink"]
+        e2["static verdicts\nCONFIRMED · LIKELY · UNCERTAIN"]
+        e3["RAG poison docs\nfor vector stores"]
+        e1 --- e2 --- e3
+    end
+
+    subgraph R["④ Report"]
+        r1["aitrace-report.html\nopens in browser"]
+    end
+
+    SRC --> D --> P --> R
+    P --> E --> R
+```
+
 AITrace runs four stages in sequence against your codebase:
 
 ### 1. Discovery
