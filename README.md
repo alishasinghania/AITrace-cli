@@ -22,22 +22,26 @@ Optional: CycloneDX / SPDX AI BOM and Mermaid architecture diagram via `-f`.
 
 **Requirements:** Python 3.9+ · No telemetry · Core analysis makes no external API calls
 
-```bash
-# Recommended
-pipx install aitrace-cli
-# or
-uv tool install aitrace-cli
-
-aitrace --help
-```
-
-From source:
+**From source (recommended — latest code):**
 
 ```bash
 git clone https://github.com/alishasinghania/AITrace-cli
 cd AITrace-cli
 pip install -e .
 ```
+
+**From PyPI:**
+
+```bash
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
+# or: pip install uv
+
+uv tool install aitrace-cli
+# or: pipx install aitrace-cli
+```
+
+> **Note:** The PyPI release may lag behind the GitHub repo. Install from source to get the latest features.
 
 ---
 
