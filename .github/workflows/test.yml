@@ -29,5 +29,6 @@ jobs:
 
       - name: Smoke test scan
         run: |
-          PYTHONPATH=src python3 -m aitrace_cli scan . --out-dir /tmp/aitrace-ci-out
-          test -f /tmp/aitrace-ci-out/aitrace-risk-report.md
+          PYTHONPATH=src python3 -m aitrace_cli scan . --no-open
+          test -f aitrace-report.html
+          test ! -f aitrace-risk-report.md

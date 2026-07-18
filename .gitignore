@@ -4,6 +4,18 @@ _ref_metadata/
 aitrace-out/
 aitrace-out-test/
 aitrace-out-baseline/
+aitrace-report.html
+aitrace-risk-report.md
+aitrace-risk-report.json
+aitrace-findings.json
+aitrace-cyclonedx.json
+aitrace-spdx.json
+aitrace-component-diagram.mmd
+aitrace-exploits.json
+aitrace-rag-poison-payload.txt
+aitrace-architecture-graph.json
+aitrace-architecture-graph.mmd
+aitrace-verification.json
 *.egg-info/
 __pycache__/
 *.py[cod]
@@ -11,5 +23,6 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv-build/
 venv/
 CLAUDE.md

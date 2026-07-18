@@ -42,28 +42,35 @@ def scan(
         "-p",
         help="Path to policy.yaml. Defaults to ./policy.yaml if present.",
     ),
-    out_dir: str = typer.Option(
-        "aitrace-out",
+    out_dir: Optional[str] = typer.Option(
+        None,
         "--out-dir",
         "-o",
-        help="Directory where reports will be written.",
+        help=(
+            "Directory where reports will be written. "
+            "Default: the scanned repository root (aitrace-report.html)."
+        ),
     ),
-    formats: List[OutputFormat] = typer.Option(
-        [
-            OutputFormat.CYCLONEDX,
-            OutputFormat.SPDX,
-            OutputFormat.RISK_MD,
-            OutputFormat.MERMAID,
-        ],
+    formats: Optional[List[OutputFormat]] = typer.Option(
+        None,
         "--format",
         "-f",
-        help="Output format(s) to generate. Pass multiple -f to add; omitting -f uses all formats.",
+        help=(
+            "Optional machine-readable outputs in addition to the HTML report. "
+            "Pass multiple -f values: cyclonedx, spdx, risk-md, mermaid, risk-json. "
+            "Default: HTML report only."
+        ),
     ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
         "-v",
         help="Also write risk-report.json, findings.json, and architecture graph files.",
+    ),
+    no_open: bool = typer.Option(
+        False,
+        "--no-open",
+        help="Do not open the HTML report in a browser (useful for CI).",
     ),
     exploit: bool = typer.Option(
         False,
@@ -108,11 +115,13 @@ def scan(
     ),
 ) -> None:
     """
-    Run AITrace analysis on a repository, optionally applying a policy.yaml and
-    generating CycloneDX, SPDX, and Enterprise Risk reports.
+    Run AITrace analysis on a repository and write a complete HTML report
+    (opens in the default browser). Optionally apply policy.yaml and emit
+    machine-readable formats via -f / --verbose.
     """
     repo_root = resolve_repo_path(path)
     policy_path: Optional[Path]
+    selected_formats: List[OutputFormat] = list(formats or [])
 
     if policy is not None:
         policy_path = Path(policy).expanduser().resolve()
@@ -158,12 +167,13 @@ def scan(
         _dry_run_verify(result, repo_root)
         return
 
-    out_path = Path(out_dir).expanduser().resolve()
+    # Default: write aitrace-report.html (and any optional artifacts) into the repo root
+    out_path = Path(out_dir).expanduser().resolve() if out_dir else repo_root
     out_path.mkdir(parents=True, exist_ok=True)
 
     architecture_result = result.architecture_result
 
-    if OutputFormat.CYCLONEDX in formats:
+    if OutputFormat.CYCLONEDX in selected_formats:
         cdx = to_cyclonedx_json(
             result.aibom,
             architecture_result=architecture_result,
@@ -174,7 +184,7 @@ def scan(
         (out_path / "aitrace-cyclonedx.json").write_text(json.dumps(cdx, indent=2), encoding="utf-8")
         typer.echo("Wrote CycloneDX BOM.")
 
-    if OutputFormat.SPDX in formats:
+    if OutputFormat.SPDX in selected_formats:
         spdx = to_spdx_json(
             result.aibom,
             architecture_result=architecture_result,
@@ -185,8 +195,9 @@ def scan(
         (out_path / "aitrace-spdx.json").write_text(json.dumps(spdx, indent=2), encoding="utf-8")
         typer.echo("Wrote SPDX document.")
 
-    exploit_payloads = []
-    verification_results = []
+    exploit_payloads: List[Any] = []
+    verification_results: List[Any] = []
+    rag_poison = None
     if exploit:
         from core.features.exploit_synthesizer import synthesize, exploits_to_markdown, print_exploits
         from core.features.finding_verifier import verify_statically, print_verification, verification_to_markdown
@@ -197,7 +208,7 @@ def scan(
         from core.features.rag_poison_simulator import simulate as rag_simulate, poison_to_text
         rag_poison = rag_simulate(architecture_result)
 
-    if OutputFormat.RISK_MD in formats:
+    if OutputFormat.RISK_MD in selected_formats:
         risk_md = to_risk_report_markdown(
             result.aibom,
             result.policy_report,
@@ -221,13 +232,13 @@ def scan(
         (out_path / "aitrace-risk-report.md").write_text(risk_md, encoding="utf-8")
         typer.echo("Wrote risk report (Markdown).")
 
-    if OutputFormat.MERMAID in formats:
+    if OutputFormat.MERMAID in selected_formats:
         mermaid_diagram = to_ai_component_mermaid(result.aibom, architecture_result)
         (out_path / "aitrace-component-diagram.mmd").write_text(mermaid_diagram, encoding="utf-8")
         typer.echo("Wrote AI component diagram (Mermaid).")
 
-    # Verbose-only: raw JSON dumps and architecture graph
-    if verbose or OutputFormat.RISK_JSON in formats:
+    # Verbose / risk-json: structured dumps
+    if verbose or OutputFormat.RISK_JSON in selected_formats:
         risk_json = to_risk_report_json(
             result.aibom,
             result.policy_report,
@@ -241,6 +252,8 @@ def scan(
             result.repo_type,
             architecture_graph=result.architecture_graph,
             attack_path_findings=result.attack_path_findings,
+            pattern_analysis=result.pattern_analysis,
+            crossfile_taint=result.crossfile_taint,
         )
         (out_path / "aitrace-risk-report.json").write_text(json.dumps(risk_json, indent=2), encoding="utf-8")
         typer.echo("Wrote risk report (JSON).")
@@ -249,7 +262,6 @@ def scan(
         typer.echo("Wrote findings (JSON).")
 
     if verbose and result.architecture_graph:
-        # architecture_graph module lives under analyzers/ after restructure
         from core.analyzers.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
         (out_path / "aitrace-architecture-graph.json").write_text(
             architecture_graph_to_json(result.architecture_graph),
@@ -286,12 +298,30 @@ def scan(
             )
             typer.echo(f"Wrote {len(rag_poison.variants)} poison variants to aitrace-rag-poison-payload.txt.")
 
+    # Primary deliverable: complete HTML report (written last so Downloads links resolve)
     from core.exporters.html_report import to_html_report
+
     html_report = to_html_report(result, out_path, exploit_payloads or None, verification_results or None)
     html_path = out_path / "aitrace-report.html"
     html_path.write_text(html_report, encoding="utf-8")
-    typer.echo("Wrote interactive HTML report.")
-    webbrowser.open(html_path.as_uri())
+
+    from core.exporters.html_report import filter_security_findings
+
+    sev_counts: dict[str, int] = {}
+    for f in filter_security_findings(result.findings or []):
+        k = f.severity.value.upper()
+        sev_counts[k] = sev_counts.get(k, 0) + 1
+    sev_parts = [
+        f"{sev_counts[s]} {s}"
+        for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+        if sev_counts.get(s)
+    ]
+    typer.echo("")
+    if sev_parts:
+        typer.echo(f"Findings: {', '.join(sev_parts)}")
+    typer.echo(f"Report: {html_path}")
+    if not no_open:
+        webbrowser.open(html_path.as_uri())
 
     if result.policy_report is not None and not result.policy_report.passed:
         typer.echo("Policy violations detected. Failing build.", err=True)

@@ -16,4 +16,5 @@ from .risk_report import (
     to_risk_report_markdown,
 )  # noqa: F401
 from .component_diagram import to_ai_component_mermaid  # noqa: F401
+from .html_report import to_html_report  # noqa: F401
 

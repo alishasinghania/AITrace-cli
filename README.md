@@ -1,194 +1,149 @@
-# AITrace
+# AITrace — Cross-File Attack Path Analysis and Exploit Synthesis for AI Applications
 
-> **An open-source AI security scanner that doesn't just detect vulnerabilities — it proves they're exploitable.**
-
-AITrace scans your codebase to map every AI component, trace data flows into LLMs, detect security vulnerabilities, and generate working proof-of-concept attack payloads from static analysis alone. No runtime required.
+Traces user-controlled data through AI framework call chains across files and generates working exploit payloads from confirmed attack paths. Static analysis — no running application needed to find the path. Python AI codebases today (LangChain, LangGraph, agents, RAG, MCP).
 
 ---
 
-<!-- Demo recording — replace with your GIF or MP4 -->
-<!-- ![AITrace Demo](assets/demo.gif) -->
+## What it does
 
----
+- **Traces attack paths** — Follows user input, env vars, and external data through AI framework calls across modules (not single-file grep)
+- **Confirms reachability** — Cross-file call-graph analysis marks which paths actually reach LLM, agent, code-exec, or SQL sinks
+- **Synthesizes exploits** — With `--exploit`, emits codebase-specific PoC payloads aimed at confirmed sinks, plus static CONFIRMED / LIKELY / UNCERTAIN verdicts
+- **Surfaces AI stack context** — Inventories LLM SDKs, agents, RAG, vector stores, and MCP configs so the path has a clear target map
+- **One HTML report** — Walk findings and (optional) exploit payloads in the browser after each run
 
-```
-$ aitrace scan ./my-app --exploit
-
-Wrote 3 exploit payload(s) to aitrace-exploits.json.
-
-════════════════════════════════════════════════════════════════════════
-  ⚠  AITrace exploit payloads — AUTHORIZED SECURITY TESTING ONLY
-════════════════════════════════════════════════════════════════════════
-
-[CRITICAL] Direct prompt injection via user input → anthropic.messages.create
-  Target: app/chat.py:47   CVSS: 9.3
-
-[CRITICAL] 'db_password' exfiltration via OpenAI API
-  Target: app/chat.py:31   CVSS: 9.3
-
-Static verification:
-  ✔ CONFIRMED  [95% confidence]  Direct prompt injection
-    + No sanitization on source→sink path
-    + f-string interpolation into prompt detected
-    + External AI provider — data leaves network boundary
-
-RAG pipeline detected (Chroma + OpenAIEmbeddings)
-Wrote 3 poison variants → aitrace-rag-poison-payload.txt
-```
+Optional: CycloneDX / SPDX AI BOM and Mermaid diagram via `-f` (not required for the core capability).
 
 ---
 
 ## Installation
 
-```bash
-git clone https://github.com/alishasinghania/AITrace-cli
-cd AITrace-cli
-pip3 install -e .
-```
-
-On macOS, pip installs scripts to `~/Library/Python/3.x/bin` which may not be on your PATH. If `aitrace` is not found after install, run:
+**Requirements:** Python 3.9+ · No telemetry · Core analysis makes no external API calls
 
 ```bash
-echo 'export PATH="$HOME/Library/Python/3.9/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
+# Recommended
+pipx install aitrace-cli
+# or
+uv tool install aitrace-cli
 
-Then verify:
-
-```bash
 aitrace --help
 ```
 
-Alternatively, use the included `run.sh` without any PATH changes:
+From source:
 
 ```bash
-./run.sh scan . --out-dir aitrace-out
+git clone https://github.com/alishasinghania/AITrace-cli
+cd AITrace-cli
+pip install -e .
 ```
-
-**Requirements:** Python 3.9+ · No external API calls · No telemetry
 
 ---
 
 ## Usage
 
 ```bash
-# Standard scan — 5 output files, browser report opens automatically
+# Analyze a repo — writes aitrace-report.html in the repo root and opens it
 aitrace scan ./my-app
 
-# Generate exploit payloads + static verification + RAG poison docs
+# Headless / CI — no browser
+aitrace scan ./my-app --no-open
+
+# Generate PoC payloads from confirmed paths (+ RAG poison docs when RAG is present)
 aitrace scan ./my-app --exploit
 
-# Policy enforcement — exits code 1 on violation (use in CI)
-aitrace scan ./my-app --policy policy.yaml
+# Optional machine outputs
+aitrace scan ./my-app -f cyclonedx -f spdx -f mermaid
 
-# Debug mode — also writes raw JSON + architecture graph
+# Policy gate (exit code 1 on violation)
+aitrace scan ./my-app --policy policy.yaml --no-open
+
+# Write findings JSON + architecture graph
 aitrace scan ./my-app --verbose
 ```
 
+**Live demo (AgentVault):** start the intentionally vulnerable app, run `aitrace scan ./agentvault-demo --exploit`, open the HTML report, copy a CONFIRMED payload, paste it into the running app to show impact. Analysis itself does not require the app to be running.
+
 ---
 
-## Architecture
+## Demo
+
+<!-- TODO: add assets/demo.gif or demo.mp4 after recording install + analyze + exploit walkthrough -->
 
 ```
-  ┌──────────────────────────────────────────────────────────────────┐
-  │                        Analysis Pipeline                          │
-  ├─────────────────┬──────────────────┬───────────────────────────── ┤
-  │  SURFACE        │  DEEP            │  SEMANTIC                    │
-  │  · manifests    │  · model files   │  · LLM call patterns         │
-  │  · AST imports  │  · MCP configs   │  · RAG flows                 │
-  │  · config refs  │  · HuggingFace   │  · agent orchestrators       │
-  └────────┬────────┴────────┬─────────┴──────────────┬──────────────┘
-           └─────────────────┴────────────────────────┘
-                                      │
-  ┌───────────────────────────────────▼──────────────────────────────┐
-  │                       Security Analysis                           │
-  │  Taint Tracker · Sensitive Exposure · Prompt Injection · MCP     │
-  └───────────────────────────────────┬──────────────────────────────┘
-                                      │
-  ┌───────────────────────────────────▼──────────────────────────────┐
-  │                    Exploit & Verification                         │
-  │  Exploit Synthesizer · Static Verifier · RAG Poison Simulator    │
-  └───────────────────────────────────┬──────────────────────────────┘
-                                      │
-              Risk Score · AI SBOM · HTML Report · Policy Gate
+$ aitrace scan ./agentvault-demo --exploit
+
+Wrote 4 exploit payload(s) to aitrace-exploits.json.
+
+[CRITICAL] Sensitive variable 'DB_PASSWORD' exfiltration via f-string template
+  Target: app/agents/primary_agent.py:17   CVSS: 9.3
+
+Static verification:
+  ✔ CONFIRMED  [90% confidence]  secret reaches LLM prompt without sanitization
+
+Findings: 18 CRITICAL, 7 HIGH, 2 MEDIUM
+Report: ./agentvault-demo/aitrace-report.html
 ```
 
----
-
-## What It Does
-
-**AI Bill of Materials** — CycloneDX 1.7 and SPDX 3.0 SBOMs covering every LLM SDK, embedding model, vector store, agent framework, and MCP server in your codebase.
-
-**Data Flow Taint Tracking** — AST-based analysis traces user input, env vars, and file reads into LLM sinks. Sanitization-aware.
-
-**MCP Trust Graph** — Scans MCP tool `description` fields for prompt-injection patterns. Assigns trust scores (0–100) and emits CRITICAL findings when triggered.
-
-**Exploit Synthesizer (`--exploit`)** — Generates purpose-built PoC payloads per flow type:
-
-| Flow | Payload | CVSS |
-|------|---------|------|
-| `user_input → LLM` | Direct instruction override | 9.3 |
-| `env var → LLM` | Variable-targeted extraction | 7.5–9.3 |
-| `RAG pipeline` | Knowledge base poisoning | 8.8 |
-| `Agent + tools` | Tool-response hijack | 9.3 |
-
-**Static Finding Verifier** — Checks each payload against the source code to determine CONFIRMED / LIKELY / UNCERTAIN without touching a running server.
-
-**RAG Poison Simulator** — Generates adversarial documents designed to survive vector similarity search. Includes Chroma, Pinecone, FAISS, Weaviate, and Qdrant insertion code.
-
-**5-Dimension Risk Scoring** — External Exposure · Data Exposure · Execution Risk · Architecture Complexity · Missing Controls. Policy enforcement with CI exit code 1 on violation.
-
-**Interactive HTML Report** — Self-contained dashboard with risk bars, findings cards, MCP trust scores, and architecture diagram. Auto-opens after every scan.
+Exploit payloads are for **authorized security testing only**.
 
 ---
 
-## Output Files
+## Output files
+
+By default, artifacts are written into the **scanned repository root**.
 
 | File | When |
 |------|------|
-| `aitrace-report.html` | Always |
-| `aitrace-risk-report.md` | Always |
-| `aitrace-cyclonedx.json` | Always |
-| `aitrace-spdx.json` | Always |
-| `aitrace-component-diagram.mmd` | Always |
+| `aitrace-report.html` | Always (primary deliverable) |
 | `aitrace-exploits.json` | `--exploit` |
 | `aitrace-rag-poison-payload.txt` | `--exploit` + RAG detected |
-| `aitrace-risk-report.json` · `aitrace-findings.json` · arch graph | `--verbose` |
+| `aitrace-cyclonedx.json` | `-f cyclonedx` |
+| `aitrace-spdx.json` | `-f spdx` |
+| `aitrace-component-diagram.mmd` | `-f mermaid` |
+| `aitrace-risk-report.md` | `-f risk-md` |
+| `aitrace-findings.json` · arch graph | `--verbose` |
 
 ---
 
-## Policy Enforcement
+## How it works
+
+```
+  Discovery          Path analysis              Exploit synthesis
+  ─────────          ─────────────              ─────────────────
+  manifests          AI call-chain tracing      PoC payloads per
+  imports            cross-file confirmation    confirmed sink
+  MCP / models       pattern shapes (PAT-*)     static verdicts
+         \                |                          /
+          \               v                         /
+           \----→  HTML report (browser)  ←-------/
+```
+
+1. **Discovery** — AI packages, RAG/agent shapes, MCP configs, model artifacts  
+2. **Path analysis** — User-controlled data → AI framework sinks across files  
+3. **Exploit synthesis** (`--exploit`) — Working payloads + CONFIRMED / LIKELY / UNCERTAIN  
+4. **Report** — Single `aitrace-report.html` for walkthroughs and demos  
+
+---
+
+## Policy gate
+
+Optional governance check for CI — not a substitute for path analysis:
 
 ```bash
-aitrace init-policy        # generates policy.yaml with defaults
-aitrace scan . --policy policy.yaml
+aitrace init-policy
+aitrace scan . --policy policy.yaml --no-open
 ```
+
+Exit code `1` on violation. Example:
 
 ```yaml
-risk:
-  max_severity: high
-  fail_build: true
-models:
-  denied: [gpt-3.5-turbo]
-model_sources:
-  trusted_orgs: [google, microsoft, huggingface]
+# GitHub Actions
+- name: AITrace policy gate
+  run: aitrace scan . --policy policy.yaml --no-open
 ```
 
 ---
 
-*Built for security engineers who need to prove risk, not just report it.*
+## License
 
----
-
-## Development
-
-```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -v
-
-# Run a quick smoke scan against this repo
-PYTHONPATH=src python3 -m aitrace_cli scan . --out-dir aitrace-out
-```
+MIT.
