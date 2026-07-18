@@ -26,3 +26,4 @@ build/
 .venv-build/
 venv/
 CLAUDE.md
+CURSOR_README_PROMPT.md
