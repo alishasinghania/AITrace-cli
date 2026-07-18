@@ -93,63 +93,17 @@ By default, all files are written into the **scanned repository root**. Use `-o`
 
 ```mermaid
 flowchart LR
-    subgraph SRC["Repository"]
-        direction TB
-        s1["manifests\nrequirements.txt\npyproject.toml"]
-        s2["Python source\n.py files"]
-        s3["MCP configs\nmcp.json"]
-        s4["model artifacts\n.gguf · .pt · config.json"]
-    end
-
-    subgraph D["① Discovery"]
-        direction TB
-        d1["AI package inventory"]
-        d2["agent / RAG shapes"]
-        d3["MCP server configs"]
-        d1 --- d2 --- d3
-    end
-
-    subgraph P["② Path Analysis"]
-        direction TB
-        p1["AST parser\nevery .py file"]
-        p2["cross-file\ncall graph"]
-        p3["taint tracing\nsource → sink"]
-        p4["pattern shapes\nPAT-001 … PAT-023"]
-        p1 --> p2 --> p3
-        p2 -.-> p4
-    end
-
-    subgraph E["③ Exploit Synthesis\n--exploit flag"]
-        direction TB
-        e1["PoC payloads\nper confirmed sink"]
-        e2["static verdicts\nCONFIRMED · LIKELY · UNCERTAIN"]
-        e3["RAG poison docs\nfor vector stores"]
-        e1 --- e2 --- e3
-    end
-
-    subgraph R["④ Report"]
-        r1["aitrace-report.html\nopens in browser"]
-    end
-
-    SRC --> D --> P --> R
-    P --> E --> R
+    A["📁 Codebase"] --> B["① Discovery\nAI packages · MCP configs · model artifacts"]
+    B --> C["② Path Analysis\nAST · cross-file call graph · taint tracing"]
+    C --> D["③ Exploit Synthesis\nPoC payloads · static verdicts"]
+    C --> E["④ Report\naitrace-report.html"]
+    D --> E
 ```
 
-AITrace runs four stages in sequence against your codebase:
-
-### 1. Discovery
-Scans package manifests (`requirements.txt`, `pyproject.toml`, `package.json`), Python imports, MCP config files (`.cursor/mcp.json`, `claude_desktop_config.json`), and model artifacts to build a complete inventory of AI components — LLM SDKs, agent frameworks, vector stores, embedding models, and MCP servers.
-
-### 2. Path analysis
-Builds a cross-file call graph by parsing every Python file with AST analysis. Sources (FastAPI/Flask routes, WebSocket handlers, Celery tasks, CLI entrypoints) are traced forward through function calls across module boundaries until they reach a sink — an LLM prompt construction, `cursor.execute()`, `eval()`, or agent tool invocation. Each path is classified as confirmed, likely, or uncertain based on whether sanitization or filtering is detected on the way.
-
-On top of taint tracing, a pattern analyzer checks for structural vulnerability shapes regardless of data flow: unbounded tool permissions, direct LLM output to `exec()`, hardcoded credentials, missing output validation, and others (PAT-001 through PAT-023).
-
-### 3. Exploit synthesis (`--exploit`)
-For each confirmed or likely path, generates a codebase-specific proof-of-concept payload targeting the exact sink and variable names found in your code. Each payload comes with a static verification verdict (CONFIRMED / LIKELY / UNCERTAIN) explaining what evidence was found. For RAG pipelines, also generates adversarial documents designed to survive vector similarity search, with insertion code for Chroma, Pinecone, FAISS, Weaviate, and Qdrant.
-
-### 4. Report
-Writes a single self-contained `aitrace-report.html` with collapsible security findings grouped by vulnerability type, MCP server analysis, exploit payloads gated behind a "Security Team Only" toggle, and a color-coded architecture diagram. Opens in your default browser automatically.
+1. **Discovery** — Inventories AI packages, agent frameworks, vector stores, MCP servers, and model artifacts from manifests and imports.
+2. **Path analysis** — Builds a cross-file call graph, traces user-controlled data (routes, env vars, files) to LLM / exec / SQL sinks, and checks 23 structural vulnerability patterns.
+3. **Exploit synthesis** (`--exploit`) — Generates codebase-specific PoC payloads for confirmed paths with CONFIRMED / LIKELY / UNCERTAIN verdicts. Includes RAG poison documents for detected vector stores.
+4. **Report** — Single `aitrace-report.html` with grouped findings, MCP analysis, exploit gate, and architecture diagram.
 
 ---
 
