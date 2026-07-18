@@ -91,28 +91,49 @@ By default, all files are written into the **scanned repository root**. Use `-o`
 
 ## How it works
 
-```mermaid
-flowchart TD
-    subgraph PIPELINE["  Analysis Pipeline  "]
-        direction LR
-        S["SURFACE\n─────────\nmanifests\nAST imports\nMCP configs"]
-        D["DEEP\n─────────\nmodel files\nHuggingFace\nconfig refs"]
-        SE["SEMANTIC\n─────────\nLLM call patterns\nRAG flows\nagent shapes"]
-    end
-
-    subgraph SEC["  Security Analysis  "]
-        direction LR
-        T["Taint Tracker"] ~~~ PI["Prompt Injection"] ~~~ MCP["MCP Inspector"] ~~~ PAT["Pattern Analyzer\nPAT-001 … PAT-023"]
-    end
-
-    subgraph EXP["  Exploit & Verification  "]
-        direction LR
-        SYN["Exploit Synthesizer"] ~~~ VER["Static Verifier"] ~~~ RAG["RAG Poison Simulator"]
-    end
-
-    OUT(["HTML Report  ·  AI SBOM  ·  Policy Gate"])
-
-    PIPELINE --> SEC --> EXP --> OUT
+```
+                      +-------------------------+
+                      |      Your Codebase      |
+                      |  Python · manifests     |
+                      |  MCP configs · models   |
+                      +----------+--------------+
+                                 |
+                                 v
+                      +----------+--------------+
+                      |     AITrace Scanner     |
+                      +----------+--------------+
+                                 |
+          +----------------------+----------------------+
+          |                      |                      |
+          v                      v                      v
+  +---------------+    +------------------+    +----------------+
+  |   Discovery   |    |  Path Analysis   |    |  MCP Inspector |
+  |               |    |                  |    |                |
+  | · AI packages |    | · AST parser     |    | · tool desc    |
+  | · agent shapes|    | · call graph     |    |   poisoning    |
+  | · RAG / vector|    | · taint tracing  |    | · hardcoded    |
+  | · model files |    | · pattern shapes |    |   credentials  |
+  +---------------+    +------------------+    +----------------+
+          \                     |                      /
+           \                    v                     /
+            +-------------------+--------------------+
+            |            Analysis Engine             |
+            |        PAT-001 … PAT-023 rules         |
+            +-------------------+--------------------+
+                                |
+              +-----------------+-----------------+
+              |                 |                 |
+              v                 v                 v
+     +----------------+  +-----------+  +----------------+
+     |    Exploit     |  |   Risk    |  |    AI SBOM     |
+     |  Synthesizer   |  |  Scoring  |  | CycloneDX/SPDX |
+     |  (--exploit)   |  |  Policy   |  |   (-f flag)    |
+     +----------------+  +-----------+  +----------------+
+              \                |                 /
+               \               v                /
+                +-----------------------------+
+                |      aitrace-report.html    |
+                +-----------------------------+
 ```
 
 1. **Discovery** — Inventories AI packages, agent frameworks, vector stores, MCP servers, and model artifacts from manifests and imports.
