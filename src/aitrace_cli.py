@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import tempfile
 import webbrowser
 from enum import Enum
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import typer
 
@@ -20,6 +23,49 @@ from core.exporters import (
 )
 
 app = typer.Typer(help="AITrace - AI Bill of Materials and governance CLI")
+
+
+def _clone_if_url(path: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    If path looks like a remote git URL, clone it to a temp directory.
+
+    Returns (local_path, tmp_dir_to_cleanup).
+    tmp_dir_to_cleanup is None when no cloning was done (caller must delete it).
+    Supports:
+      https://github.com/owner/repo
+      https://github.com/owner/repo.git
+      git@github.com:owner/repo.git
+      Any https:// or git@ URL
+    """
+    if path is None:
+        return path, None
+    if not (
+        path.startswith("https://")
+        or path.startswith("http://")
+        or path.startswith("git@")
+        or (path.startswith("git://"))
+    ):
+        return path, None
+
+    tmp_dir = tempfile.mkdtemp(prefix="aitrace-clone-")
+    typer.echo(f"Cloning {path} …")
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", path, tmp_dir],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            typer.echo(f"Error: git clone failed:\n{result.stderr.strip()}", err=True)
+            raise typer.Exit(code=1)
+    except FileNotFoundError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        typer.echo("Error: git is not installed or not on PATH.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Cloned to {tmp_dir}")
+    return tmp_dir, tmp_dir
 
 
 class OutputFormat(str, Enum):
@@ -119,7 +165,10 @@ def scan(
     (opens in the default browser). Optionally apply policy.yaml and emit
     machine-readable formats via -f / --verbose.
     """
+    path, _tmp_clone = _clone_if_url(path)
     repo_root = resolve_repo_path(path)
+    # When scanning a remote URL, default output goes to cwd, not inside the temp clone
+    _is_remote = _tmp_clone is not None
     policy_path: Optional[Path]
     selected_formats: List[OutputFormat] = list(formats or [])
 
@@ -167,8 +216,12 @@ def scan(
         _dry_run_verify(result, repo_root)
         return
 
-    # Default: write aitrace-report.html (and any optional artifacts) into the repo root
-    out_path = Path(out_dir).expanduser().resolve() if out_dir else repo_root
+    # Default output dir: explicit --out-dir > cwd (remote) > repo root (local)
+    out_path = (
+        Path(out_dir).expanduser().resolve()
+        if out_dir
+        else (Path.cwd() if _is_remote else repo_root)
+    )
     out_path.mkdir(parents=True, exist_ok=True)
 
     architecture_result = result.architecture_result
@@ -322,6 +375,9 @@ def scan(
     typer.echo(f"Report: {html_path}")
     if not no_open:
         webbrowser.open(html_path.as_uri())
+
+    if _tmp_clone:
+        shutil.rmtree(_tmp_clone, ignore_errors=True)
 
     if result.policy_report is not None and not result.policy_report.passed:
         typer.echo("Policy violations detected. Failing build.", err=True)
