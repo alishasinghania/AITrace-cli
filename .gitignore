@@ -24,6 +24,7 @@ dist/
 build/
 .venv/
 .venv-build/
+.venv-ci/
 venv/
 CLAUDE.md
 CURSOR_README_PROMPT.md

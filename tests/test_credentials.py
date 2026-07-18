@@ -311,13 +311,12 @@ class TestConfigStore:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_cred = Path(tmpdir) / "credentials"
+            # keychain is imported lazily inside _get_encryption_key — patch the
+            # real module attributes, not config_store.keychain (which does not exist).
             with _patch.object(config_store, "_CRED_FILE", tmp_cred), \
                  _patch.object(config_store, "_CONFIG_DIR", Path(tmpdir)), \
-                 _patch("core.features.credentials.config_store.keychain") as mock_kc:
-                # Keychain unavailable — use machine-derived key
-                mock_kc.read_key.return_value = None
-                mock_kc.write_key.return_value = False
-
+                 _patch("core.features.credentials.keychain.read_key", return_value=None), \
+                 _patch("core.features.credentials.keychain.write_key", return_value=False):
                 ok = config_store.write_provider_key("openai", "sk-stored-securely")
                 assert ok is True
 
@@ -340,10 +339,8 @@ class TestConfigStore:
             tmp_cred = Path(tmpdir) / "credentials"
             with _patch.object(config_store, "_CRED_FILE", tmp_cred), \
                  _patch.object(config_store, "_CONFIG_DIR", Path(tmpdir)), \
-                 _patch("core.features.credentials.config_store.keychain") as mock_kc:
-                mock_kc.read_key.return_value = None
-                mock_kc.write_key.return_value = False
-
+                 _patch("core.features.credentials.keychain.read_key", return_value=None), \
+                 _patch("core.features.credentials.keychain.write_key", return_value=False):
                 result = config_store.read_provider_key("nonexistent-provider")
                 assert result is None
 
@@ -363,10 +360,8 @@ class TestConfigStore:
             tmp_cred = Path(tmpdir) / "credentials"
             with _patch.object(config_store, "_CRED_FILE", tmp_cred), \
                  _patch.object(config_store, "_CONFIG_DIR", Path(tmpdir)), \
-                 _patch("core.features.credentials.config_store.keychain") as mock_kc:
-                mock_kc.read_key.return_value = None
-                mock_kc.write_key.return_value = False
-
+                 _patch("core.features.credentials.keychain.read_key", return_value=None), \
+                 _patch("core.features.credentials.keychain.write_key", return_value=False):
                 config_store.write_provider_key("anthropic", "to-be-deleted")
                 config_store.delete_provider_key("anthropic")
                 assert config_store.read_provider_key("anthropic") is None
