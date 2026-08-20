@@ -51,7 +51,13 @@ SEMANTIC_PATTERNS: List[Tuple[Set[str], str, str]] = [
 ]
 # LLM: generic "create"/"invoke" need chain context; provider names are direct matches
 SEMANTIC_LLM_TARGETS = {"chat", "complete", "create", "invoke", "generate", "messages"}
-SEMANTIC_LLM_CHAIN_REQUIRED = {"openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai", "bedrock", "litellm", "ollama", "ai21", "fireworks", "aleph_alpha", "chat", "completion", "messages"}
+SEMANTIC_LLM_CHAIN_REQUIRED = {
+    "openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai",
+    "bedrock", "litellm", "ollama", "ai21", "fireworks", "aleph_alpha",
+    "xai", "grok", "groq", "deepseek", "openrouter", "dashscope", "moonshot",
+    "together", "perplexity",
+    "chat", "completion", "messages",
+}
 
 # Targets that are NOT LLM inference (config, reflection, embeddings, UI)
 LLM_TARGET_BLOCKLIST = frozenset({
@@ -74,9 +80,12 @@ LLM_CHAIN_BLOCKLIST = (
 LLM_BARE_SELF_CHAT = ("self", "chat")  # chain for self.chat (no llm/client)
 
 # Known LLM providers - for strict matching of generic targets
-LLM_KNOWN_PROVIDERS = frozenset(
-    {"openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai", "bedrock", "litellm", "ollama", "ai21", "fireworks", "aleph_alpha"}
-)
+LLM_KNOWN_PROVIDERS = frozenset({
+    "openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai",
+    "bedrock", "litellm", "ollama", "ai21", "fireworks", "aleph_alpha",
+    "xai", "grok", "groq", "deepseek", "openrouter", "dashscope", "moonshot",
+    "together", "perplexity",
+})
 # Agent: require framework in chain to avoid create_agent_task, create_agent_card
 SEMANTIC_AGENT_SPECIFIC = {"create_react_agent", "stategraph", "crewagent", "crew", "assistantagent", "userproxyagent", "conversableagent"}
 SEMANTIC_AGENT_REQUIRES_CHAIN = {"create_agent"}  # create_agent needs langchain/crew in chain
@@ -84,6 +93,7 @@ SEMANTIC_AGENT_REQUIRES_CHAIN = {"create_agent"}  # create_agent needs langchain
 # Additional inference call names for findings (broader than semantic patterns)
 AI_CALL_NAMES = {
     "openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai",
+    "xai", "grok", "groq", "deepseek", "openrouter",
     "client", "chat", "complete", "create", "embed", "embedding",
 }
 
@@ -204,7 +214,11 @@ def _infer_provider_from_pattern(pattern: str) -> str:
     parts = pattern.split(".")
     if parts:
         p = parts[0].lower()
-        if p in ("openai", "anthropic", "cohere", "mistral", "vertexai", "generativeai", "bedrock"):
+        if p in (
+            "openai", "anthropic", "cohere", "mistral", "vertexai",
+            "generativeai", "bedrock", "xai", "grok", "groq", "deepseek",
+            "openrouter", "litellm", "ollama",
+        ):
             return p
         if p == "client":
             return "client"

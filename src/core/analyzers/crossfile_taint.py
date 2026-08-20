@@ -15,6 +15,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..utils.ast_utils import should_skip_path, walk_python_files, get_call_target_chain
 from .pattern_analyzer import PatternFinding
+from .taint_catalog import (
+    FLOW_META,
+    HIGH_IMPACT_SINKS,
+    function_has_source_call,
+    function_sink_types,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -135,51 +141,9 @@ def _call_attr(node: ast.Call) -> str:
     return ""
 
 
-def _is_llm_sink_call(node: ast.Call) -> bool:
-    attr = _call_attr(node)
-    if attr not in _LLM_SINK_ATTRS:
-        return False
-    chain = set(_call_chain_str(node).split("."))
-    return bool(chain & _LLM_SINK_CHAIN_FRAGS)
-
-
-def _is_sql_sink_call(node: ast.Call) -> bool:
-    attr = _call_attr(node)
-    if attr not in _SQL_SINK_ATTRS:
-        return False
-    chain = set(_call_chain_str(node).split("."))
-    return bool(chain & _SQL_SINK_CHAINS) or attr == "execute"
-
-
-def _is_code_exec_sink_call(node: ast.Call) -> bool:
-    attr = _call_attr(node)
-    if attr in {"exec", "eval", "compile"}:
-        return True
-    if attr in {"run", "popen", "system", "call", "check_output"}:
-        chain = set(_call_chain_str(node).split("."))
-        return bool(chain & _CODE_EXEC_SINK_CHAINS)
-    return False
-
-
-def _is_retrieval_sink_call(node: ast.Call) -> bool:
-    attr = _call_attr(node)
-    return attr in _RETRIEVAL_SINK_ATTRS
-
-
 def _sink_types_for_func(func: ast.FunctionDef | ast.AsyncFunctionDef) -> List[str]:
-    sink_types = []
-    for node in ast.walk(func):
-        if not isinstance(node, ast.Call):
-            continue
-        if _is_llm_sink_call(node) and "llm" not in sink_types:
-            sink_types.append("llm")
-        if _is_sql_sink_call(node) and "sql" not in sink_types:
-            sink_types.append("sql")
-        if _is_code_exec_sink_call(node) and "rce" not in sink_types:
-            sink_types.append("rce")
-        if _is_retrieval_sink_call(node) and "retrieval" not in sink_types:
-            sink_types.append("retrieval")
-    return sink_types
+    """Delegate to the shared catalog so taint and PAT-* agree on sinks."""
+    return function_sink_types(func)
 
 
 def _decorator_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> List[str]:
@@ -240,6 +204,9 @@ def _detect_source(
 
     if "uploadfile" in func_src:
         return True, "file_upload", "high"
+
+    if function_has_source_call(func):
+        return True, "user_input", "high"
 
     # Kafka/Faust
     if any("agent" in d or "topic" in d for d in dec):
@@ -515,6 +482,9 @@ def _find_taint_paths(
             "sql": "sql_injection",
             "rce": "rce",
             "retrieval": "rag_poisoning",
+            "http": "ssrf_exfil",
+            "email": "excessive_agency",
+            "rag_ingest": "rag_poisoning",
         }.get(sink_type, "unknown")
 
         paths.append(TaintPath(
@@ -606,6 +576,15 @@ def _upgrade_findings(
         "PAT-014": {"retrieval", "llm"},
         "PAT-016": {"llm"},
         "PAT-018": {"llm"},
+        "PAT-025": {"rce"},
+        "PAT-026": {"retrieval", "llm"},
+        "PAT-027": {"llm", "http", "email"},
+        "PAT-028": {"llm", "retrieval"},
+        "FLOW-RCE": {"rce"},
+        "FLOW-SQL": {"sql"},
+        "FLOW-HTTP": {"http"},
+        "FLOW-EMAIL": {"email"},
+        "FLOW-RAG": {"rag_ingest", "retrieval"},
     }
 
     for finding in pattern_findings:
@@ -633,6 +612,75 @@ def _upgrade_findings(
                 if finding.vulnerability_id not in partial_ids:
                     partial_ids.append(finding.vulnerability_id)
                 break
+
+
+def _emit_flow_findings(
+    pattern_findings: List[PatternFinding],
+    paths: List[TaintPath],
+    graph: Dict[str, FunctionNode],
+) -> None:
+    """
+    Discover findings from confirmed high-impact taint paths even when no PAT-* matched.
+
+    Only rce/sql/http/email/rag_ingest — not every user→LLM chat path.
+    """
+    covered_files: Dict[str, Set[str]] = {}
+    for f in pattern_findings:
+        covered_files.setdefault(f.file, set()).add(f.vulnerability_id)
+
+    seen: Set[Tuple[str, str, str]] = set()
+    for tp in paths:
+        if not tp.confirmed or tp.sink_type not in HIGH_IMPACT_SINKS:
+            continue
+        meta = FLOW_META.get(tp.sink_type)
+        if not meta:
+            continue
+        vid, title, severity, category, cwe = meta
+        sink_node = graph.get(tp.sink_key)
+        file_name = sink_node.file if sink_node else tp.sink_key.split("::")[0]
+        key = (vid, file_name, tp.sink_key)
+        if key in seen:
+            continue
+        # Skip if a more specific PAT already covers this file+sink class
+        existing = covered_files.get(file_name, set())
+        if vid in existing:
+            continue
+        if tp.sink_type == "rce" and {"PAT-002", "PAT-004", "PAT-025"} & existing:
+            continue
+        if tp.sink_type == "rag_ingest" and "PAT-026" in existing:
+            continue
+        if tp.sink_type in {"http", "email"} and "PAT-027" in existing:
+            continue
+        seen.add(key)
+        hop_short = " → ".join(
+            h.split("::")[-1] for h in tp.hops[:6] if "(sink not reached)" not in h
+        )
+        pattern_findings.append(PatternFinding(
+            vulnerability_id=vid,
+            title=title,
+            severity=severity,
+            confidence="high",
+            category=category,
+            owasp_id="LLM08" if tp.sink_type != "rag_ingest" else "LLM03",
+            cwe=cwe,
+            file=file_name,
+            line=sink_node.line_start if sink_node else None,
+            function_name=sink_node.function_name if sink_node else None,
+            pattern_matched=f"taint path to {tp.sink_type} sink",
+            evidence=[
+                f"Confirmed path ({tp.hop_count} hops): {hop_short}",
+                f"Sink type: {tp.sink_type} at {tp.sink_key}",
+            ],
+            framework="taint",
+            confirmed_by_taint=True,
+            taint_path=tp.hops,
+            remediation=(
+                "Block or sanitize untrusted data before this sink. "
+                "Prefer allowlists, parameterized APIs, and shell=False with argv lists."
+            ),
+            cvss_estimate=9.0 if severity == "critical" else 7.5,
+        ))
+        tp.confirms_pattern_ids.append(vid)
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +715,11 @@ def analyze_crossfile_taint(
 
     try:
         _upgrade_findings(pattern_findings, paths, confirmed_ids, partial_ids)
+    except Exception:
+        pass
+
+    try:
+        _emit_flow_findings(pattern_findings, paths, graph)
     except Exception:
         pass
 

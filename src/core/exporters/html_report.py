@@ -63,6 +63,15 @@ _PLAIN_PAT_TITLES: Dict[str, str] = {
     "PAT-022": "Known-vulnerable AI package in use",
     "PAT-023": "Agent output is promoted to trusted system context",
     "PAT-024": "Irreversible action runs without a human in the loop",
+    "PAT-025": "User input is executed as a shell command",
+    "PAT-026": "User messages are written into the AI knowledge base",
+    "PAT-027": "AI agent has a high-impact tool with no approval gate",
+    "PAT-028": "Secrets sit in documents the AI can retrieve",
+    "FLOW-RCE": "Untrusted input reaches command execution",
+    "FLOW-SQL": "Untrusted input reaches a database query",
+    "FLOW-HTTP": "Untrusted input reaches an outbound HTTP call",
+    "FLOW-EMAIL": "Untrusted input reaches an email send",
+    "FLOW-RAG": "Untrusted input is written into the vector store",
 }
 
 _PLAIN_TITLE_PREFIXES: Tuple[Tuple[str, str], ...] = (
@@ -459,14 +468,18 @@ def _why_it_matters(finding: Any) -> str:
         return "An attacker could run commands on your servers through the AI agent."
     if fid in ("PAT-001", "PAT-008", "PAT-018"):
         return "Attackers may steer the AI with crafted input or poisoned data."
-    if fid in ("PAT-003", "PAT-004"):
+    if fid in ("PAT-003", "PAT-004", "PAT-025", "FLOW-RCE", "FLOW-SQL"):
         return "AI output could change or damage databases and systems."
     if fid in ("PAT-010",) or "credential" in (getattr(finding, "title", "") or "").lower():
         return "Secrets in config can be stolen and used to access other systems."
     if fid in ("PAT-012", "PAT-023", "PAT-005"):
         return "Sensitive data can leave your environment via the AI stack."
-    if fid == "PAT-020":
+    if fid in ("PAT-020", "PAT-026", "FLOW-RAG"):
         return "Uploaded content can poison what the AI tells users."
+    if fid in ("PAT-027", "FLOW-HTTP", "FLOW-EMAIL"):
+        return "The agent can email, fetch URLs, or act without a human in the loop."
+    if fid == "PAT-028":
+        return "Retrieved documents may leak passwords or keys to users or the model."
     if fid.startswith("PAT-") and sev in ("CRITICAL", "HIGH"):
         return "This creates a realistic path for abuse of your AI application."
     if "poison" in (getattr(finding, "title", "") or "").lower():

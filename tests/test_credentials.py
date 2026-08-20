@@ -36,6 +36,11 @@ class TestDetectProvider:
         from core.features.credentials.resolver import detect_provider
         assert detect_provider("mistral-7b-instruct") == "mistral"
 
+    def test_grok_model(self):
+        from core.features.credentials.resolver import detect_provider
+        assert detect_provider("grok-3") == "xai"
+        assert detect_provider("xai/grok-2") == "xai"
+
 
 # ---------------------------------------------------------------------------
 # ProviderConfig properties

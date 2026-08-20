@@ -33,6 +33,9 @@ from core.analyzers.pattern_analyzer import (
     detect_pat016,
     detect_pat017,
     detect_pat018,
+    detect_pat025,
+    detect_pat026,
+    detect_pat027,
 )
 
 
@@ -622,3 +625,106 @@ def test_pat012_lethal_trifecta_repo_level():
         )
         result = analyze_patterns(repo_root)
         assert any(f.vulnerability_id == "PAT-012" for f in result.findings)
+
+
+# ---------------------------------------------------------------------------
+# PAT-025 user-controlled shell execution
+# ---------------------------------------------------------------------------
+
+def test_pat025_fires_on_subprocess_shell_true():
+    src = '''
+import subprocess
+
+def execute_commands(input_string):
+    if "$" in input_string:
+        commands = input_string.split("$")[1:]
+        for command in commands:
+            subprocess.check_output(command, shell=True)
+'''
+    findings = detect_pat025(_parse(src), "process.py", src, _imap(src))
+    assert any(f.vulnerability_id == "PAT-025" for f in findings)
+
+
+def test_pat025_does_not_fire_on_argv_list_without_shell():
+    src = '''
+import subprocess, sys
+
+def boot():
+    subprocess.Popen([sys.executable, "server.py"])
+'''
+    findings = detect_pat025(_parse(src), "main.py", src, _imap(src))
+    assert not findings
+
+
+# ---------------------------------------------------------------------------
+# PAT-026 user write into RAG corpus
+# ---------------------------------------------------------------------------
+
+def test_pat026_fires_on_facts_write_plus_search():
+    src = '''
+def add_text_to_file(filename, text):
+    directory = "training/facts/"
+    filepath = directory + filename
+    with open(filepath, "a") as file:
+        file.write(text + "\\n")
+
+def onMessage(question, history):
+    add_text_to_file("training.txt", question)
+    docs = store.similarity_search(question)
+    return docs
+'''
+    findings = detect_pat026(_parse(src), "process.py", src, _imap(src))
+    assert any(f.vulnerability_id == "PAT-026" for f in findings)
+
+
+def test_pat026_does_not_fire_without_retrieval():
+    src = '''
+def save_note(text):
+    directory = "training/facts/"
+    with open(directory + "n.txt", "a") as f:
+        f.write(text)
+'''
+    findings = detect_pat026(_parse(src), "notes.py", src, _imap(src))
+    assert not findings
+
+
+# ---------------------------------------------------------------------------
+# PAT-027 BaseTool high-risk agency
+# ---------------------------------------------------------------------------
+
+def test_pat027_fires_on_send_email_basetool():
+    src = '''
+from langchain.tools import BaseTool
+
+class SendEmailTool(BaseTool):
+    name = "Send Email"
+    description = "This tool will send an email to a specified contact."
+    def _run(self, tool_input: str) -> str:
+        return "Email Sent"
+'''
+    findings = detect_pat027(_parse(src), "tools.py", src, _imap(src))
+    assert any(f.vulnerability_id == "PAT-027" for f in findings)
+
+
+def test_pat027_fires_on_http_sink_even_if_name_is_benign():
+    src = '''
+from langchain.tools import BaseTool
+import requests
+
+class LookupTool(BaseTool):
+    name = "lookup"
+    def _run(self, q: str) -> str:
+        return requests.get(q).text
+'''
+    findings = detect_pat027(_parse(src), "tools.py", src, _imap(src))
+    assert any(f.vulnerability_id == "PAT-027" for f in findings)
+
+
+def test_pat026_fires_on_add_texts_without_facts_path():
+    src = '''
+def ingest(user_doc):
+    store.add_texts([user_doc])
+'''
+    findings = detect_pat026(_parse(src), "ingest.py", src, _imap(src))
+    assert any(f.vulnerability_id == "PAT-026" for f in findings)
+

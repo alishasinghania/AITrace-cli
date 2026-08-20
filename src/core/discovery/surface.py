@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..config import get_ignore_paths
 from ..detectors.config_reference_detector import detect_config_references
@@ -18,14 +18,30 @@ AI_PACKAGES: Dict[str, str] = {
     "anthropic": "Anthropic",
     "cohere": "Cohere",
     "google-generativeai": "Google Generative AI",
+    "google-genai": "Google Gen AI SDK",
+    "google_genai": "Google Gen AI SDK",
     "google": "Google AI (generic)",
     "vertexai": "Google Vertex AI",
     "mistralai": "Mistral AI",
+    "huggingface-hub": "Hugging Face Hub",
+    "huggingface_hub": "Hugging Face Hub",
     "transformers": "Hugging Face Transformers",
     "accelerate": "Hugging Face Accelerate",
     "diffusers": "Hugging Face Diffusers",
+    "peft": "Hugging Face PEFT",
+    "trl": "Hugging Face TRL",
+    "bitsandbytes": "bitsandbytes",
+    "datasets": "Hugging Face Datasets",
     "langchain": "LangChain",
     "langchain-community": "LangChain Community",
+    "langchain-openai": "LangChain OpenAI",
+    "langchain_openai": "LangChain OpenAI",
+    "langchain-anthropic": "LangChain Anthropic",
+    "langchain_anthropic": "LangChain Anthropic",
+    "langchain-google-genai": "LangChain Google GenAI",
+    "langchain-groq": "LangChain Groq",
+    "langchain-mistralai": "LangChain Mistral",
+    "langchain-text-splitters": "LangChain Text Splitters",
     "llama-index": "LlamaIndex",
     "llama-index-core": "LlamaIndex Core",
     "llama_index_core": "LlamaIndex Core",
@@ -34,14 +50,32 @@ AI_PACKAGES: Dict[str, str] = {
     "ragas": "RAGAS",
     "ragstack": "RAGStack",
     "vllm": "vLLM",
+    "sglang": "SGLang",
+    "outlines": "Outlines",
+    "llama-cpp-python": "llama.cpp Python",
+    "llama_cpp": "llama.cpp Python",
+    "tensorrt-llm": "TensorRT-LLM",
+    "lmdeploy": "LMDeploy",
+    "openllm": "OpenLLM",
     "litellm": "LiteLLM",
     "replicate": "Replicate",
     "together": "Together AI",
+    "together-ai": "Together AI",
     "fireworks": "Fireworks AI",
     "fireworks-ai": "Fireworks AI",
     "groq": "Groq",
     "perplexity": "Perplexity",
+    "xai": "xAI",
+    "xai-sdk": "xAI SDK",
+    "grok": "xAI Grok",
+    "openrouter": "OpenRouter",
+    "deepseek": "DeepSeek",
+    "dashscope": "Alibaba DashScope (Qwen)",
+    "moonshot": "Moonshot (Kimi)",
     "ollama": "Ollama",
+    "openai-whisper": "OpenAI Whisper",
+    "whisper": "Whisper",
+    "faster-whisper": "Faster Whisper",
     "ai21": "AI21 Labs",
     "aleph-alpha-client": "Aleph Alpha",
     "aleph_alpha": "Aleph Alpha",
@@ -56,8 +90,13 @@ AGENT_PACKAGES: Dict[str, str] = {
     "langchain-core": "LangChain Core",
     "langchain_core": "LangChain Core",  # import name for langchain-core pkg
     "langgraph": "LangGraph",
+    "langchain-mcp-adapters": "LangChain MCP Adapters",
     "crewai": "CrewAI",
+    "crewai-tools": "CrewAI Tools",
     "autogen": "AutoGen",
+    "pyautogen": "AutoGen",
+    "ag2": "AG2 (AutoGen)",
+    "autogen-agentchat": "AutoGen AgentChat",
     "semantic-kernel": "Microsoft Semantic Kernel",
     "semantic_kernel": "Microsoft Semantic Kernel",
     "haystack": "Haystack",
@@ -69,6 +108,13 @@ AGENT_PACKAGES: Dict[str, str] = {
     "marvin": "Marvin",
     "superagi": "SuperAGI",
     "babyagi": "BabyAGI",
+    "langroid": "Langroid",
+    "camel-ai": "CAMEL",
+    "camel": "CAMEL",
+    "metagpt": "MetaGPT",
+    "swarms": "Swarms",
+    "browser-use": "Browser Use",
+    "browser_use": "Browser Use",
 }
 
 # Expanded from 2 entries — covers full MCP ecosystem
@@ -95,7 +141,10 @@ AGENT_TOOL_PACKAGES: Dict[str, str] = {
     "e2b": "E2B Code Interpreter",
     "composio": "Composio",
     "browserbase": "Browserbase",
+    "browser-use": "Browser Use",
     "firecrawl-py": "Firecrawl",
+    "crawl4ai": "Crawl4AI",
+    "exa-py": "Exa",
     "apify-client": "Apify",
 }
 
@@ -138,11 +187,24 @@ VECTOR_STORE_PACKAGES: Dict[str, str] = {
 
 EMBEDDING_PACKAGES: Dict[str, str] = {
     "sentence-transformers": "Sentence Transformers",
+    "sentence_transformers": "Sentence Transformers",
     "tiktoken": "OpenAI Tokenizer",
     "voyageai": "Voyage AI",
     "nomic": "Nomic Embed",
     "fastembed": "FastEmbed",
     "cohere-embeddings": "Cohere Embeddings",
+    "flagembedding": "FlagEmbedding",
+}
+
+ML_RUNTIME_PACKAGES: Dict[str, str] = {
+    "torch": "PyTorch",
+    "pytorch": "PyTorch",
+    "tensorflow": "TensorFlow",
+    "keras": "Keras",
+    "jax": "JAX",
+    "mlx": "Apple MLX",
+    "mlx-lm": "Apple MLX-LM",
+    "unsloth": "Unsloth",
 }
 
 GUARDRAIL_PACKAGES: Dict[str, str] = {
@@ -163,7 +225,13 @@ OBSERVABILITY_PACKAGES: Dict[str, str] = {
     "phoenix": "Arize Phoenix",
     "helicone": "Helicone",
     "trulens-eval": "TruLens",
+    "trulens": "TruLens",
     "deepeval": "DeepEval",
+    "wandb": "Weights & Biases",
+    "mlflow": "MLflow",
+    "opik": "Opik",
+    "braintrust": "Braintrust",
+    "promptlayer": "PromptLayer",
 }
 
 NEW_AGENT_PACKAGES: Dict[str, str] = {
@@ -179,9 +247,13 @@ NEW_AGENT_PACKAGES: Dict[str, str] = {
     "phi": "Phidata",
     "openai-agents": "OpenAI Agents SDK",
     "google-adk": "Google ADK",
+    "google_adk": "Google ADK",
     "letta": "Letta (MemGPT)",
     "memgpt": "MemGPT",
+    "mem0": "Mem0",
+    "mem0ai": "Mem0",
     "controlflow": "ControlFlow",
+    "atomic-agents": "Atomic Agents",
 }
 
 # ---------------------------------------------------------------------------
@@ -199,6 +271,7 @@ ALL_AI_PACKAGES: Dict[str, str] = {
     **GUARDRAIL_PACKAGES,
     **OBSERVABILITY_PACKAGES,
     **NEW_AGENT_PACKAGES,
+    **ML_RUNTIME_PACKAGES,
 }
 
 
@@ -209,7 +282,7 @@ def get_package_category(package_name: str) -> str:
     Used by downstream code (exporters, risk scoring) to classify
     components without reimplementing the registry lookup.
 
-    Returns one of: vector_store | embedding | guardrail | observability |
+    Returns one of: vector_store | embedding | ml_runtime | guardrail | observability |
     agent_framework | mcp | llm_sdk | cloud | agent_tool | unknown
     """
     norm = package_name.lower().replace("-", "_").replace(" ", "_")
@@ -217,6 +290,7 @@ def get_package_category(package_name: str) -> str:
     _registry: List[Tuple[Dict[str, str], str]] = [
         (VECTOR_STORE_PACKAGES, "vector_store"),
         (EMBEDDING_PACKAGES, "embedding"),
+        (ML_RUNTIME_PACKAGES, "ml_runtime"),
         (GUARDRAIL_PACKAGES, "guardrail"),
         (OBSERVABILITY_PACKAGES, "observability"),
         (NEW_AGENT_PACKAGES, "agent_framework"),
@@ -231,6 +305,23 @@ def get_package_category(package_name: str) -> str:
             if key.lower().replace("-", "_") == norm:
                 return category
     return "unknown"
+
+
+def _ai_package_lookup(name: str) -> Optional[str]:
+    """
+    Return the ALL_AI_PACKAGES key for a PyPI or import name.
+
+    Accepts hyphen/underscore variants (sentence_transformers ↔ sentence-transformers).
+    """
+    if not name:
+        return None
+    n = name.lower().strip()
+    hyphen = n.replace("_", "-")
+    under = n.replace("-", "_")
+    for cand in (hyphen, n, under):
+        if cand in ALL_AI_PACKAGES:
+            return cand
+    return None
 
 
 @dataclass
@@ -308,6 +399,23 @@ def _parse_pyproject(path: Path) -> Iterable[Tuple[str, Optional[str]]]:
                             name = dep.split("[")[0].split(">=")[0].split("==")[0].split("<")[0].strip()
                             if name and not name.startswith("$"):
                                 yield name.lower(), None
+        poetry_deps = (
+            data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+            if isinstance(data.get("tool"), dict)
+            else {}
+        )
+        if isinstance(poetry_deps, dict):
+            for name, spec in poetry_deps.items():
+                if str(name).lower() == "python":
+                    continue
+                ver = None
+                if isinstance(spec, str):
+                    ver = spec.lstrip("^~<=>! ")
+                elif isinstance(spec, dict):
+                    v = spec.get("version")
+                    if isinstance(v, str):
+                        ver = v.lstrip("^~<=>! ")
+                yield str(name).lower(), ver
         return
     # Regex fallback for Python < 3.11
     deps_match = re.search(
@@ -331,9 +439,24 @@ def _parse_pyproject(path: Path) -> Iterable[Tuple[str, Optional[str]]]:
             pkg = m.group(1).split("[")[0].split(">=")[0].split("==")[0].strip()
             if pkg and not pkg.startswith("$"):
                 yield pkg.lower(), None
-
-
-# Import module -> package key (for packages where import name differs from PyPI name)
+    poetry_match = re.search(
+        r"\[tool\.poetry\.dependencies\](.*?)(?:\n\[|\Z)",
+        content,
+        re.DOTALL,
+    )
+    if poetry_match:
+        for m in re.finditer(
+            r'^([A-Za-z0-9_.\-]+)\s*=\s*(?:"([^"]+)"|\'([^\']+)\'|\{[^}]*version\s*=\s*"([^"]+)")',
+            poetry_match.group(1),
+            re.MULTILINE,
+        ):
+            name = m.group(1).lower()
+            if name == "python":
+                continue
+            ver = m.group(2) or m.group(3) or m.group(4)
+            if ver:
+                ver = ver.lstrip("^~<=>! ")
+            yield name, ver
 _IMPORT_TO_AGENT_TOOL: Dict[str, str] = {
     "git": "gitpython",  # GitPython provides 'git' module
 }
@@ -350,10 +473,11 @@ def _normalize_import_to_ai_package(module: str) -> Optional[str]:
             return "google-generativeai"
         if "cloud" in parts and "aiplatform" in parts:
             return "vertexai"
-    if first in ALL_AI_PACKAGES:
-        return first
     if first in _IMPORT_TO_AGENT_TOOL:
         return _IMPORT_TO_AGENT_TOOL[first]
+    looked = _ai_package_lookup(first)
+    if looked:
+        return looked
     if first in AGENT_TOOL_PACKAGES:
         return first
     return None
@@ -361,31 +485,41 @@ def _normalize_import_to_ai_package(module: str) -> Optional[str]:
 
 def _scan_manifests(root: Path) -> List[Component]:
     components: List[Component] = []
+    seen: Set[str] = set()
 
-    req_file = root / "requirements.txt"
-    if req_file.exists():
-        for name, version in _parse_requirements(req_file):
-            comp = Component(
+    def _add_pypi(name: str, version: Optional[str]) -> None:
+        key = _ai_package_lookup(name)
+        if not key:
+            return
+        ident = name.lower()
+        if ident in seen or ident.replace("-", "_") in seen:
+            return
+        seen.add(ident)
+        seen.add(ident.replace("-", "_"))
+        seen.add(key)
+        cat = get_package_category(key)
+        props: Dict[str, Any] = {}
+        if cat != "unknown":
+            props["ai_category"] = cat
+        components.append(
+            Component(
                 id=f"pkg:pypi/{name}@{version}" if version else f"pkg:pypi/{name}",
                 name=name,
                 type=ComponentType.LIBRARY,
                 version=version,
+                properties=props,
             )
-            components.append(comp)
+        )
+
+    req_file = root / "requirements.txt"
+    if req_file.exists():
+        for name, version in _parse_requirements(req_file):
+            _add_pypi(name, version)
 
     pyproject = root / "pyproject.toml"
     if pyproject.exists():
-        seen_pyproject: Set[str] = set()
         for name, version in _parse_pyproject(pyproject):
-            if name and name not in seen_pyproject:
-                seen_pyproject.add(name)
-                comp = Component(
-                    id=f"pkg:pypi/{name}@{version}" if version else f"pkg:pypi/{name}",
-                    name=name,
-                    type=ComponentType.LIBRARY,
-                    version=version,
-                )
-                components.append(comp)
+            _add_pypi(name, version)
 
     pkg_json = root / "package.json"
     if pkg_json.exists():
@@ -393,27 +527,19 @@ def _scan_manifests(root: Path) -> List[Component]:
             props = {}
             if "@modelcontextprotocol" in name.lower() or "mcp-server" in name.lower():
                 props["aitrace:mcp_server"] = True
-            comp = Component(
-                id=f"pkg:npm/{name}@{version}" if version else f"pkg:npm/{name}",
-                name=name,
-                type=ComponentType.LIBRARY,
-                version=version,
-                properties=props,
-            )
-            components.append(comp)
-
-    pyproject = root / "pyproject.toml"
-    if pyproject.exists():
-        seen_pyproject = set()
-        for name, version in _parse_pyproject(pyproject):
-            if name and name not in seen_pyproject:
-                seen_pyproject.add(name)
-                components.append(Component(
-                    id=f"pkg:pypi/{name}@{version}" if version else f"pkg:pypi/{name}",
+            elif not _ai_package_lookup(name.lstrip("@").split("/")[-1]):
+                # Skip non-AI npm deps (express, typescript, etc.)
+                if "mcp" not in name.lower() and "langchain" not in name.lower() and "openai" not in name.lower():
+                    continue
+            components.append(
+                Component(
+                    id=f"pkg:npm/{name}@{version}" if version else f"pkg:npm/{name}",
                     name=name,
                     type=ComponentType.LIBRARY,
                     version=version,
-                ))
+                    properties=props,
+                )
+            )
 
     return components
 
@@ -610,25 +736,36 @@ def discover_surface(repo_root: Path) -> SurfaceDiscoveryResult:
         comp_by_name[k] = c
         comp_by_name[k.replace("-", "_")] = c
 
-    # Add inferred components for AI/agent/MCP/cloud/agent-tool packages imported or referenced but not in manifests
+    # Add inferred components for AI packages imported or referenced but not in manifests
+    existing_labels = {
+        ALL_AI_PACKAGES.get(_ai_package_lookup(n) or n, n)
+        for n in comp_by_name
+    }
     for module in imported_modules:
-        if module in ALL_AI_PACKAGES and module not in comp_by_name:
-            infer_source = "config-reference" if module in ref_providers else "import-analysis"
-            pkg_id = f"pkg:pypi/{module}"  # inferred PyPI, no version
-            infer_props: Dict[str, Any] = {"aitrace:inferred": infer_source}
-            ai_cat = get_package_category(module)
-            if ai_cat != "unknown":
-                infer_props["ai_category"] = ai_cat
-            inferred = Component(
-                id=pkg_id,
-                name=module,
-                type=ComponentType.LIBRARY,
-                version=None,
-                purl=pkg_id,
-                properties=infer_props,
-            )
-            components.append(inferred)
-            comp_by_name[module] = inferred
+        looked = _ai_package_lookup(module) or (module if module in ALL_AI_PACKAGES else None)
+        if not looked:
+            continue
+        label = ALL_AI_PACKAGES.get(looked, looked)
+        if looked in comp_by_name or module in comp_by_name or label in existing_labels:
+            continue
+        infer_source = "config-reference" if module in ref_providers else "import-analysis"
+        pkg_id = f"pkg:pypi/{looked}"
+        infer_props: Dict[str, Any] = {"aitrace:inferred": infer_source}
+        ai_cat = get_package_category(looked)
+        if ai_cat != "unknown":
+            infer_props["ai_category"] = ai_cat
+        inferred = Component(
+            id=pkg_id,
+            name=looked,
+            type=ComponentType.LIBRARY,
+            version=None,
+            purl=pkg_id,
+            properties=infer_props,
+        )
+        components.append(inferred)
+        comp_by_name[looked] = inferred
+        comp_by_name[looked.replace("-", "_")] = inferred
+        existing_labels.add(label)
 
     findings = _build_findings_for_components(components, imported_modules, repo_root)
     return SurfaceDiscoveryResult(components=components, findings=findings)

@@ -43,11 +43,20 @@ _PROVIDER_MAP = {
     "openrouter/": "openrouter",
     "together/": "together",
     "groq/": "groq",
+    "grok-": "xai",
+    "xai/": "xai",
+    "xai-": "xai",
     "deepseek": "deepseek",
+    "qwen": "dashscope",
+    "kimi": "moonshot",
+    "moonshot": "moonshot",
 }
 
 # Providers that require an API key
-_CLOUD_PROVIDERS = {"openai", "anthropic", "google", "cohere", "mistral", "openrouter", "together", "groq", "deepseek"}
+_CLOUD_PROVIDERS = {
+    "openai", "anthropic", "google", "cohere", "mistral", "openrouter",
+    "together", "groq", "deepseek", "xai", "dashscope", "moonshot", "perplexity",
+}
 
 # Providers that are local (no key needed)
 _LOCAL_PROVIDERS = {"ollama", "meta"}
@@ -63,6 +72,10 @@ _ENV_VAR_MAP = {
     "together": "TOGETHER_API_KEY",
     "groq": "GROQ_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
+    "xai": "XAI_API_KEY",
+    "dashscope": "DASHSCOPE_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
 }
 
 

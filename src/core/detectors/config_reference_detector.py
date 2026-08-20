@@ -22,6 +22,14 @@ API_URL_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"ai\.google\.dev", re.I), "google-generativeai"),
     (re.compile(r"api\.cohere\.(ai|com)", re.I), "cohere"),
     (re.compile(r"api\.mistral\.ai", re.I), "mistralai"),
+    (re.compile(r"api\.x\.ai", re.I), "xai"),
+    (re.compile(r"api\.groq\.com", re.I), "groq"),
+    (re.compile(r"openrouter\.ai", re.I), "openrouter"),
+    (re.compile(r"api\.deepseek\.com", re.I), "deepseek"),
+    (re.compile(r"dashscope\.aliyuncs\.com", re.I), "dashscope"),
+    (re.compile(r"api\.moonshot\.(cn|ai)", re.I), "moonshot"),
+    (re.compile(r"api\.together\.(xyz|ai)", re.I), "together"),
+    (re.compile(r"api\.perplexity\.ai", re.I), "perplexity"),
     (re.compile(r"api\.replicate\.com", re.I), "replicate"),
     (re.compile(r"localhost:11434|ollama[./]|[\"']ollama[\"']|OLLAMA_", re.I), "ollama"),  # Ollama local API
     (re.compile(r"api\.ai21\.(com|ai)", re.I), "ai21"),
@@ -31,17 +39,34 @@ API_URL_PATTERNS: list[tuple[re.Pattern, str]] = [
 
 # Model ID patterns in strings -> provider (for metadata/config)
 MODEL_ID_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r'["\']gpt-4(?:o|o-mini|-turbo)?["\']', re.I), "openai"),
+    # OpenAI
+    (re.compile(r'["\']gpt-4(?:o|o-mini|-turbo|\.1)?[\w\-]*["\']', re.I), "openai"),
+    (re.compile(r'["\']gpt-5[\w\-]*["\']', re.I), "openai"),
     (re.compile(r'["\']gpt-3\.5-turbo(?:-\d+)?["\']', re.I), "openai"),
-    (re.compile(r'["\']o1(?:-preview|-mini)?["\']', re.I), "openai"),
+    (re.compile(r'["\']o[134](?:-preview|-mini|-pro)?["\']', re.I), "openai"),
     (re.compile(r'["\']text-embedding-3-(?:large|small)["\']', re.I), "openai"),
     (re.compile(r'["\']text-embedding-ada-002["\']', re.I), "openai"),
-    (re.compile(r'["\']claude-3(?:\.5-sonnet|-opus|-sonnet|-haiku)?(?:-\d+)?["\']', re.I), "anthropic"),
-    (re.compile(r'["\']gemini-1\.5-(?:pro|flash)["\']', re.I), "google-generativeai"),
-    (re.compile(r'["\']gemini-2\.0-flash-exp["\']', re.I), "google-generativeai"),
-    (re.compile(r'["\']gemini-pro["\']', re.I), "google-generativeai"),
-    (re.compile(r'["\'](?:mistral-large|mixtral(?:-8x7b)?(?:-\d+)?)["\']', re.I), "mistralai"),
-    (re.compile(r'["\']llama3?(?:-\d+b)?(?:-\d+)?["\']', re.I), "ollama"),
+    # Anthropic
+    (re.compile(r'["\']claude-(?:3(?:\.[57])?|sonnet-4|opus-4|haiku-4)[\w\-\.]*["\']', re.I), "anthropic"),
+    (re.compile(r'["\']claude-(?:sonnet|opus|haiku)-4[\w\-]*["\']', re.I), "anthropic"),
+    # Google
+    (re.compile(r'["\']gemini-(?:1\.5|2\.0|2\.5|pro|flash)[\w\-\.]*["\']', re.I), "google-generativeai"),
+    # xAI Grok
+    (re.compile(r'["\']grok-(?:[0-9]|beta|latest)[\w\-]*["\']', re.I), "xai"),
+    (re.compile(r'["\']xai/[^"\']+["\']', re.I), "xai"),
+    # Groq (explicit prefix)
+    (re.compile(r'["\']groq/[^"\']+["\']', re.I), "groq"),
+    # DeepSeek
+    (re.compile(r'["\']deepseek-(?:chat|reasoner|coder)[\w\-]*["\']', re.I), "deepseek"),
+    # Qwen / Kimi
+    (re.compile(r'["\']qwen[\w\.\-]*["\']', re.I), "dashscope"),
+    (re.compile(r'["\'](?:kimi|moonshot)[\w\-\.]*["\']', re.I), "moonshot"),
+    # Mistral
+    (re.compile(r'["\'](?:mistral-large|mixtral|pixtral)[\w\-]*["\']', re.I), "mistralai"),
+    # Local / Ollama
+    (re.compile(r'["\']llama-?3[\w\.\-]*["\']', re.I), "ollama"),
+    # OpenRouter prefixed ids
+    (re.compile(r'["\']openrouter/[^"\']+["\']', re.I), "openrouter"),
 ]
 
 # Provider key in config (e.g. "provider": "openai")
@@ -49,7 +74,12 @@ PROVIDER_KEY_PATTERN = re.compile(
     r'["\']?(?:provider|api_provider|llm_provider)["\']?\s*:\s*["\']([a-z0-9\-]+)["\']',
     re.I,
 )
-KNOWN_PROVIDER_VALUES = {"openai", "anthropic", "cohere", "google", "mistral", "mistralai", "replicate", "together", "groq", "ollama", "ai21", "fireworks", "fireworks-ai", "aleph-alpha", "aleph_alpha"}
+KNOWN_PROVIDER_VALUES = {
+    "openai", "anthropic", "cohere", "google", "mistral", "mistralai",
+    "replicate", "together", "groq", "ollama", "ai21", "fireworks", "fireworks-ai",
+    "aleph-alpha", "aleph_alpha", "xai", "grok", "openrouter", "deepseek",
+    "dashscope", "moonshot", "perplexity",
+}
 
 
 def detect_config_references(repo_root: Path) -> Set[Tuple[str, str]]:
@@ -99,6 +129,7 @@ def detect_config_references(repo_root: Path) -> Set[Tuple[str, str]]:
                 provider = (
                     "google-generativeai" if val == "google"
                     else "mistralai" if val == "mistral"
+                    else "xai" if val == "grok"
                     else "aleph-alpha-client" if val in ("aleph-alpha", "aleph_alpha")
                     else val
                 )

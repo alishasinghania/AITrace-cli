@@ -359,8 +359,12 @@ class _PromptInjectionVisitor(ast.NodeVisitor):
                     ))
 
         # PythonREPL / exec() — user input into code execution
+        # Match the call attribute, not substrings (execute_commands would match "exec").
         _cs = ".".join(chain_lower)
-        if any(rt in _cs for rt in ("pythonrepl", "python_repl", "exec", "eval", "repl")):
+        _attr = chain_lower[-1] if chain_lower else ""
+        if _attr in {"exec", "eval", "compile"} or any(
+            rt in _cs for rt in ("pythonrepl", "python_repl", "pythonrepltool")
+        ):
             for arg in node.args:
                 refs = {n.id for n in ast.walk(arg) if isinstance(n, ast.Name)}
                 if refs & self.user_input_vars or any(

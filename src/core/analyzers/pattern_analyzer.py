@@ -15,6 +15,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..utils.ast_utils import should_skip_path, walk_python_files, get_call_target_chain
 
+from .taint_catalog import RAG_INGEST_ATTRS, classify_sink
+
 # Re-use sensitive keywords rather than duplicating them
 from .sensitive_data_detector import SENSITIVE_KEYWORDS
 
@@ -105,6 +107,7 @@ _LLM_CALL_ATTRS = {
 _LLM_CHAIN_FRAGMENTS = {
     "openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral",
     "litellm", "ollama", "groq", "together", "replicate", "perplexity",
+    "xai", "grok", "deepseek", "openrouter", "dashscope", "moonshot",
     "chat", "completions", "messages", "llm", "chain", "agent",
     "generativemodel", "generativeai", "chatmodel", "chatanthropic",
     "chatopenai", "azurechatopenai",
@@ -253,6 +256,63 @@ def _get_param_names(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> Set[s
     if args.kwarg:
         params.add(args.kwarg.arg)
     return params
+
+
+def _tainted_from_params(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> Set[str]:
+    """Approximate intra-function taint: parameters plus names assigned or looped from them."""
+    skip = {"self", "cls"}
+    tainted = {p for p in _get_param_names(func_node) if p not in skip}
+    for _ in range(4):
+        grew = False
+        for node in ast.walk(func_node):
+            if isinstance(node, ast.Assign) and _names_in_expr(node.value) & tainted:
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id not in tainted:
+                        tainted.add(t.id)
+                        grew = True
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.value is not None and _names_in_expr(node.value) & tainted:
+                    if node.target.id not in tainted:
+                        tainted.add(node.target.id)
+                        grew = True
+            elif isinstance(node, ast.For) and _names_in_expr(node.iter) & tainted:
+                if isinstance(node.target, ast.Name) and node.target.id not in tainted:
+                    tainted.add(node.target.id)
+                    grew = True
+        if not grew:
+            break
+    return tainted
+
+
+def _call_has_shell_true(node: ast.Call) -> bool:
+    """Return True if a subprocess-style call sets shell=True."""
+    for kw in node.keywords:
+        if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+            return True
+    return False
+
+
+def _class_base_names(cls: ast.ClassDef) -> List[str]:
+    """Lowercased base class names for a class definition."""
+    names: List[str] = []
+    for b in cls.bases:
+        if isinstance(b, ast.Name):
+            names.append(b.id.lower())
+        elif isinstance(b, ast.Attribute):
+            names.append(b.attr.lower())
+    return names
+
+
+def _class_str_field(cls: ast.ClassDef, field: str) -> str:
+    """Return a string constant assigned to `field` on the class body, if any."""
+    for node in cls.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == field for t in node.targets):
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return node.value.value
+    return ""
 
 
 def _names_in_expr(node: ast.expr) -> Set[str]:
@@ -2547,6 +2607,413 @@ def detect_pat024(
 
 
 # ---------------------------------------------------------------------------
+# PAT-025: User-controlled input executed via subprocess/os.system
+# ---------------------------------------------------------------------------
+
+_SHELL_EXEC_ATTRS = {"run", "popen", "system", "call", "check_output", "check_call", "popen"}
+_RAG_CORPUS_PATH_FRAGMENTS = (
+    "training/facts", "training\\facts", "/facts/", "facts/",
+    "knowledge", "corpus", "vectorstore", "/kb/", "rag_docs", "documents/",
+)
+_CORPUS_SECRET_RE = re.compile(
+    r"(password\s*[:=]\s*\S+)|(\bapi[_-]?key\b\s*[:=])|(FLAG\{)|(\bsk-[A-Za-z0-9]{8,})",
+    re.IGNORECASE,
+)
+_HIGH_RISK_DECLARED: List[Tuple[Tuple[str, ...], str, str]] = [
+    (("send email", "send_email", "sendmail", "smtp"), "email_send", "critical"),
+    (("read email", "read_email", "incoming email"), "email_read", "high"),
+    (("read contacts", "contact_list"), "contacts", "high"),
+    (("get url", "retrieve url", "http get", "ssrf"), "url_fetch", "high"),
+]
+
+
+def detect_pat025(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-025: Function parameters reach subprocess/os.system (command injection)."""
+    findings: List[PatternFinding] = []
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if func.name.startswith("test_"):
+            continue
+        tainted = _tainted_from_params(func)
+        if not tainted:
+            continue
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            attr = _call_attr(node)
+            chain = _call_chain_str(node)
+            is_os_system = attr == "system" and "os" in chain.split(".")
+            is_os_popen = attr == "popen" and "os" in chain.split(".")
+            is_subproc = "subprocess" in chain and attr in _SHELL_EXEC_ATTRS
+            if not (is_os_system or is_os_popen or is_subproc):
+                continue
+            uses_shell = is_os_system or is_os_popen or _call_has_shell_true(node)
+            if not uses_shell:
+                continue
+
+            arg_exprs = list(node.args) + [kw.value for kw in node.keywords if kw.arg != "shell"]
+            hit_names: Set[str] = set()
+            for arg in arg_exprs:
+                hit_names |= _names_in_expr(arg) & tainted
+            if not hit_names:
+                continue
+
+            lineno = getattr(node, "lineno", 0)
+            var = next(iter(hit_names))
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-025",
+                title="User-controlled input executed as a shell command",
+                severity="critical",
+                confidence="high",
+                category="LLM08 Excessive Agency",
+                owasp_id="LLM08",
+                cwe="CWE-78",
+                file=file_path,
+                line=lineno,
+                function_name=_get_func_name(func),
+                pattern_matched=f"tainted '{var}' passed to {chain}.{attr}(shell=True)" if not is_os_system
+                else f"tainted '{var}' passed to os.system()",
+                evidence=[
+                    f"line {func.lineno}: function '{func.name}' takes user-controlled parameters",
+                    f"line {lineno}: {chain}({var}) with shell execution",
+                    "Attacker-controlled strings can run arbitrary OS commands.",
+                ],
+                framework="python_stdlib",
+                remediation=(
+                    "Never pass user or LLM-derived strings to subprocess with shell=True "
+                    "or os.system(). Use subprocess.run(argv_list, shell=False) with a fixed "
+                    "allowlist of commands."
+                ),
+                cvss_estimate=9.8,
+            ))
+            break
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# PAT-026: User content appended into a RAG / training corpus then retrieved
+# ---------------------------------------------------------------------------
+
+def detect_pat026(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-026: Chat/user text is written into files later loaded by RAG."""
+    findings: List[PatternFinding] = []
+    src_lower = source_text.lower()
+    has_retrieval = any(
+        s in src_lower
+        for s in ("similarity_search", "from_texts", "add_texts", "faiss", "as_retriever")
+    )
+    has_ingest = any(s in src_lower for s in RAG_INGEST_ATTRS)
+    if not has_retrieval and not has_ingest:
+        return []
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        tainted = _tainted_from_params(func)
+        if not tainted:
+            continue
+
+        corpus_path_hit = False
+        write_line = 0
+        ingest_line = 0
+        ingest_attr = ""
+        for node in ast.walk(func):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                val = node.value.lower().replace("\\", "/")
+                if any(frag in val for frag in _RAG_CORPUS_PATH_FRAGMENTS):
+                    corpus_path_hit = True
+            if not isinstance(node, ast.Call):
+                continue
+            attr = _call_attr(node)
+            if attr == "write":
+                for arg in node.args:
+                    if _names_in_expr(arg) & tainted:
+                        write_line = getattr(node, "lineno", 0)
+            if attr in RAG_INGEST_ATTRS:
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    if _names_in_expr(arg) & tainted:
+                        ingest_line = getattr(node, "lineno", 0)
+                        ingest_attr = attr
+                        break
+
+        if ingest_line:
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-026",
+                title="User input is written into the RAG / training corpus",
+                severity="high",
+                confidence="high",
+                category="LLM03 Training Data Poisoning",
+                owasp_id="LLM03",
+                cwe="CWE-20",
+                file=file_path,
+                line=ingest_line,
+                function_name=_get_func_name(func),
+                pattern_matched=f"tainted argument to {ingest_attr}()",
+                evidence=[
+                    f"line {ingest_line}: {ingest_attr}() receives a function parameter",
+                    "User-controlled documents can be retrieved into later LLM prompts.",
+                ],
+                framework="langchain",
+                remediation=(
+                    "Do not ingest raw user messages into the vector store. "
+                    "Require admin-only ingestion and content signing."
+                ),
+                cvss_estimate=7.5,
+            ))
+        elif corpus_path_hit and write_line:
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-026",
+                title="User input is written into the RAG / training corpus",
+                severity="high",
+                confidence="high",
+                category="LLM03 Training Data Poisoning",
+                owasp_id="LLM03",
+                cwe="CWE-20",
+                file=file_path,
+                line=write_line,
+                function_name=_get_func_name(func),
+                pattern_matched="user text appended under a corpus path",
+                evidence=[
+                    f"line {write_line}: write() of a function parameter into a corpus path",
+                    "Same file performs RAG retrieval — poisoned documents can reach the LLM.",
+                ],
+                framework="langchain",
+                remediation=(
+                    "Do not append raw user messages into the retrieval corpus. "
+                    "Require admin-only ingestion, content signing, and re-index from a trusted source."
+                ),
+                cvss_estimate=7.5,
+            ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# PAT-027: LangChain BaseTool with high-risk capability (email, URL, search)
+# ---------------------------------------------------------------------------
+
+def detect_pat027(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-027: Tools flagged by sinks in the body; names are secondary evidence."""
+    findings: List[PatternFinding] = []
+
+    def _emit(
+        line: int,
+        name: str,
+        action: str,
+        severity: str,
+        confidence: str,
+        evidence: List[str],
+        title: str,
+    ) -> None:
+        findings.append(PatternFinding(
+            vulnerability_id="PAT-027",
+            title=title,
+            severity=severity,
+            confidence=confidence,
+            category="LLM08 Excessive Agency",
+            owasp_id="LLM08",
+            cwe="CWE-284",
+            file=file_path,
+            line=line,
+            function_name=name,
+            pattern_matched=action,
+            evidence=evidence,
+            framework="langchain",
+            remediation=(
+                "Wrap high-impact tools with human-in-the-loop confirmation, "
+                "allowlists, and sanitization of tool results before they re-enter the agent."
+            ),
+            cvss_estimate=8.8 if severity == "critical" else 7.2,
+        ))
+
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        if not any(b in {"basetool", "tool"} for b in _class_base_names(cls)):
+            continue
+        tool_name = _class_str_field(cls, "name") or cls.name
+        desc = _class_str_field(cls, "description")
+        run_fn = next(
+            (
+                item
+                for item in cls.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name in {"_run", "_arun", "run", "arun"}
+            ),
+            None,
+        )
+        observed: List[str] = []
+        returns_untrusted = False
+        if run_fn:
+            for node in ast.walk(run_fn):
+                if isinstance(node, ast.Call):
+                    for tag in classify_sink(node):
+                        if tag not in observed:
+                            observed.append(tag)
+                if isinstance(node, ast.Return) and node.value is not None:
+                    if _names_in_expr(node.value) & {"payload", "tool_input", "query", "url"}:
+                        returns_untrusted = True
+                    for n in ast.walk(node.value):
+                        if isinstance(n, ast.Attribute) and n.attr.lower() in {
+                            "payload", "payloads", "content", "body", "text",
+                        }:
+                            returns_untrusted = True
+
+        if "email" in observed or "rce" in observed:
+            _emit(
+                cls.lineno, cls.name, f"observed sink in {tool_name}: {observed}",
+                "critical", "high",
+                [
+                    f"line {cls.lineno}: {cls.name} (BaseTool) name={tool_name!r}",
+                    f"Tool body performs {observed} with no human approval gate.",
+                ],
+                "AI agent tool performs a high-impact action",
+            )
+            continue
+        if "http" in observed or returns_untrusted:
+            _emit(
+                cls.lineno, cls.name, f"untrusted tool result from {tool_name}",
+                "high", "high",
+                [
+                    f"line {cls.lineno}: {cls.name} name={tool_name!r}",
+                    "Tool returns fetched or attacker-controlled text into the agent."
+                    if returns_untrusted
+                    else f"Tool body performs outbound HTTP ({observed}).",
+                ],
+                "AI agent tool returns untrusted content or fetches URLs",
+            )
+            continue
+        blob = f"{cls.name} {tool_name} {desc}".lower()
+        for needles, action, severity in _HIGH_RISK_DECLARED:
+            if any(n in blob for n in needles):
+                _emit(
+                    cls.lineno, cls.name,
+                    f"declared capability {action} (no sink in body)",
+                    severity, "medium",
+                    [
+                        f"line {cls.lineno}: {cls.name} name={tool_name!r}",
+                        "No dangerous call in _run; capability inferred from name/description.",
+                    ],
+                    "AI agent has a high-impact tool with no approval gate",
+                )
+                break
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        is_tool = False
+        for d in func.decorator_list:
+            name = ""
+            if isinstance(d, ast.Name):
+                name = d.id.lower()
+            elif isinstance(d, ast.Attribute):
+                name = d.attr.lower()
+            elif isinstance(d, ast.Call):
+                name = _call_attr(d)
+            if name in _TOOL_DECORATORS:
+                is_tool = True
+                break
+        if not is_tool:
+            continue
+        observed: List[str] = []
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call):
+                for tag in classify_sink(node):
+                    if tag not in observed:
+                        observed.append(tag)
+        if not (set(observed) & {"rce", "email", "http", "sql", "rag_ingest"}):
+            continue
+        sev = "critical" if set(observed) & {"rce", "email"} else "high"
+        _emit(
+            func.lineno, func.name, f"@tool body sinks {observed}",
+            sev, "high",
+            [
+                f"line {func.lineno}: @tool function '{func.name}'",
+                f"Body performs {observed} without an approval gate.",
+            ],
+            "AI agent tool performs a high-impact action",
+        )
+
+    return findings
+
+
+def _detect_pat028_corpus_secrets(repo_root: Path) -> List[PatternFinding]:
+    """PAT-028: Secrets in text files that RAG pipelines ingest."""
+    findings: List[PatternFinding] = []
+    try:
+        py_blob = " ".join(
+            p.read_text(encoding="utf-8", errors="ignore")[:8000]
+            for p in list(walk_python_files(repo_root))[:80]
+        ).lower()
+    except Exception:
+        return []
+    if not any(s in py_blob for s in ("faiss", "similarity_search", "from_texts", "chromadb", "vectorstore")):
+        return []
+
+    skip_parts = {".git", "node_modules", ".venv", "venv", "dist", "__pycache__"}
+    for path in repo_root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {".txt", ".md"}:
+            continue
+        rel_parts = set(path.relative_to(repo_root).parts)
+        if rel_parts & skip_parts:
+            continue
+        rel = str(path.relative_to(repo_root)).replace("\\", "/")
+        if not any(k in rel.lower() for k in ("fact", "training", "knowledge", "corpus", "docs")):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if not _CORPUS_SECRET_RE.search(line):
+                continue
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-028",
+                title="Secret or credential stored in RAG training documents",
+                severity="high",
+                confidence="medium",
+                category="LLM06 Sensitive Information Disclosure",
+                owasp_id="LLM06",
+                cwe="CWE-312",
+                file=rel,
+                line=i,
+                function_name=None,
+                pattern_matched="credential-like string in corpus file ingested by RAG",
+                evidence=[
+                    f"{rel}:{i}: document contains a password/key/flag pattern",
+                    "These files are loaded into the vector store and can be retrieved into LLM context.",
+                ],
+                framework="rag_corpus",
+                remediation=(
+                    "Remove secrets from documents used for embeddings. "
+                    "Store credentials in a secret manager, not in the knowledge base."
+                ),
+                cvss_estimate=7.5,
+            ))
+            break  # one finding per file
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -2574,6 +3041,9 @@ _DETECTORS: List[Callable] = [
     detect_pat021,
     detect_pat023,
     detect_pat024,
+    detect_pat025,
+    detect_pat026,
+    detect_pat027,
 ]
 
 
@@ -2683,6 +3153,11 @@ def analyze_patterns(repo_root: Path) -> PatternAnalysisResult:
     except Exception as e:
         scan_errors.append(f"PAT-022 CVE check: {e}")
 
+    try:
+        all_findings.extend(_detect_pat028_corpus_secrets(repo_root))
+    except Exception as e:
+        scan_errors.append(f"PAT-028 corpus secret check: {e}")
+
     # PAT-012: repo-level Lethal Trifecta
     if cond_a_signals and cond_b_signals and cond_c_signals:
         fa, la = cond_a_signals[0]
@@ -2719,7 +3194,7 @@ def analyze_patterns(repo_root: Path) -> PatternAnalysisResult:
     return PatternAnalysisResult(
         findings=all_findings,
         files_scanned=files_scanned,
-        patterns_evaluated=len(_DETECTORS) + 2,  # +1 PAT-012 repo-level, +1 PAT-022 CVE check
+        patterns_evaluated=len(_DETECTORS) + 3,  # PAT-012, PAT-022, PAT-028 repo-level
         scan_errors=scan_errors,
         framework_summary=framework_summary,
     )
