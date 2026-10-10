@@ -34,6 +34,16 @@ def test_torch_and_new_sdks_are_registered():
     assert _ai_package_lookup("grok") == "grok"
     assert _ai_package_lookup("openrouter")
     assert _ai_package_lookup("deepseek")
+    assert _ai_package_lookup("google-cloud-aiplatform")
+    assert _ai_package_lookup("langchain-aws")
+    assert _ai_package_lookup("cerebras-cloud-sdk")
+    assert _ai_package_lookup("ibm-watsonx-ai")
+    assert _ai_package_lookup("azure-ai-inference")
+    assert _ai_package_lookup("zhipuai")
+    assert _ai_package_lookup("strands-agents")
+    assert _ai_package_lookup("unstructured")
+    assert get_package_category("chromadb") == "vector_store"
+    assert get_package_category("langchain-aws") == "llm_sdk"
 
 
 def test_parse_poetry_pyproject(tmp_path: Path):

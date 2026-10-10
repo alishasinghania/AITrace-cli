@@ -259,7 +259,10 @@ def scan(
             verification_results = verify_statically(exploit_payloads, repo_root)
 
         from core.features.rag_poison_simulator import simulate as rag_simulate, poison_to_text
-        rag_poison = rag_simulate(architecture_result)
+        rag_poison = rag_simulate(
+            architecture_result,
+            pattern_analysis=result.pattern_analysis,
+        )
 
     if OutputFormat.RISK_MD in selected_formats:
         risk_md = to_risk_report_markdown(

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from core.architecture_inference import ArchitectureResult
+    from core.analyzers.architecture_inference import ArchitectureResult
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +254,55 @@ _STORE_SNIPPETS: Dict[str, str] = {
     "qdrant":   _QDRANT_SNIPPET,
 }
 
+_RAG_PAT_IDS = frozenset({"PAT-001", "PAT-018"})
+_VECTOR_STORE_HINTS = (
+    "chroma", "pinecone", "weaviate", "qdrant", "faiss", "pgvector",
+    "milvus", "lancedb", "vector", "opensearch",
+)
+
+
+def rag_pipeline_detected(
+    architecture_result: Any = None,
+    pattern_analysis: Any = None,
+) -> bool:
+    """
+    True when a RAG/vector-store pipeline is present.
+
+    Triggers on architecture type RAG, vector-store detector hits, or
+    PAT-001/PAT-018 findings. Does not require the exact string \"RAG\"
+    in architecture_types.
+    """
+    if architecture_result is not None:
+        types = [str(t).lower() for t in getattr(architecture_result, "architecture_types", []) or []]
+        if any(t == "rag" or any(h in t for h in _VECTOR_STORE_HINTS) for t in types):
+            return True
+        for dr in getattr(architecture_result, "detector_results", []) or []:
+            if not isinstance(dr, dict):
+                component = str(getattr(dr, "component", "") or "").lower()
+                details = getattr(dr, "details", None) or {}
+            else:
+                component = str(dr.get("component", "") or "").lower()
+                details = dr.get("details") or {}
+            if component == "rag":
+                return True
+            stores = []
+            if isinstance(details, dict):
+                stores = details.get("vector_stores") or []
+            if stores:
+                return True
+            if any(h in component for h in _VECTOR_STORE_HINTS):
+                return True
+
+    if pattern_analysis is not None:
+        for f in getattr(pattern_analysis, "findings", []) or []:
+            if getattr(f, "dismissed_as_fp", False):
+                continue
+            if getattr(f, "confidence", "high") == "low":
+                continue
+            if getattr(f, "vulnerability_id", "") in _RAG_PAT_IDS:
+                return True
+    return False
+
 
 def _get_insertion_snippet(vector_store: str) -> str:
     key = vector_store.lower().replace(" ", "").replace("vectorstore", "")
@@ -267,28 +316,38 @@ def _get_insertion_snippet(vector_store: str) -> str:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def simulate(architecture_result: "ArchitectureResult") -> Optional[RagPoisonResult]:
+def simulate(
+    architecture_result: "ArchitectureResult" = None,
+    pattern_analysis: Optional[Any] = None,
+) -> Optional[RagPoisonResult]:
     """
     Generate RAG poison payloads if a RAG pipeline is detected.
     Returns None if RAG is not present.
+
+    pattern_analysis is optional (PatternAnalysisResult) so PAT-001/018
+    can trigger generation when architecture_types does not include \"RAG\".
     """
-    if not architecture_result:
+    if not rag_pipeline_detected(architecture_result, pattern_analysis):
         return None
 
-    arch_types = getattr(architecture_result, "architecture_types", [])
-    if "RAG" not in arch_types:
-        return None
-
-    # Extract vector store and embedding info from detector results
     vector_stores: List[str] = []
     embeddings: List[str] = []
-    for dr in getattr(architecture_result, "detector_results", []):
-        if dr.get("component") == "RAG":
-            # Fields may be at top level or nested under "details"
-            details = dr.get("details", {})
-            vector_stores = dr.get("vector_stores") or details.get("vector_stores") or []
-            embeddings = dr.get("embeddings") or details.get("embeddings") or []
-            break
+    if architecture_result:
+        for dr in getattr(architecture_result, "detector_results", []) or []:
+            if isinstance(dr, dict):
+                component = dr.get("component")
+                details = dr.get("details") or {}
+                vs = dr.get("vector_stores") or details.get("vector_stores") or []
+                emb = dr.get("embeddings") or details.get("embeddings") or []
+            else:
+                component = getattr(dr, "component", None)
+                details = getattr(dr, "details", None) or {}
+                vs = details.get("vector_stores") or []
+                emb = details.get("embeddings") or []
+            if str(component or "").upper() == "RAG" or vs:
+                vector_stores = list(vs)
+                embeddings = list(emb)
+                break
 
     store_label = vector_stores[0] if vector_stores else "Unknown"
     embed_label = embeddings[0] if embeddings else "Unknown"

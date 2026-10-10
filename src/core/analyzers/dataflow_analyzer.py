@@ -24,6 +24,7 @@ from ..utils.ast_utils import walk_python_files, should_skip_path, get_call_chai
 
 SOURCE_RISK: Dict[str, str] = {
     "user_input": "high",
+    "mcp_tool_arg": "high",
     "external_api": "medium",
     "environment": "medium",
     "file_read": "low",
@@ -279,6 +280,59 @@ def _is_sanitization_call(node: ast.Call) -> bool:
 
 _GENERIC_SINK_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
 
+_MCP_HANDLER_EXACT = {"call_tool", "handle_tool_call", "dispatch_tool"}
+_MCP_ARG_NAMES = {"arguments", "args", "params"}
+_MCP_FILE_HINTS = (
+    "list_tools", "call_tool", "mcp.tool", "FastMCP", "fastmcp",
+    "mcpServers", "types.Tool", "Server(",
+)
+
+
+def _decorator_attr(dec: ast.expr) -> str:
+    """Return the last attribute/name of a decorator expression."""
+    if isinstance(dec, ast.Attribute):
+        return dec.attr.lower()
+    if isinstance(dec, ast.Name):
+        return dec.id.lower()
+    if isinstance(dec, ast.Call):
+        if isinstance(dec.func, ast.Attribute):
+            return dec.func.attr.lower()
+        if isinstance(dec.func, ast.Name):
+            return dec.func.id.lower()
+    return ""
+
+
+def _has_tool_decorator(func: ast.AST) -> bool:
+    """True if the function is decorated as an MCP/agent tool."""
+    for dec in getattr(func, "decorator_list", []) or []:
+        if _decorator_attr(dec) in {"tool", "function_tool"}:
+            return True
+    return False
+
+
+def _is_mcp_tool_function(func: ast.AST, is_mcp_file: bool) -> bool:
+    """True for call_tool / handle_* (MCP files only) / @mcp.tool handlers."""
+    if _has_tool_decorator(func):
+        return True
+    name = getattr(func, "name", "")
+    if name in _MCP_HANDLER_EXACT:
+        return True
+    if is_mcp_file and (name.startswith("handle_") or name.startswith("_handle_")):
+        return True
+    return False
+
+
+def _mcp_arg_source(node: ast.expr) -> Optional[Tuple[str, str]]:
+    """arguments.get / args['x'] only — not generic dict.get."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr == "get" and isinstance(node.func.value, ast.Name):
+            if node.func.value.id in _MCP_ARG_NAMES:
+                return ("mcp_tool_arg", SOURCE_RISK["mcp_tool_arg"])
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+        if node.value.id in _MCP_ARG_NAMES:
+            return ("mcp_tool_arg", SOURCE_RISK["mcp_tool_arg"])
+    return None
+
 
 def _is_sink_call(node: ast.Call) -> Optional[str]:
     """Return sink label if node is an LLM sink."""
@@ -310,21 +364,41 @@ def _names_in_expr(node: ast.expr) -> Set[str]:
 class _TaintVisitor(ast.NodeVisitor):
     """Per-function taint analysis visitor with sanitization tracking."""
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, source_text: str = ""):
         self.file_path = file_path
         self.tainted: Dict[str, Tuple[str, str, Optional[int]]] = {}  # var -> (source, risk, line)
         self.sanitized: Set[str] = set()  # vars that passed through sanitization (mitigated)
         self.flows: List[DataFlow] = []
         self._in_function = False
+        self._in_mcp_handler = False
+        self._is_mcp_file = any(h in source_text for h in _MCP_FILE_HINTS)
+
+    def _visit_function(self, node: ast.AST) -> None:
+        saved_tainted = dict(self.tainted)
+        saved_sanitized = set(self.sanitized)
+        saved_mcp = self._in_mcp_handler
+        self._in_function = True
+        self._in_mcp_handler = _is_mcp_tool_function(node, self._is_mcp_file)
+        if self._in_mcp_handler:
+            line = getattr(node, "lineno", None)
+            skip = {"self", "cls", "name"}
+            for a in node.args.args:
+                if a.arg not in skip:
+                    self.tainted[a.arg] = ("mcp_tool_arg", SOURCE_RISK["mcp_tool_arg"], line)
+            for a in node.args.kwonlyargs:
+                if a.arg not in skip:
+                    self.tainted[a.arg] = ("mcp_tool_arg", SOURCE_RISK["mcp_tool_arg"], line)
+        self.generic_visit(node)
+        self.tainted = saved_tainted
+        self.sanitized = saved_sanitized
+        self._in_mcp_handler = saved_mcp
+        self._in_function = False
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._in_function = True
-        func_tainted = dict(self.tainted)
-        func_sanitized = set(self.sanitized)
-        self.generic_visit(node)
-        self.tainted = func_tainted
-        self.sanitized = func_sanitized
-        self._in_function = False
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         targets = _get_assign_targets(node)
@@ -341,7 +415,11 @@ class _TaintVisitor(ast.NodeVisitor):
             self.generic_visit(node)
             return
 
-        src = _is_source_value(node.value)
+        src = None
+        if self._in_mcp_handler:
+            src = _mcp_arg_source(node.value)
+        if src is None:
+            src = _is_source_value(node.value)
         if src:
             label, risk = src
             line = getattr(node, "lineno", None)
@@ -419,12 +497,13 @@ def analyze_dataflows(repo_root: Path) -> DataFlowAnalysisResult:
         if path.suffix != ".py" or should_skip_path(path, repo_root):
             continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+            source_text = path.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(source_text)
         except (SyntaxError, OSError):
             continue
 
         rel_path = str(path.relative_to(repo_root))
-        visitor = _TaintVisitor(rel_path)
+        visitor = _TaintVisitor(rel_path, source_text)
         visitor.visit(tree)
 
         for df in visitor.flows:

@@ -20,7 +20,6 @@ from ..models import (
 
 MODEL_EXTENSIONS = {".pt", ".pth", ".bin", ".safetensors", ".onnx", ".pb", ".gguf", ".ggml"}
 CONFIG_FILENAMES = {"config.json", "model_config.json"}
-MCP_CONFIG_PATHS = (".cursor/mcp.json", "mcp.json", ".mcp.json")
 # Path parts that indicate non-model .bin files (Flutter/Dart, etc.)
 MODEL_BIN_EXCLUDE = {"build", "web", "assets", "assetmanifest", "asset_manifest"}
 # Known index/graph .bin filenames (HNSW, not model weights)
@@ -173,7 +172,15 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
 
     # MCP server config discovery
     mcp_servers: List[MCPServer] = []
-    for mcp_rel in MCP_CONFIG_PATHS:
+    from core.detectors.mcp_detector import (
+        iter_mcp_config_rel_paths,
+        resolve_python_mcp_script,
+        scan_tool_descriptions,
+        scan_companion_tool_files,
+        scan_python_mcp_server_file,
+        _BUILTIN_TOOL_NAMES,
+    )
+    for mcp_rel in iter_mcp_config_rel_paths(repo_root):
         mcp_path = repo_root / mcp_rel
         if not mcp_path.exists():
             continue
@@ -182,12 +189,6 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
         except (OSError, json.JSONDecodeError):
             continue
         servers = config.get("mcpServers") or config.get("mcp_servers") or {}
-        from core.detectors.mcp_detector import (
-            scan_tool_descriptions,
-            scan_companion_tool_files,
-            scan_python_mcp_server_file,
-            _BUILTIN_TOOL_NAMES,
-        )
 
         # Track tool names across all servers in this config for shadowing detection
         cross_server_tools: Dict[str, str] = {}  # tool_name -> first_server_name
@@ -246,17 +247,11 @@ def discover_deep(repo_root: Path) -> DeepDiscoveryResult:
             injection_evidence: List[str] = []
             py_rel: str = ""
             py_candidate: Optional[Path] = None
-            if str(command or "").lower() in ("python", "python3") and isinstance(args, list):
-                # Convert module path arg (e.g. "-m app.mcp.web_search_server") to file path
-                mod_arg = next(
-                    (a for a in args if isinstance(a, str) and not a.startswith("-")),
-                    None,
-                )
-                if mod_arg:
-                    py_rel = mod_arg.replace(".", "/") + ".py"
-                    py_candidate = repo_root / py_rel
-                    if py_candidate.exists():
-                        py_tool_names, injection_evidence = scan_python_mcp_server_file(py_candidate)
+            if str(command or "").lower() in ("python", "python3", "uv", "poetry"):
+                py_candidate = resolve_python_mcp_script(repo_root, args)
+                if py_candidate is not None:
+                    py_rel = str(py_candidate.relative_to(repo_root))
+                    py_tool_names, injection_evidence = scan_python_mcp_server_file(py_candidate)
 
             # Tool shadowing: check this server's tools against previous servers
             shadowing_findings: List[str] = []

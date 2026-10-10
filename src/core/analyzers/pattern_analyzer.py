@@ -108,6 +108,7 @@ _LLM_CHAIN_FRAGMENTS = {
     "openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral",
     "litellm", "ollama", "groq", "together", "replicate", "perplexity",
     "xai", "grok", "deepseek", "openrouter", "dashscope", "moonshot",
+    "cerebras", "zhipuai", "watsonx", "portkey",
     "chat", "completions", "messages", "llm", "chain", "agent",
     "generativemodel", "generativeai", "chatmodel", "chatanthropic",
     "chatopenai", "azurechatopenai",
@@ -323,6 +324,93 @@ def _names_in_expr(node: ast.expr) -> Set[str]:
     return names
 
 
+def _expr_is_interpolated(node: ast.expr) -> bool:
+    """True if expression builds a string via f-string, % formatting, or concat."""
+    if isinstance(node, ast.JoinedStr):
+        return any(isinstance(v, ast.FormattedValue) for v in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        return True
+    if isinstance(node, ast.Call) and _call_attr(node) == "format":
+        return True
+    return False
+
+
+_AI_TOOL_SOURCE_RE = re.compile(
+    r"(?:from\s+mcp\b|import\s+mcp\b|mcp\.server|\bFastMCP\b|@mcp\.tool"
+    r"|types\.Tool\s*\(|\bBaseTool\b|\bStructuredTool\b|\bAgentExecutor\b"
+    r"|langchain\.tools|@tool\b"
+    r"|(?:async\s+)?def\s+(?:list_tools|call_tool)\b)",
+    re.I,
+)
+
+
+def _looks_like_ai_tool_source(source_text: str) -> bool:
+    """True if the file is an MCP server, LangChain/agent tool module, or similar."""
+    return bool(_AI_TOOL_SOURCE_RE.search(source_text))
+
+
+def _looks_like_mcp_source(source_text: str) -> bool:
+    """Backward-compatible alias used by MCP-oriented detectors."""
+    return _looks_like_ai_tool_source(source_text)
+
+
+def _has_tool_decorator(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True if the function is decorated as an agent/MCP tool."""
+    for dec in func.decorator_list:
+        attr = ""
+        if isinstance(dec, ast.Attribute):
+            attr = dec.attr.lower()
+        elif isinstance(dec, ast.Call):
+            attr = _call_attr(dec)
+        elif isinstance(dec, ast.Name):
+            attr = dec.id.lower()
+        if attr in {"tool", "function_tool"}:
+            return True
+    return False
+
+
+def _func_is_exposed_ai_tool(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    source_text: str,
+) -> bool:
+    """True if this function is a likely LLM-invoked tool, not a generic helper."""
+    if _has_tool_decorator(func):
+        return True
+    name = func.name.lower()
+    if any(k in name for k in ("run_code", "exec_code", "execute_code", "eval_code", "python_repl")):
+        return True
+    if name.startswith(("handle_", "_handle_")) and _looks_like_ai_tool_source(source_text):
+        return True
+    return False
+
+
+def _func_has_path_guard(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True if the function appears to constrain paths to a base directory."""
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call) and _call_attr(node) in {
+            "relative_to", "is_relative_to", "commonpath",
+        }:
+            return True
+        if isinstance(node, ast.Compare):
+            for comparator in node.comparators:
+                if isinstance(comparator, ast.Constant) and comparator.value == "..":
+                    return True
+    return False
+
+
+def _open_mode_is_write(call: ast.Call) -> bool:
+    """True if open() is called with a write/append mode."""
+    mode = None
+    if len(call.args) >= 2 and isinstance(call.args[1], ast.Constant):
+        mode = call.args[1].value
+    for kw in call.keywords:
+        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+            mode = kw.value.value
+    if not isinstance(mode, str):
+        return False
+    return any(ch in mode for ch in "wax+")
+
+
 def _assigned_names_in_func(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> Dict[str, int]:
     """Return {var_name: line} for all assignments in a function."""
     result: Dict[str, int] = {}
@@ -502,8 +590,67 @@ def detect_pat002(
                                 )
 
     has_signal_a = bool(dangerous_imports or tool_instantiations)
-    if not has_signal_a:
+
+    exec_hits: List[str] = []
+    exec_line: Optional[int] = None
+    exec_func: Optional[str] = None
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if func.name.startswith("test_"):
+            continue
+        tainted = _tainted_from_params(func)
+        if not tainted:
+            continue
+        if not (
+            _looks_like_ai_tool_source(source_text)
+            or _func_is_exposed_ai_tool(func, source_text)
+        ):
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            if _call_attr(node) not in {"exec", "eval", "compile"}:
+                continue
+            hit_names: Set[str] = set()
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                hit_names |= _names_in_expr(arg) & tainted
+            if not hit_names:
+                continue
+            lineno = getattr(node, "lineno", 0)
+            var = next(iter(hit_names))
+            exec_hits.append(
+                f"line {lineno}: {_call_attr(node)}({var}) in {func.name}() — "
+                "function parameter reaches a code-execution builtin"
+            )
+            if exec_line is None:
+                exec_line = lineno
+                exec_func = func.name
+
+    if not has_signal_a and not exec_hits:
         return []
+
+    if exec_hits:
+        findings.append(PatternFinding(
+            vulnerability_id="PAT-002",
+            title="Code execution tool in agent — RCE risk",
+            severity="critical",
+            confidence="high",
+            category="LLM08 Excessive Agency",
+            owasp_id="LLM08",
+            cwe="CWE-94",
+            file=file_path,
+            line=exec_line,
+            function_name=exec_func,
+            pattern_matched="exec_eval_compile_of_user_input",
+            evidence=exec_hits[:6],
+            framework="mcp" if _looks_like_mcp_source(source_text) else "python_builtins",
+            remediation="Sandbox PythonREPLTool in a container with resource limits. Never let untrusted input reach exec().",
+            cvss_estimate=9.0,
+        ))
+
+    if not has_signal_a:
+        return findings
 
     # Signal B: agent execution in same file
     agent_calls: List[str] = []
@@ -563,6 +710,8 @@ def detect_pat003(
     for func in ast.walk(tree):
         if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
+        if func.name.startswith("test_"):
+            continue
 
         # Find LLM call assignments
         llm_output_vars: Dict[str, int] = {}  # var_name -> line
@@ -584,48 +733,100 @@ def detect_pat003(
                     if isinstance(t, ast.Name) and any(kw in t.id.lower() for kw in _SQL_KEYWORDS):
                         llm_output_vars[t.id] = getattr(node, "lineno", 0)
 
-        if not llm_output_vars:
-            continue
+        if llm_output_vars:
+            # Find SQL execution calls using those vars
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not _is_sql_exec_call(node):
+                    continue
+                exec_line = getattr(node, "lineno", 0)
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    names = _names_in_expr(arg)
+                    matched = names & set(llm_output_vars.keys())
+                    # Also flag if variable name suggests SQL + heuristic match
+                    for name in names:
+                        if any(kw in name.lower() for kw in _SQL_KEYWORDS):
+                            matched.add(name)
+                    if matched:
+                        var = next(iter(matched))
+                        src_line = llm_output_vars.get(var, 0)
+                        confidence = "high" if var in llm_output_vars else "medium"
+                        findings.append(PatternFinding(
+                            vulnerability_id="PAT-003",
+                            title="LLM-generated SQL executed without parameterization",
+                            severity="critical",
+                            confidence=confidence,
+                            category="LLM02 Insecure Output Handling",
+                            owasp_id="LLM02",
+                            cwe="CWE-89",
+                            file=file_path,
+                            line=exec_line,
+                            function_name=_get_func_name(func),
+                            pattern_matched=f"llm_output_var '{var}' passed to sql execute()",
+                            evidence=[
+                                f"line {src_line}: LLM call assigns to '{var}'",
+                                f"line {exec_line}: {_call_chain_str(node)}({var})",
+                            ],
+                            framework="sqlalchemy/sqlite3/psycopg2",
+                            remediation="Never pass LLM output directly to execute(). Use parameterized queries or a SQL validator to confirm safe syntax before execution.",
+                            cvss_estimate=9.0,
+                        ))
+                        break
 
-        # Find SQL execution calls using those vars
+        # Dynamic SQL: f-string / concat of function parameters (MCP tools, etc.)
+        tainted = _tainted_from_params(func)
+        interpolated_at: Dict[str, int] = {}
         for node in ast.walk(func):
-            if not isinstance(node, ast.Call):
+            if not isinstance(node, ast.Assign):
                 continue
-            if not _is_sql_exec_call(node):
+            if node.value is None or not _expr_is_interpolated(node.value):
                 continue
+            if not (_names_in_expr(node.value) & tainted):
+                continue
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    interpolated_at[t.id] = getattr(node, "lineno", 0)
+
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call) or not _is_sql_exec_call(node):
+                continue
+            if not node.args or len(node.args) >= 2:
+                continue
+            if any(kw.arg in {"params", "parameters"} for kw in node.keywords):
+                continue
+            sql_arg = node.args[0]
             exec_line = getattr(node, "lineno", 0)
-            for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                names = _names_in_expr(arg)
-                matched = names & set(llm_output_vars.keys())
-                # Also flag if variable name suggests SQL + heuristic match
-                for name in names:
-                    if any(kw in name.lower() for kw in _SQL_KEYWORDS):
-                        matched.add(name)
-                if matched:
-                    var = next(iter(matched))
-                    src_line = llm_output_vars.get(var, 0)
-                    confidence = "high" if var in llm_output_vars else "medium"
-                    findings.append(PatternFinding(
-                        vulnerability_id="PAT-003",
-                        title="LLM-generated SQL executed without parameterization",
-                        severity="critical",
-                        confidence=confidence,
-                        category="LLM02 Insecure Output Handling",
-                        owasp_id="LLM02",
-                        cwe="CWE-89",
-                        file=file_path,
-                        line=exec_line,
-                        function_name=_get_func_name(func),
-                        pattern_matched=f"llm_output_var '{var}' passed to sql execute()",
-                        evidence=[
-                            f"line {src_line}: LLM call assigns to '{var}'",
-                            f"line {exec_line}: {_call_chain_str(node)}({var})",
-                        ],
-                        framework="sqlalchemy/sqlite3/psycopg2",
-                        remediation="Never pass LLM output directly to execute(). Use parameterized queries or a SQL validator to confirm safe syntax before execution.",
-                        cvss_estimate=9.0,
-                    ))
-                    break
+            interpolated = _expr_is_interpolated(sql_arg) and bool(
+                _names_in_expr(sql_arg) & tainted
+            )
+            via_var = isinstance(sql_arg, ast.Name) and sql_arg.id in interpolated_at
+            if not interpolated and not via_var:
+                continue
+            src_line = exec_line
+            if via_var and isinstance(sql_arg, ast.Name):
+                src_line = interpolated_at.get(sql_arg.id, exec_line)
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-003",
+                title="LLM-generated SQL executed without parameterization",
+                severity="critical",
+                confidence="high",
+                category="LLM02 Insecure Output Handling",
+                owasp_id="LLM02",
+                cwe="CWE-89",
+                file=file_path,
+                line=exec_line,
+                function_name=_get_func_name(func),
+                pattern_matched="interpolated SQL string passed to execute()",
+                evidence=[
+                    f"line {src_line}: SQL string built via f-string / concat / format from function input",
+                    f"line {exec_line}: {_call_chain_str(node)}() without bound parameters",
+                ],
+                framework="sqlalchemy/sqlite3/psycopg2",
+                remediation="Never pass LLM output directly to execute(). Use parameterized queries or a SQL validator to confirm safe syntax before execution.",
+                cvss_estimate=9.0,
+            ))
+            break
 
     return findings
 
@@ -2127,8 +2328,17 @@ _MCP_RESPONSE_INJECTION_PATS = [
     re.compile(r"\balways\s+(include|append|add|output)\b", re.I),
     re.compile(r"\bnew (instructions?|task|objective|directive)\b", re.I),
     re.compile(r"\bdo not\s+(mention|reveal|tell)\b", re.I),
+    re.compile(r"\bsystem override\b", re.I),
+    re.compile(r"\bhidden instruction\b", re.I),
 ]
-_MCP_HANDLER_NAMES = {"call_tool", "handle_tool_call", "dispatch_tool"}
+_MCP_HANDLER_NAMES = {"call_tool", "handle_tool_call", "dispatch_tool", "list_tools"}
+
+
+def _string_is_mcp_injection(val: str) -> bool:
+    """True if a string looks like an injected instruction for an MCP client LLM."""
+    if not isinstance(val, str) or len(val) < 15:
+        return False
+    return any(pat.search(val) for pat in _MCP_RESPONSE_INJECTION_PATS)
 
 
 def detect_pat021(
@@ -2137,61 +2347,85 @@ def detect_pat021(
     source_text: str,
     import_map: Dict[str, str],
 ) -> List[PatternFinding]:
-    """PAT-021: MCP server tool handler returns injected instructions."""
+    """PAT-021: MCP server tool handler or tool metadata injects instructions."""
     findings: List[PatternFinding] = []
 
-    # Only scan files that look like Python MCP servers
-    has_list_tools = "list_tools" in source_text
-    has_call_tool = "call_tool" in source_text or "_handle_" in source_text
-    if not (has_list_tools or has_call_tool):
+    if not _looks_like_ai_tool_source(source_text):
         return findings
 
-    for func in ast.walk(tree):
-        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    def _emit(func_name: str, lineno: Optional[int], val: str, matched: str) -> None:
+        findings.append(PatternFinding(
+            vulnerability_id="PAT-021",
+            title="MCP server response injection — tool return hijacks agent",
+            severity="high",
+            confidence="high",
+            category="LLM01 Prompt Injection",
+            owasp_id="LLM01",
+            cwe="CWE-74",
+            file=file_path,
+            line=lineno,
+            function_name=func_name,
+            pattern_matched=matched,
+            evidence=[
+                f"line {lineno}: {_source_lines(source_text, lineno or 1)}",
+                f"Injected string: {val[:120]!r}",
+                "Tool metadata or return value is read by the LLM as trusted context — injected instructions are followed.",
+            ],
+            framework="mcp",
+            remediation=(
+                "Never include imperative instructions in tool descriptions or return values. "
+                "Strip instruction patterns from tool responses before returning. "
+                "Apply output filtering on all MCP server responses."
+            ),
+            cvss_estimate=8.0,
+        ))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _call_attr(node) in {"tool", "structuredtool"}:
+            desc = None
+            for kw in node.keywords:
+                if kw.arg == "description" and isinstance(kw.value, ast.Constant):
+                    desc = kw.value.value if isinstance(kw.value.value, str) else None
+            if desc is None and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                desc = node.args[1].value if isinstance(node.args[1].value, str) else None
+            if desc and _string_is_mcp_injection(desc):
+                _emit("Tool", getattr(node, "lineno", None), desc, "poisoned Tool() description")
+
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
+        is_tool_decorated = False
+        for dec in node.decorator_list:
+            attr = ""
+            if isinstance(dec, ast.Attribute):
+                attr = dec.attr.lower()
+            elif isinstance(dec, ast.Call):
+                attr = _call_attr(dec)
+            if attr in {"tool", "function_tool"}:
+                is_tool_decorated = True
+                break
         is_handler = (
-            func.name in _MCP_HANDLER_NAMES
-            or func.name.startswith("_handle_")
-            or func.name.startswith("handle_")
+            node.name in _MCP_HANDLER_NAMES
+            or node.name.startswith("_handle_")
+            or node.name.startswith("handle_")
+            or is_tool_decorated
         )
         if not is_handler:
             continue
-
-        for node in ast.walk(func):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        doc = ast.get_docstring(node) or ""
+        if is_tool_decorated and _string_is_mcp_injection(doc):
+            _emit(node.name, getattr(node, "lineno", None), doc, f"poisoned docstring on {node.name}()")
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Constant) or not isinstance(sub.value, str):
                 continue
-            val = node.value
-            if len(val) < 15:
+            val = sub.value
+            if not _string_is_mcp_injection(val):
                 continue
-            for pat in _MCP_RESPONSE_INJECTION_PATS:
-                if pat.search(val):
-                    lineno = getattr(node, "lineno", None)
-                    findings.append(PatternFinding(
-                        vulnerability_id="PAT-021",
-                        title="MCP server response injection — tool return hijacks agent",
-                        severity="high",
-                        confidence="high",
-                        category="LLM01 Prompt Injection",
-                        owasp_id="LLM01",
-                        cwe="CWE-74",
-                        file=file_path,
-                        line=lineno,
-                        function_name=func.name,
-                        pattern_matched=f"instruction injection in {func.name}() return value",
-                        evidence=[
-                            f"line {lineno}: {_source_lines(source_text, lineno or 1)}",
-                            f"Injected string: {val[:120]!r}",
-                            "Tool return value is read by the LLM as trusted context — injected instructions are followed.",
-                        ],
-                        framework="mcp",
-                        remediation=(
-                            "Never include imperative instructions in tool return values. "
-                            "Strip instruction patterns from tool responses before returning. "
-                            "Apply output filtering on all MCP server responses."
-                        ),
-                        cvss_estimate=8.0,
-                    ))
-                    break  # one finding per constant
+            _emit(
+                node.name,
+                getattr(sub, "lineno", None),
+                val,
+                f"instruction injection in {node.name}()",
+            )
 
     return findings
 
@@ -3014,6 +3248,210 @@ def _detect_pat028_corpus_secrets(repo_root: Path) -> List[PatternFinding]:
 
 
 # ---------------------------------------------------------------------------
+# PAT-029: Path traversal via unsanitized file open
+# ---------------------------------------------------------------------------
+
+_HTTP_CLIENT_ATTRS = {"get", "post", "put", "patch", "delete", "request", "urlopen", "urlretrieve"}
+_HTTP_CLIENT_CHAIN = {"requests", "httpx", "aiohttp", "urllib", "urllib3"}
+
+
+def detect_pat029(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-029: User-controlled path reaches open()/read without a directory guard."""
+    findings: List[PatternFinding] = []
+    if not _looks_like_ai_tool_source(source_text):
+        return findings
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if func.name.startswith("test_"):
+            continue
+        tainted = _tainted_from_params(func)
+        if not tainted:
+            continue
+        if _func_has_path_guard(func):
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            attr = _call_attr(node)
+            chain = _call_chain_str(node)
+            is_open = attr == "open" and (not chain or chain in {"open", "io.open", "builtins.open"})
+            is_read = attr in {"read_text", "read_bytes", "read"} and "path" in chain
+            if not (is_open or is_read):
+                continue
+            if not node.args:
+                continue
+            hit = _names_in_expr(node.args[0]) & tainted
+            if not hit:
+                continue
+            if is_open and _open_mode_is_write(node):
+                continue
+            lineno = getattr(node, "lineno", 0)
+            var = next(iter(hit))
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-029",
+                title="Unsanitized path reaches file read — directory traversal risk",
+                severity="high",
+                confidence="high",
+                category="LLM08 Excessive Agency",
+                owasp_id="LLM08",
+                cwe="CWE-22",
+                file=file_path,
+                line=lineno,
+                function_name=_get_func_name(func),
+                pattern_matched=f"tainted '{var}' passed to {attr}() with no path guard",
+                evidence=[
+                    f"line {func.lineno}: function '{func.name}' takes a path-like parameter",
+                    f"line {lineno}: {attr}({var}) without resolving inside a base directory",
+                ],
+                framework="mcp" if _looks_like_mcp_source(source_text) else "python_stdlib",
+                remediation=(
+                    "Resolve the path with Path.resolve() and reject results that are not "
+                    "relative to an allowlisted base directory (Path.relative_to / is_relative_to)."
+                ),
+                cvss_estimate=7.5,
+            ))
+            break
+    return findings
+
+
+def detect_pat030(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-030: User-controlled URL fetched with no host allowlist (SSRF)."""
+    findings: List[PatternFinding] = []
+    if not _looks_like_ai_tool_source(source_text):
+        return findings
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if func.name.startswith("test_"):
+            continue
+        tainted = _tainted_from_params(func)
+        if not tainted:
+            continue
+        blob_names = {n.id.lower() for n in ast.walk(func) if isinstance(n, ast.Name)}
+        if blob_names & {"allowlist", "allowed_hosts", "allowed_urls"}:
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            attr = _call_attr(node)
+            chain = _call_chain_str(node)
+            parts = set(chain.split("."))
+            if attr not in _HTTP_CLIENT_ATTRS:
+                continue
+            if not (parts & _HTTP_CLIENT_CHAIN or attr == "urlopen"):
+                continue
+            if not node.args:
+                continue
+            hit = _names_in_expr(node.args[0]) & tainted
+            if not hit:
+                continue
+            lineno = getattr(node, "lineno", 0)
+            var = next(iter(hit))
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-030",
+                title="User-controlled URL fetched without host allowlist (SSRF)",
+                severity="high",
+                confidence="high",
+                category="LLM08 Excessive Agency",
+                owasp_id="LLM08",
+                cwe="CWE-918",
+                file=file_path,
+                line=lineno,
+                function_name=_get_func_name(func),
+                pattern_matched=f"tainted '{var}' passed to {chain}.{attr}()",
+                evidence=[
+                    f"line {func.lineno}: function '{func.name}' takes a URL-like parameter",
+                    f"line {lineno}: {chain}({var}) with no host allowlist",
+                ],
+                framework="mcp" if _looks_like_mcp_source(source_text) else "python_stdlib",
+                remediation=(
+                    "Do not fetch caller-supplied URLs. If required, parse the host and allow "
+                    "only an explicit hostname list; block link-local, private, and metadata IPs."
+                ),
+                cvss_estimate=8.2,
+            ))
+            break
+    return findings
+
+
+def detect_pat031(
+    tree: ast.Module,
+    file_path: str,
+    source_text: str,
+    import_map: Dict[str, str],
+) -> List[PatternFinding]:
+    """PAT-031: User-controlled path used to write a file (arbitrary file write)."""
+    findings: List[PatternFinding] = []
+    if not _looks_like_ai_tool_source(source_text):
+        return findings
+
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if func.name.startswith("test_"):
+            continue
+        tainted = _tainted_from_params(func)
+        if not tainted:
+            continue
+        if _func_has_path_guard(func):
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            attr = _call_attr(node)
+            chain = _call_chain_str(node)
+            is_open_write = attr == "open" and _open_mode_is_write(node)
+            is_path_write = attr in {"write_text", "write_bytes"} and "path" in chain
+            if not (is_open_write or is_path_write):
+                continue
+            if not node.args:
+                continue
+            hit = _names_in_expr(node.args[0]) & tainted
+            if not hit:
+                continue
+            lineno = getattr(node, "lineno", 0)
+            var = next(iter(hit))
+            findings.append(PatternFinding(
+                vulnerability_id="PAT-031",
+                title="Unsanitized path reaches file write — arbitrary file write",
+                severity="critical",
+                confidence="high",
+                category="LLM08 Excessive Agency",
+                owasp_id="LLM08",
+                cwe="CWE-73",
+                file=file_path,
+                line=lineno,
+                function_name=_get_func_name(func),
+                pattern_matched=f"tainted '{var}' passed to {attr}() for write",
+                evidence=[
+                    f"line {func.lineno}: function '{func.name}' takes a path-like parameter",
+                    f"line {lineno}: {attr}({var}) writes without a base-directory guard",
+                ],
+                framework="mcp" if _looks_like_mcp_source(source_text) else "python_stdlib",
+                remediation=(
+                    "Never write to caller-supplied paths. Resolve inside a jail directory "
+                    "and reject paths that escape it. Prefer generating server-side filenames."
+                ),
+                cvss_estimate=9.1,
+            ))
+            break
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -3044,6 +3482,9 @@ _DETECTORS: List[Callable] = [
     detect_pat025,
     detect_pat026,
     detect_pat027,
+    detect_pat029,
+    detect_pat030,
+    detect_pat031,
 ]
 
 

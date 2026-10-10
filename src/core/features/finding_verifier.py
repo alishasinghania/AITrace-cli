@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -27,7 +28,7 @@ _EXTERNAL_PROVIDERS = ("openai", "anthropic", "cohere", "google", "mistral", "hu
 # Patterns that suggest sanitization is happening near the LLM call
 _SANITIZE_HINTS = (
     "sanitize", "validate", "escape", "strip_tags", "bleach",
-    "html.escape", "re.sub", "filter", "clean", "purify",
+    "html.escape", "re.sub", "clean", "purify",
 )
 
 # Patterns that confirm user input is interpolated directly into the prompt
@@ -108,9 +109,182 @@ def _recommendation(verdict: str, payload: "ExploitPayload") -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Per-source verifiers
-# ---------------------------------------------------------------------------
+def _verify_sql(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
+    """Confirm interpolated SQL at the sink, not bound parameters."""
+    score = 40
+    ev_for: List[str] = ["Pattern analyzer reported unsanitized SQL construction"]
+    ev_against: List[str] = []
+    window = ""
+    if payload.target_file and payload.target_file != "<vector_store>":
+        window = _read_window(repo_root / payload.target_file, payload.target_line)
+    if any(h in window for h in ("execute(", "executemany(", "raw(", "cursor")):
+        ev_for.append("SQL execute/cursor call present near the finding line")
+        score += 20
+    if any(h in window for h in ('f"', "f'", ".format(", " % ", " + ")):
+        ev_for.append("String interpolation into the SQL statement")
+        score += 25
+    else:
+        ev_against.append("No f-string/%/concat interpolation visible in the window")
+        score -= 15
+    # Bound parameters: execute(sql, (x,)) / execute(sql, [x])
+    if re.search(r"execute\([^)]+,\s*[\(\[]", window):
+        ev_against.append("Possible bound-parameter execute() — may not be injectable")
+        score -= 40
+    score = max(0, min(100, score))
+    verdict = VERDICT_CONFIRMED if score >= 75 else (VERDICT_LIKELY if score >= 50 else VERDICT_UNCERTAIN)
+    return VerificationResult(
+        finding_id=payload.finding_id,
+        verdict=verdict,
+        confidence=score,
+        evidence_for=ev_for,
+        evidence_against=ev_against,
+        recommendation=_recommendation(verdict, payload),
+    )
+
+
+def _verify_shell(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
+    """Confirm shell=True / os.system at the finding line."""
+    score = 45
+    ev_for: List[str] = ["Pattern analyzer reported command injection"]
+    ev_against: List[str] = []
+    window = ""
+    if payload.target_file:
+        window = _read_window(repo_root / payload.target_file, payload.target_line)
+    if "shell=true" in window or "os.system" in window or "os.popen" in window:
+        ev_for.append("shell=True or os.system/popen at the sink")
+        score += 35
+    elif "subprocess" in window:
+        ev_for.append("subprocess call present")
+        score += 15
+        ev_against.append("shell=True not visible in window")
+        score -= 10
+    else:
+        ev_against.append("No subprocess/os.system visible near the line")
+        score -= 20
+    score = max(0, min(100, score))
+    verdict = VERDICT_CONFIRMED if score >= 75 else (VERDICT_LIKELY if score >= 50 else VERDICT_UNCERTAIN)
+    return VerificationResult(
+        finding_id=payload.finding_id,
+        verdict=verdict,
+        confidence=score,
+        evidence_for=ev_for,
+        evidence_against=ev_against,
+        recommendation=_recommendation(verdict, payload),
+    )
+
+
+def _verify_exec(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
+    """Confirm exec/eval/compile of attacker-controlled text."""
+    score = 50
+    ev_for: List[str] = ["Pattern analyzer reported code execution (PAT-002)"]
+    ev_against: List[str] = []
+    window = ""
+    if payload.target_file:
+        window = _read_window(repo_root / payload.target_file, payload.target_line)
+    if any(h in window for h in ("exec(", "eval(", "compile(", "pythonrepl")):
+        ev_for.append("exec/eval/compile or PythonREPL at the sink")
+        score += 35
+    else:
+        ev_against.append("No exec/eval/compile in the source window")
+        score -= 20
+    score = max(0, min(100, score))
+    verdict = VERDICT_CONFIRMED if score >= 75 else (VERDICT_LIKELY if score >= 50 else VERDICT_UNCERTAIN)
+    return VerificationResult(
+        finding_id=payload.finding_id,
+        verdict=verdict,
+        confidence=score,
+        evidence_for=ev_for,
+        evidence_against=ev_against,
+        recommendation=_recommendation(verdict, payload),
+    )
+
+
+def _verify_path(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
+    """Confirm unsanitized path used in open/write."""
+    score = 45
+    ev_for: List[str] = ["Pattern analyzer reported path traversal or arbitrary write"]
+    ev_against: List[str] = []
+    window = ""
+    if payload.target_file:
+        window = _read_window(repo_root / payload.target_file, payload.target_line)
+    if "open(" in window or "write_text" in window or "path(" in window:
+        ev_for.append("Filesystem open/write near the finding line")
+        score += 20
+    if any(h in window for h in ("relative_to", "is_relative_to", "allowed_dir", "startswith")):
+        ev_against.append("Possible path allowlist/guard near the sink")
+        score -= 30
+    else:
+        ev_for.append("No directory guard (relative_to/allowed dir) in the window")
+        score += 20
+    score = max(0, min(100, score))
+    verdict = VERDICT_CONFIRMED if score >= 75 else (VERDICT_LIKELY if score >= 50 else VERDICT_UNCERTAIN)
+    return VerificationResult(
+        finding_id=payload.finding_id,
+        verdict=verdict,
+        confidence=score,
+        evidence_for=ev_for,
+        evidence_against=ev_against,
+        recommendation=_recommendation(verdict, payload),
+    )
+
+
+def _verify_ssrf(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
+    """Confirm user-controlled URL is fetched without a host allowlist."""
+    score = 45
+    ev_for: List[str] = ["Pattern analyzer reported SSRF (PAT-030)"]
+    ev_against: List[str] = []
+    window = ""
+    if payload.target_file:
+        window = _read_window(repo_root / payload.target_file, payload.target_line)
+    if any(h in window for h in ("urlopen", "requests.get", "requests.request", "httpx", "session.get")):
+        ev_for.append("HTTP client fetch near the finding line")
+        score += 25
+    if any(h in window for h in ("allowlist", "allowed_hosts", "urlparse", "hostname")):
+        ev_against.append("Possible host allowlist near the fetch")
+        score -= 25
+    else:
+        ev_for.append("No host allowlist visible in the window")
+        score += 15
+    score = max(0, min(100, score))
+    verdict = VERDICT_CONFIRMED if score >= 75 else (VERDICT_LIKELY if score >= 50 else VERDICT_UNCERTAIN)
+    return VerificationResult(
+        finding_id=payload.finding_id,
+        verdict=verdict,
+        confidence=score,
+        evidence_for=ev_for,
+        evidence_against=ev_against,
+        recommendation=_recommendation(verdict, payload),
+    )
+
+
+def _verify_mcp_poison(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
+    """Confirm the poisoned instruction string is present in the tool module."""
+    score = 40
+    ev_for: List[str] = ["Pattern analyzer reported poisoned tool metadata/return"]
+    ev_against: List[str] = []
+    window = ""
+    if payload.target_file:
+        window = _read_window(repo_root / payload.target_file, payload.target_line, radius=20)
+    snippet = (payload.payload or "")[:40].lower()
+    if snippet and snippet in window:
+        ev_for.append("Poisoned instruction string is present at the finding line")
+        score += 45
+    elif any(h in window for h in ("ignore previous", "ignore all previous", "system:", "override")):
+        ev_for.append("Instruction-override phrasing present near the finding")
+        score += 30
+    else:
+        ev_against.append("Could not re-find the injected string in the source window")
+        score -= 15
+    score = max(0, min(100, score))
+    verdict = VERDICT_CONFIRMED if score >= 75 else (VERDICT_LIKELY if score >= 50 else VERDICT_UNCERTAIN)
+    return VerificationResult(
+        finding_id=payload.finding_id,
+        verdict=verdict,
+        confidence=score,
+        evidence_for=ev_for,
+        evidence_against=ev_against,
+        recommendation=_recommendation(verdict, payload),
+    )
 
 def _verify_user_input(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
     score = 40
@@ -211,39 +385,43 @@ def _verify_env_exposure(payload: "ExploitPayload", repo_root: Path) -> Verifica
 
 
 def _verify_rag(payload: "ExploitPayload", repo_root: Path) -> VerificationResult:
-    score = 50
+    """Confirm retrieved chunks are concatenated into an LLM prompt in the target file."""
+    score = 40
     ev_for: List[str] = []
     ev_against: List[str] = []
 
-    ev_for.append("RAG pipeline detected — retrieval results are passed to LLM context")
-    score += 10
-
-    # Look for any retrieval result filtering
-    py_files = list(repo_root.rglob("*.py"))[:30]
-    rag_keywords = ("similarity_search", "query", "retrieve", "vectorstore", "chroma", "pinecone", "weaviate")
-    filter_keywords = ("filter", "validate", "sanitize", "score_threshold", "max_marginal")
-
-    rag_found = False
-    filter_found = False
-    for f in py_files:
+    target = payload.target_file
+    windows: List[str] = []
+    if target and target != "<vector_store>":
+        path = repo_root / target
+        windows.append(_read_window(path, payload.target_line, radius=25))
         try:
-            src = f.read_text(encoding="utf-8", errors="replace").lower()
+            windows.append(path.read_text(encoding="utf-8", errors="replace")[:8000].lower())
         except OSError:
-            continue
-        if any(k in src for k in rag_keywords):
-            rag_found = True
-        if rag_found and any(k in src for k in filter_keywords):
-            filter_found = True
-            break
-
-    if rag_found:
-        ev_for.append("RAG retrieval call confirmed in source code")
-        score += 15
-    if filter_found:
-        ev_against.append("Score threshold or filter detected in retrieval — may limit injection surface")
-        score -= 15
+            pass
     else:
-        ev_for.append("No score threshold or document filtering detected on retrieval results")
+        ev_against.append("No specific RAG file — architecture-only detection")
+        score -= 10
+
+    blob = "\n".join(windows)
+    retrieval_hits = [k for k in ("similarity_search", "as_retriever", "vectorstore", "chroma", "get_relevant") if k in blob]
+    if retrieval_hits:
+        ev_for.append(f"Retrieval API in target file ({', '.join(retrieval_hits[:3])})")
+        score += 20
+    prompt_hits = [h for h in _INTERPOLATION_HINTS if h in blob]
+    context_hits = any(k in blob for k in ("context", "retrieved", "documents", "chunks"))
+    if prompt_hits and context_hits:
+        ev_for.append("Retrieved context is interpolated into a prompt string")
+        score += 30
+    elif prompt_hits:
+        ev_for.append("Prompt-string interpolation present")
+        score += 10
+    if any(k in blob for k in ("score_threshold", "max_marginal_relevance")):
+        ev_against.append("Retriever score/MMR filtering may reduce poison ranking")
+        score -= 10
+
+    if not ev_for:
+        ev_for.append("RAG pattern finding or vector-store architecture triggered this payload")
         score += 10
 
     score = max(0, min(100, score))
@@ -297,9 +475,22 @@ def _verify_agent(payload: "ExploitPayload", repo_root: Path) -> VerificationRes
 
 _VERIFIER_MAP = {
     "user_input":    _verify_user_input,
+    "mcp_tool_arg":  _verify_user_input,
     "environment":   _verify_env_exposure,
     "rag_document":  _verify_rag,
     "tool_response": _verify_agent,
+    "file_read":     _verify_user_input,
+}
+
+_SINK_VERIFIER_MAP = {
+    "sql": _verify_sql,
+    "shell": _verify_shell,
+    "exec": _verify_exec,
+    "path": _verify_path,
+    "file_write": _verify_path,
+    "ssrf": _verify_ssrf,
+    "mcp_poison": _verify_mcp_poison,
+    "rag": _verify_rag,
 }
 
 
@@ -310,17 +501,16 @@ def verify_statically(
     """Run static verification for each payload. Returns one result per payload."""
     results: List[VerificationResult] = []
     for payload in payloads:
-        verifier = _VERIFIER_MAP.get(payload.source_type)
+        verifier = _SINK_VERIFIER_MAP.get(payload.sink_type) or _VERIFIER_MAP.get(payload.source_type)
         if verifier:
             results.append(verifier(payload, repo_root))
         else:
-            # Generic fallback — mark uncertain
             results.append(VerificationResult(
                 finding_id=payload.finding_id,
                 verdict=VERDICT_UNCERTAIN,
                 confidence=30,
-                evidence_for=["Flow detected by taint analysis"],
-                evidence_against=["No source-specific verifier available for this flow type"],
+                evidence_for=["Flow detected by analysis"],
+                evidence_against=["No sink-specific verifier available for this payload"],
                 recommendation=_recommendation(VERDICT_UNCERTAIN, payload),
             ))
     return results

@@ -36,6 +36,15 @@ AI_API_MODULE_TO_PACKAGES: Dict[str, Set[str]] = {
     "aleph_alpha": {"aleph-alpha-client"},
     "perplexity": {"perplexity"},
     "ollama": {"ollama"},
+    "xai": {"xai", "xai-sdk"},
+    "grok": {"xai", "xai-sdk", "grok"},
+    "openrouter": {"openrouter"},
+    "deepseek": {"deepseek"},
+    "dashscope": {"dashscope"},
+    "cerebras": {"cerebras", "cerebras-cloud-sdk"},
+    "zhipuai": {"zhipuai", "zai-sdk"},
+    "watsonx": {"ibm-watsonx-ai"},
+    "portkey": {"portkey-ai", "portkey"},
     # AWS Bedrock via boto3
     "bedrock": {"boto3"},
 }

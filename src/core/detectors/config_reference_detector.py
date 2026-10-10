@@ -31,6 +31,10 @@ API_URL_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"api\.together\.(xyz|ai)", re.I), "together"),
     (re.compile(r"api\.perplexity\.ai", re.I), "perplexity"),
     (re.compile(r"api\.replicate\.com", re.I), "replicate"),
+    (re.compile(r"api\.cerebras\.ai", re.I), "cerebras"),
+    (re.compile(r"open\.bigmodel\.cn|api\.z\.ai", re.I), "zhipuai"),
+    (re.compile(r"us-south\.ml\.cloud\.ibm\.com|watsonx", re.I), "ibm-watsonx-ai"),
+    (re.compile(r"cognitiveservices\.azure\.com", re.I), "azure-ai-inference"),
     (re.compile(r"localhost:11434|ollama[./]|[\"']ollama[\"']|OLLAMA_", re.I), "ollama"),  # Ollama local API
     (re.compile(r"api\.ai21\.(com|ai)", re.I), "ai21"),
     (re.compile(r"api\.fireworks\.ai", re.I), "fireworks-ai"),
@@ -61,6 +65,8 @@ MODEL_ID_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Qwen / Kimi
     (re.compile(r'["\']qwen[\w\.\-]*["\']', re.I), "dashscope"),
     (re.compile(r'["\'](?:kimi|moonshot)[\w\-\.]*["\']', re.I), "moonshot"),
+    (re.compile(r'["\']glm-[\w\.\-]+["\']', re.I), "zhipuai"),
+    (re.compile(r'["\']cerebras/[^"\']+["\']', re.I), "cerebras"),
     # Mistral
     (re.compile(r'["\'](?:mistral-large|mixtral|pixtral)[\w\-]*["\']', re.I), "mistralai"),
     # Local / Ollama
@@ -79,6 +85,7 @@ KNOWN_PROVIDER_VALUES = {
     "replicate", "together", "groq", "ollama", "ai21", "fireworks", "fireworks-ai",
     "aleph-alpha", "aleph_alpha", "xai", "grok", "openrouter", "deepseek",
     "dashscope", "moonshot", "perplexity",
+    "cerebras", "zhipuai", "watsonx", "ibm", "writer", "portkey",
 }
 
 

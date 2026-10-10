@@ -22,7 +22,9 @@ AI_PACKAGES: Dict[str, str] = {
     "google_genai": "Google Gen AI SDK",
     "google": "Google AI (generic)",
     "vertexai": "Google Vertex AI",
+    "google-cloud-aiplatform": "Google Cloud AI Platform (Vertex)",
     "mistralai": "Mistral AI",
+    "mistral": "Mistral AI",
     "huggingface-hub": "Hugging Face Hub",
     "huggingface_hub": "Hugging Face Hub",
     "transformers": "Hugging Face Transformers",
@@ -39,8 +41,18 @@ AI_PACKAGES: Dict[str, str] = {
     "langchain-anthropic": "LangChain Anthropic",
     "langchain_anthropic": "LangChain Anthropic",
     "langchain-google-genai": "LangChain Google GenAI",
+    "langchain-google-vertexai": "LangChain Google Vertex AI",
     "langchain-groq": "LangChain Groq",
     "langchain-mistralai": "LangChain Mistral",
+    "langchain-aws": "LangChain AWS (Bedrock)",
+    "langchain-ollama": "LangChain Ollama",
+    "langchain-huggingface": "LangChain Hugging Face",
+    "langchain-together": "LangChain Together",
+    "langchain-fireworks": "LangChain Fireworks",
+    "langchain-deepseek": "LangChain DeepSeek",
+    "langchain-xai": "LangChain xAI",
+    "langchain-perplexity": "LangChain Perplexity",
+    "langchain-cohere": "LangChain Cohere",
     "langchain-text-splitters": "LangChain Text Splitters",
     "llama-index": "LlamaIndex",
     "llama-index-core": "LlamaIndex Core",
@@ -72,6 +84,21 @@ AI_PACKAGES: Dict[str, str] = {
     "deepseek": "DeepSeek",
     "dashscope": "Alibaba DashScope (Qwen)",
     "moonshot": "Moonshot (Kimi)",
+    "zhipuai": "Zhipu AI (GLM)",
+    "zai-sdk": "Zhipu AI (Z.ai)",
+    "cerebras": "Cerebras",
+    "cerebras-cloud-sdk": "Cerebras Cloud SDK",
+    "ibm-watsonx-ai": "IBM watsonx.ai",
+    "ibm_watsonx_ai": "IBM watsonx.ai",
+    "azure-ai-inference": "Azure AI Inference",
+    "azure-ai-openai": "Azure OpenAI",
+    "portkey-ai": "Portkey",
+    "portkey": "Portkey",
+    "any-llm-sdk": "Any-LLM SDK",
+    "any_llm": "Any-LLM SDK",
+    "qianfan": "Baidu Qianfan",
+    "writer": "Writer",
+    "writer-sdk": "Writer SDK",
     "ollama": "Ollama",
     "openai-whisper": "OpenAI Whisper",
     "whisper": "Whisper",
@@ -183,6 +210,9 @@ VECTOR_STORE_PACKAGES: Dict[str, str] = {
     "turbopuffer": "Turbopuffer",
     "elasticsearch": "Elasticsearch (vector)",
     "redis": "Redis (vector)",
+    "redisvl": "RedisVL",
+    "txtai": "txtai",
+    "azure-search-documents": "Azure AI Search",
 }
 
 EMBEDDING_PACKAGES: Dict[str, str] = {
@@ -190,6 +220,10 @@ EMBEDDING_PACKAGES: Dict[str, str] = {
     "sentence_transformers": "Sentence Transformers",
     "tiktoken": "OpenAI Tokenizer",
     "voyageai": "Voyage AI",
+    "unstructured": "Unstructured",
+    "docling": "Docling",
+    "llama-parse": "LlamaParse",
+    "llama-cloud": "LlamaCloud",
     "nomic": "Nomic Embed",
     "fastembed": "FastEmbed",
     "cohere-embeddings": "Cohere Embeddings",
@@ -205,6 +239,10 @@ ML_RUNTIME_PACKAGES: Dict[str, str] = {
     "mlx": "Apple MLX",
     "mlx-lm": "Apple MLX-LM",
     "unsloth": "Unsloth",
+    "onnxruntime": "ONNX Runtime",
+    "onnxruntime-gpu": "ONNX Runtime",
+    "ctransformers": "CTransformers",
+    "tokenizers": "Hugging Face Tokenizers",
 }
 
 GUARDRAIL_PACKAGES: Dict[str, str] = {
@@ -215,6 +253,9 @@ GUARDRAIL_PACKAGES: Dict[str, str] = {
     "presidio-analyzer": "Microsoft Presidio",
     "detoxify": "Detoxify",
     "langkit": "LangKit",
+    "giskard": "Giskard",
+    "lakera": "Lakera",
+    "azure-ai-contentsafety": "Azure Content Safety",
 }
 
 OBSERVABILITY_PACKAGES: Dict[str, str] = {
@@ -232,6 +273,11 @@ OBSERVABILITY_PACKAGES: Dict[str, str] = {
     "opik": "Opik",
     "braintrust": "Braintrust",
     "promptlayer": "PromptLayer",
+    "weave": "W&B Weave",
+    "traceloop-sdk": "Traceloop / OpenLLMetry",
+    "openlit": "OpenLIT",
+    "promptflow": "Azure Prompt Flow",
+    "langwatch": "LangWatch",
 }
 
 NEW_AGENT_PACKAGES: Dict[str, str] = {
@@ -254,6 +300,10 @@ NEW_AGENT_PACKAGES: Dict[str, str] = {
     "mem0ai": "Mem0",
     "controlflow": "ControlFlow",
     "atomic-agents": "Atomic Agents",
+    "griptape": "Griptape",
+    "strands-agents": "AWS Strands Agents",
+    "llama-stack": "Llama Stack",
+    "llama-stack-client": "Llama Stack Client",
 }
 
 # ---------------------------------------------------------------------------
