@@ -15,7 +15,12 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..utils.ast_utils import should_skip_path, walk_python_files, get_call_target_chain
 
-from .taint_catalog import RAG_INGEST_ATTRS, classify_sink
+from .taint_catalog import (
+    RAG_INGEST_ATTRS,
+    classify_sink,
+    collect_sql_receivers,
+    is_parameterized_sql_call,
+)
 
 # Re-use sensitive keywords rather than duplicating them
 from .sensitive_data_detector import SENSITIVE_KEYWORDS
@@ -47,6 +52,10 @@ class PatternFinding:
     llm_reasoning: str = ""
     remediation: str = ""
     cvss_estimate: float = 0.0
+    taint_kind: str = ""
+    source_file: str = ""
+    source_line: Optional[int] = None
+    sink_arg_role: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -70,6 +79,10 @@ class PatternFinding:
             "llm_reasoning": self.llm_reasoning,
             "remediation": self.remediation,
             "cvss_estimate": self.cvss_estimate,
+            "taint_kind": self.taint_kind,
+            "source_file": self.source_file,
+            "source_line": self.source_line,
+            "sink_arg_role": self.sink_arg_role,
         }
 
 
@@ -235,12 +248,9 @@ def _is_agent_call(node: ast.Call) -> bool:
     return any(frag in chain_lower for frag in _AGENT_CHAIN_FRAGMENTS)
 
 
-def _is_sql_exec_call(node: ast.Call) -> bool:
-    attr = _call_attr(node)
-    if attr not in _SQL_EXEC_ATTRS:
-        return False
-    chain = _call_chain_str(node)
-    return bool(set(chain.split(".")) & _SQL_CHAIN_FRAGMENTS) or attr == "execute"
+def _is_sql_exec_call(node: ast.Call, sql_receivers: Optional[Set[str]] = None) -> bool:
+    """True for database execute APIs, not a generic obj.execute()."""
+    return "sql" in classify_sink(node, sql_receivers=sql_receivers)
 
 
 def _get_func_name(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
@@ -333,6 +343,33 @@ def _expr_is_interpolated(node: ast.expr) -> bool:
     if isinstance(node, ast.Call) and _call_attr(node) == "format":
         return True
     return False
+
+
+def _is_sqlalchemy_text_call(node: ast.expr) -> bool:
+    """True for ``text(...)`` / ``sqlalchemy.text(...)``, not ``response.text()``."""
+    if not isinstance(node, ast.Call) or _call_attr(node) != "text":
+        return False
+    parts = [p for p in _call_chain_str(node).split(".") if p]
+    return parts == ["text"] or parts == ["sqlalchemy", "text"]
+
+
+def _unwrap_sqlalchemy_text(node: ast.expr) -> ast.expr:
+    """Return the SQL string argument of ``sqlalchemy.text()``, else ``node``."""
+    if _is_sqlalchemy_text_call(node) and isinstance(node, ast.Call) and node.args:
+        return node.args[0]
+    return node
+
+
+def _is_llm_result_unwrap_call(node: ast.Call) -> bool:
+    """True when a Call looks like reading an LLM completion, not constructing SQL.
+
+    ``sqlalchemy.text()`` shares the token ``text`` with ``choice.message.text()``
+    and must not be treated as model output.
+    """
+    if _is_sqlalchemy_text_call(node):
+        return False
+    parts = set(_call_chain_str(node).split("."))
+    return bool(parts & {"content", "choices", "message", "generations"})
 
 
 _AI_TOOL_SOURCE_RE = re.compile(
@@ -713,6 +750,8 @@ def detect_pat003(
         if func.name.startswith("test_"):
             continue
 
+        sql_receivers = collect_sql_receivers(func)
+
         # Find LLM call assignments
         llm_output_vars: Dict[str, int] = {}  # var_name -> line
         for node in ast.walk(func):
@@ -726,81 +765,97 @@ def detect_pat003(
                 for t in node.targets:
                     if isinstance(t, ast.Name):
                         llm_output_vars[t.id] = getattr(node, "lineno", 0)
-            # Also catch: sql = response.content[0].text style attribute chains
-            chain = _call_chain_str(call_node)
-            if any(f in chain for f in {"content", "choices", "message", "text", "generations"}):
+            # Catch sql = response.choices[0].message.content() style unwraps.
+            # Do not treat sqlalchemy.text() as LLM output — "text" alone is not enough.
+            elif _is_llm_result_unwrap_call(call_node):
                 for t in node.targets:
                     if isinstance(t, ast.Name) and any(kw in t.id.lower() for kw in _SQL_KEYWORDS):
                         llm_output_vars[t.id] = getattr(node, "lineno", 0)
 
+        # Copy LLM result through attribute/subscript assigns (sql = response.content).
+        for _ in range(4):
+            grew = False
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Assign) or node.value is None:
+                    continue
+                if not (_names_in_expr(node.value) & set(llm_output_vars)):
+                    continue
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id not in llm_output_vars:
+                        llm_output_vars[t.id] = getattr(node, "lineno", 0)
+                        grew = True
+            if not grew:
+                break
+
         if llm_output_vars:
-            # Find SQL execution calls using those vars
+            # LLM output used as the SQL *string* (not as a bound parameter).
             for node in ast.walk(func):
                 if not isinstance(node, ast.Call):
                     continue
-                if not _is_sql_exec_call(node):
+                if not _is_sql_exec_call(node, sql_receivers) or not node.args:
                     continue
                 exec_line = getattr(node, "lineno", 0)
-                for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                    names = _names_in_expr(arg)
-                    matched = names & set(llm_output_vars.keys())
-                    # Also flag if variable name suggests SQL + heuristic match
-                    for name in names:
-                        if any(kw in name.lower() for kw in _SQL_KEYWORDS):
-                            matched.add(name)
-                    if matched:
-                        var = next(iter(matched))
-                        src_line = llm_output_vars.get(var, 0)
-                        confidence = "high" if var in llm_output_vars else "medium"
-                        findings.append(PatternFinding(
-                            vulnerability_id="PAT-003",
-                            title="LLM-generated SQL executed without parameterization",
-                            severity="critical",
-                            confidence=confidence,
-                            category="LLM02 Insecure Output Handling",
-                            owasp_id="LLM02",
-                            cwe="CWE-89",
-                            file=file_path,
-                            line=exec_line,
-                            function_name=_get_func_name(func),
-                            pattern_matched=f"llm_output_var '{var}' passed to sql execute()",
-                            evidence=[
-                                f"line {src_line}: LLM call assigns to '{var}'",
-                                f"line {exec_line}: {_call_chain_str(node)}({var})",
-                            ],
-                            framework="sqlalchemy/sqlite3/psycopg2",
-                            remediation="Never pass LLM output directly to execute(). Use parameterized queries or a SQL validator to confirm safe syntax before execution.",
-                            cvss_estimate=9.0,
-                        ))
-                        break
+                sql_arg = node.args[0]
+                names = _names_in_expr(sql_arg)
+                matched = names & set(llm_output_vars.keys())
+                if matched:
+                    var = next(iter(matched))
+                    src_line = llm_output_vars.get(var, 0)
+                    findings.append(PatternFinding(
+                        vulnerability_id="PAT-003",
+                        title="LLM-generated SQL executed without parameterization",
+                        severity="critical",
+                        confidence="high",
+                        category="LLM02 Insecure Output Handling",
+                        owasp_id="LLM02",
+                        cwe="CWE-89",
+                        file=file_path,
+                        line=exec_line,
+                        function_name=_get_func_name(func),
+                        pattern_matched=f"llm_output_var '{var}' passed to sql execute()",
+                        evidence=[
+                            f"line {src_line}: LLM call assigns to '{var}'",
+                            f"line {exec_line}: {_call_chain_str(node)}({var})",
+                        ],
+                        framework="sqlalchemy/sqlite3/psycopg2",
+                        remediation="Never pass LLM output directly to execute(). Use parameterized queries or a SQL validator to confirm safe syntax before execution.",
+                        cvss_estimate=9.0,
+                    ))
+                    break
 
-        # Dynamic SQL: f-string / concat of function parameters (MCP tools, etc.)
+        # Dynamic SQL: f-string / concat of function parameters (not LLM output).
         tainted = _tainted_from_params(func)
         interpolated_at: Dict[str, int] = {}
         for node in ast.walk(func):
             if not isinstance(node, ast.Assign):
                 continue
-            if node.value is None or not _expr_is_interpolated(node.value):
+            if node.value is None:
                 continue
-            if not (_names_in_expr(node.value) & tainted):
+            sql_built = _unwrap_sqlalchemy_text(node.value)
+            if not _expr_is_interpolated(sql_built):
+                continue
+            if not (_names_in_expr(sql_built) & tainted):
                 continue
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     interpolated_at[t.id] = getattr(node, "lineno", 0)
 
         for node in ast.walk(func):
-            if not isinstance(node, ast.Call) or not _is_sql_exec_call(node):
+            if not isinstance(node, ast.Call) or not _is_sql_exec_call(node, sql_receivers):
                 continue
-            if not node.args or len(node.args) >= 2:
-                continue
-            if any(kw.arg in {"params", "parameters"} for kw in node.keywords):
+            if not node.args or is_parameterized_sql_call(node):
                 continue
             sql_arg = node.args[0]
+            sql_built = _unwrap_sqlalchemy_text(sql_arg)
             exec_line = getattr(node, "lineno", 0)
-            interpolated = _expr_is_interpolated(sql_arg) and bool(
-                _names_in_expr(sql_arg) & tainted
+            interpolated = _expr_is_interpolated(sql_built) and bool(
+                _names_in_expr(sql_built) & tainted
             )
-            via_var = isinstance(sql_arg, ast.Name) and sql_arg.id in interpolated_at
+            via_var = (
+                isinstance(sql_arg, ast.Name) and sql_arg.id in interpolated_at
+            ) or (
+                isinstance(sql_built, ast.Name) and sql_built.id in interpolated_at
+            )
             if not interpolated and not via_var:
                 continue
             src_line = exec_line
@@ -808,7 +863,7 @@ def detect_pat003(
                 src_line = interpolated_at.get(sql_arg.id, exec_line)
             findings.append(PatternFinding(
                 vulnerability_id="PAT-003",
-                title="LLM-generated SQL executed without parameterization",
+                title="Interpolated SQL executed without parameterization",
                 severity="critical",
                 confidence="high",
                 category="LLM02 Insecure Output Handling",
@@ -823,7 +878,7 @@ def detect_pat003(
                     f"line {exec_line}: {_call_chain_str(node)}() without bound parameters",
                 ],
                 framework="sqlalchemy/sqlite3/psycopg2",
-                remediation="Never pass LLM output directly to execute(). Use parameterized queries or a SQL validator to confirm safe syntax before execution.",
+                remediation="Never pass untrusted input directly to execute(). Use parameterized queries or a SQL validator to confirm safe syntax before execution.",
                 cvss_estimate=9.0,
             ))
             break

@@ -25,6 +25,7 @@ DEFAULT_IGNORE_PATHS = [
     "integrations",
     "packs",
     "demo",
+    "benchmarks",
 ]
 IGNORE_PATHS = DEFAULT_IGNORE_PATHS  # Alias for global config
 

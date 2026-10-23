@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..models import AIBOM, Finding, FindingCategory, PolicyReport, Severity
@@ -8,6 +9,7 @@ from ..governance.risk_scoring import compute_risk_score
 if TYPE_CHECKING:
     from ..analyzers.architecture_inference import ArchitectureResult
 from .component_diagram import to_ai_component_mermaid
+from .finding_contract import coverage_from_analysis, serialize_finding, summary_counts
 from .provider_summary import findings_to_detections, summarize_providers
 
 SEVERITY_BADGES = {
@@ -92,16 +94,23 @@ def _build_summary_with_llm(
         prompt_injection_risks=prompt_injection_risks,
         llm_usage=llm_usage,
     )
+    taint_flows = list(getattr(dataflow_analysis, "data_flows", None) or []) if dataflow_analysis else []
     summary: Dict[str, Any] = {
         "component_count": len(aibom.components),
         "model_count": len(aibom.models),
         "dataflow_count": len(aibom.dataflows),
+        "architecture_dataflow_count": len(aibom.dataflows),
+        "taint_flow_count": len(taint_flows),
+        "taint_analysis_incomplete": bool(
+            getattr(dataflow_analysis, "incomplete", False)
+        ) if dataflow_analysis is not None else False,
         "finding_count": len(findings),
         "mcp_server_count": len(aibom.mcp_servers),
         "agent_framework_count": len(aibom.agent_frameworks),
         "agent_tool_count": len(getattr(aibom, "agent_tools", None) or []),
         "executive_insights": insights,
     }
+    summary.update(summary_counts(findings))
     if llm_usage:
         lp = _build_llm_invocation_patterns(llm_usage)
         if lp:
@@ -198,6 +207,7 @@ def to_risk_report_json(
     attack_path_findings: Optional[Any] = None,
     pattern_analysis: Optional[Any] = None,
     crossfile_taint: Optional[Any] = None,
+    generated_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build an Enterprise Risk Report JSON document.
@@ -217,7 +227,9 @@ def to_risk_report_json(
         crossfile_taint=crossfile_taint,
     )
     arch_dict = architecture_result.to_dict() if architecture_result else {"architecture_types": ["Unknown"], "components": [], "confidence": "low"}
+    stamp = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M")
     report: Dict[str, Any] = {
+        "generated_at": stamp,
         "repo": str(aibom.repo_path),
         "repo_type": repo_type or "application",
         "risk_score": {
@@ -239,19 +251,8 @@ def to_risk_report_json(
             model_supply_chain=model_supply_chain,
             prompt_injection_risks=prompt_injection_risks,
         ),
-        "findings": [
-            {
-                "id": f.id,
-                "title": f.title,
-                "category": f.category.value,
-                "severity": f.severity.value,
-                "description": f.description,
-                "file": f.evidence[0].file if f.evidence else None,
-                "line": f.evidence[0].line if f.evidence else None,
-            }
-            for f in (findings or [])
-            if f.category != FindingCategory.SEMANTIC
-        ],
+        "findings": [serialize_finding(f) for f in (findings or [])],
+        "analysis_coverage": coverage_from_analysis(dataflow_analysis),
         "architecture": arch_dict,
         "provider_summary": _build_provider_summary(findings, llm_usage),
         "llm_invocation_patterns": _build_llm_invocation_patterns(llm_usage),
@@ -280,6 +281,7 @@ def to_risk_report_json(
         ],
         "dataflows": [
             {
+                "kind": "aibom_architecture",
                 "flow_type": getattr(df, "flow_type", None),
                 "diagram": df.to_mermaid(layout="LR"),
                 "example_files": getattr(df, "example_files", [])[:5],
@@ -291,6 +293,38 @@ def to_risk_report_json(
 
     if dataflow_analysis is not None:
         report["ai_data_flow_analysis"] = dataflow_analysis.to_dict()
+        report["taint_data_flows"] = [
+            df.to_dict() if hasattr(df, "to_dict") else df
+            for df in getattr(dataflow_analysis, "data_flows", None) or []
+        ]
+    if crossfile_taint is not None:
+        paths = list(getattr(crossfile_taint, "taint_paths", None) or [])
+        report["crossfile_reachability"] = {
+            "kind": "call_graph_bfs",
+            "not_value_taint": True,
+            "confirmed_paths": sum(1 for p in paths if getattr(p, "confirmed", False)),
+            "partial_paths": sum(1 for p in paths if getattr(p, "partial", False)),
+            "confirmed_pattern_ids": list(
+                getattr(crossfile_taint, "confirmed_pattern_ids", None) or []
+            ),
+            "partial_pattern_ids": list(
+                getattr(crossfile_taint, "partial_pattern_ids", None) or []
+            ),
+        }
+    if pattern_analysis is not None:
+        pat_findings = list(getattr(pattern_analysis, "findings", None) or [])
+        report["pattern_analysis"] = {
+            "kind": "structural_pattern",
+            "not_value_taint": True,
+            "finding_count": len(pat_findings),
+            "vulnerability_ids": sorted(
+                {
+                    str(getattr(f, "vulnerability_id", "") or getattr(f, "id", ""))
+                    for f in pat_findings
+                    if getattr(f, "vulnerability_id", None) or getattr(f, "id", None)
+                }
+            ),
+        }
     if sensitive_exposures is not None:
         report["sensitive_exposures"] = sensitive_exposures.to_dict()
     if model_supply_chain is not None:
@@ -320,19 +354,7 @@ def to_findings_json(
     Export findings and architecture as JSON for tooling or dashboards.
     Returns {"architecture": {...}, "findings": [...]}.
     """
-    findings_data = [
-        {
-            "id": f.id,
-            "title": f.title,
-            "category": f.category.value,
-            "severity": f.severity.value,
-            "description": f.description,
-            "file": f.evidence[0].file if f.evidence else None,
-            "line": f.evidence[0].line if f.evidence else None,
-            "tags": f.tags,
-        }
-        for f in findings
-    ]
+    findings_data = [serialize_finding(f) for f in findings]
     out: Dict[str, Any] = {"findings": findings_data}
     if architecture_result:
         out["architecture"] = architecture_result.to_dict()
@@ -721,6 +743,30 @@ def to_risk_report_markdown(
     if dataflow_analysis:
         lines.append("## AI Data Flow Analysis")
         lines.append("")
+        if getattr(dataflow_analysis, "incomplete", False):
+            reasons = list(getattr(dataflow_analysis, "incomplete_reasons", None) or [])
+            why = ", ".join(reasons) if reasons else "worklist cap"
+            lines.append(
+                f"**Analysis incomplete** ({why}). The taint worklist was truncated; "
+                "this is not a full analysis and missing flows must not be treated "
+                "as absence of taint."
+            )
+            lines.append("")
+        cov = coverage_from_analysis(dataflow_analysis)
+        n_unres = cov["unresolved_calls"]["count"]
+        n_unsup = cov["unsupported_call_forms"]["count"]
+        if n_unres or n_unsup:
+            bits = []
+            if n_unres:
+                bits.append(f"{n_unres} unresolved tainted call(s)")
+            if n_unsup:
+                bits.append(f"{n_unsup} unsupported call form(s)")
+            lines.append(
+                "**Coverage limitations** (not findings): "
+                + ", ".join(bits)
+                + ". These do not prove a vulnerability or that the application is safe."
+            )
+            lines.append("")
         if dataflow_analysis.data_flows:
             lines.append("Data flowing from sources into LLM inference calls. Risk is classified by source type:")
             lines.append("")
@@ -728,15 +774,54 @@ def to_risk_report_markdown(
             lines.append("- **Medium**: external_api (HTTP, DB), environment (env vars)")
             lines.append("- **Low**: file_read, config, internal_variable")
             lines.append("")
-            lines.append("| Source Type | Sink | File | Line | Risk |")
-            lines.append("|-------------|------|------|------|------|")
+            lines.append("| Source Type | Sink | Category | Location | Trace | Risk | Notes |")
+            lines.append("|-------------|------|----------|----------|-------|------|-------|")
             risk_badges = {"high": "🔴 high", "medium": "🟠 medium", "low": "🟢 low"}
             for df in dataflow_analysis.data_flows[:20]:
-                line_str = str(df.line) if df.line else "—"
+                src_file = getattr(df, "source_file", "") or ""
+                src_line = getattr(df, "source_line", None)
+                sink_file = df.file or ""
+                sink_line = str(df.line) if df.line else "—"
+                src_loc = src_file + (f":{src_line}" if src_line else "")
+                sink_loc = sink_file + (f":{sink_line}" if sink_file else "")
+                if src_loc and src_loc != sink_loc:
+                    loc = f"`{src_loc}` → `{sink_loc}`"
+                else:
+                    loc = f"`{sink_loc}`" if sink_loc else "—"
+                hops = [str(h) for h in (getattr(df, "hops", None) or []) if str(h).strip()]
+                trace = " → ".join(f"`{h}`" for h in hops) if hops else "—"
+                cat = getattr(df, "sink_category", "") or "—"
+                notes = []
+                if getattr(df, "sanitized", False):
+                    notes.append("sanitized")
+                conf = getattr(df, "confidence", "") or ""
+                if conf:
+                    notes.append(f"confidence:{conf}")
+                note_str = ", ".join(notes) if notes else "—"
                 risk_str = risk_badges.get(df.risk.lower(), df.risk)
-                lines.append(f"| {df.source} | {df.sink} | `{df.file}` | {line_str} | {risk_str} |")
+                lines.append(
+                    f"| {df.source} | {df.sink} | {cat} | {loc} | {trace} | {risk_str} | {note_str} |"
+                )
             if len(dataflow_analysis.data_flows) > 20:
-                lines.append(f"| *... and {len(dataflow_analysis.data_flows) - 20} more flow(s)* | | | | |")
+                lines.append(
+                    f"| *... and {len(dataflow_analysis.data_flows) - 20} more flow(s)* | | | | | | |"
+                )
+            from .taint_diagram import taint_mermaid_for_analysis
+            taint_mmd = taint_mermaid_for_analysis(dataflow_analysis)
+            if taint_mmd:
+                lines.append("")
+                lines.append(
+                    "**Value-taint movement** (HTTP/source → callees → sink). "
+                    "Not an AIBOM architecture graph."
+                )
+                lines.append("")
+                lines.append("```mermaid")
+                lines.append(taint_mmd)
+                lines.append("```")
+        elif getattr(dataflow_analysis, "incomplete", False):
+            lines.append(
+                "No flows were recorded before truncation; this is not a complete negative result."
+            )
         else:
             lines.append("No sensitive data flows from tracked sources to LLM sinks were detected.")
         lines.append("")
@@ -928,11 +1013,16 @@ def to_risk_report_markdown(
         lines.append("")
 
     # AI Component Architecture diagram
-    component_mermaid = to_ai_component_mermaid(aibom, arch)
-    if aibom.components or aibom.models:
+    component_mermaid = to_ai_component_mermaid(
+        aibom, arch, dataflow_analysis=dataflow_analysis
+    )
+    if aibom.components or aibom.models or getattr(dataflow_analysis, "data_flows", None):
         lines.append("## AI Component Architecture")
         lines.append("")
-        lines.append("How AI libraries, models, and external APIs connect in this project:")
+        lines.append(
+            "Packages, in-repo HTTP handlers, agents, LLM backends, and SQL/exec sites. "
+            "Dashed edges are structural uses. Value-taint movement is under AI Data Flow Analysis."
+        )
         lines.append("")
         lines.append("```mermaid")
         lines.append(component_mermaid)

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import webbrowser
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -289,33 +290,39 @@ def scan(
         typer.echo("Wrote risk report (Markdown).")
 
     if OutputFormat.MERMAID in selected_formats:
-        mermaid_diagram = to_ai_component_mermaid(result.aibom, architecture_result)
+        mermaid_diagram = to_ai_component_mermaid(
+            result.aibom,
+            architecture_result,
+            dataflow_analysis=result.dataflow_analysis,
+        )
         (out_path / "aitrace-component-diagram.mmd").write_text(mermaid_diagram, encoding="utf-8")
         typer.echo("Wrote AI component diagram (Mermaid).")
 
-    # Verbose / risk-json: structured dumps
-    if verbose or OutputFormat.RISK_JSON in selected_formats:
-        risk_json = to_risk_report_json(
-            result.aibom,
-            result.policy_report,
-            result.findings,
-            architecture_result,
-            result.dataflow_analysis,
-            result.sensitive_exposures,
-            result.model_supply_chain,
-            result.prompt_injection_risks,
-            result.llm_usage,
-            result.repo_type,
-            architecture_graph=result.architecture_graph,
-            attack_path_findings=result.attack_path_findings,
-            pattern_analysis=result.pattern_analysis,
-            crossfile_taint=result.crossfile_taint,
-        )
-        (out_path / "aitrace-risk-report.json").write_text(json.dumps(risk_json, indent=2), encoding="utf-8")
-        typer.echo("Wrote risk report (JSON).")
-        findings_json = to_findings_json(result.findings, architecture_result)
-        (out_path / "aitrace-findings.json").write_text(json.dumps(findings_json, indent=2), encoding="utf-8")
-        typer.echo("Wrote findings (JSON).")
+    # Always write JSON from the same AnalysisResult as the HTML report so
+    # timestamps and taint vs architecture vs reachability stay aligned.
+    report_generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    risk_json = to_risk_report_json(
+        result.aibom,
+        result.policy_report,
+        result.findings,
+        architecture_result,
+        result.dataflow_analysis,
+        result.sensitive_exposures,
+        result.model_supply_chain,
+        result.prompt_injection_risks,
+        result.llm_usage,
+        result.repo_type,
+        architecture_graph=result.architecture_graph,
+        attack_path_findings=result.attack_path_findings,
+        pattern_analysis=result.pattern_analysis,
+        crossfile_taint=result.crossfile_taint,
+        generated_at=report_generated_at,
+    )
+    (out_path / "aitrace-risk-report.json").write_text(json.dumps(risk_json, indent=2), encoding="utf-8")
+    typer.echo("Wrote risk report (JSON).")
+    findings_json = to_findings_json(result.findings, architecture_result)
+    (out_path / "aitrace-findings.json").write_text(json.dumps(findings_json, indent=2), encoding="utf-8")
+    typer.echo("Wrote findings (JSON).")
 
     if verbose and result.architecture_graph:
         from core.analyzers.architecture_graph import architecture_graph_to_json, architecture_graph_to_mermaid
@@ -357,7 +364,13 @@ def scan(
     # Primary deliverable: complete HTML report (written last so Downloads links resolve)
     from core.exporters.html_report import to_html_report
 
-    html_report = to_html_report(result, out_path, exploit_payloads or None, verification_results or None)
+    html_report = to_html_report(
+        result,
+        out_path,
+        exploit_payloads or None,
+        verification_results or None,
+        generated_at=report_generated_at,
+    )
     html_path = out_path / "aitrace-report.html"
     html_path.write_text(html_report, encoding="utf-8")
 
@@ -374,7 +387,16 @@ def scan(
     ]
     typer.echo("")
     if sev_parts:
-        typer.echo(f"Findings: {', '.join(sev_parts)}")
+        typer.echo(f"Security findings: {', '.join(sev_parts)}")
+    from core.exporters.finding_contract import coverage_from_analysis
+
+    cov = coverage_from_analysis(result.dataflow_analysis)
+    n_unres = cov["unresolved_calls"]["count"]
+    if n_unres:
+        typer.echo(
+            f"Coverage: {n_unres} unresolved tainted call(s) "
+            "(limitations, not findings)"
+        )
     typer.echo(f"Report: {html_path}")
     if not no_open:
         webbrowser.open(html_path.as_uri())

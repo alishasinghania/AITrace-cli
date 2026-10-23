@@ -207,13 +207,24 @@ class PromptInjectionResult:
         }
 
 
-def _dataflow_to_risk(df: DataFlow) -> PromptInjectionRisk:
-    """Convert DataFlow to PromptInjectionRisk with new format."""
+# Only LLM / retrieval sinks can be prompt-injection exposures.
+# SQL, RCE, HTTP, email, and RAG ingest keep their own finding classes.
+_PI_SINK_CATEGORIES = frozenset({"llm", "retrieval"})
+
+
+def _dataflow_to_risk(df: DataFlow) -> Optional[PromptInjectionRisk]:
+    """Convert an LLM/retrieval DataFlow to a prompt-injection risk, or None."""
+    cat = (getattr(df, "sink_category", "") or "").lower()
+    if cat not in _PI_SINK_CATEGORIES:
+        return None
+    kind = getattr(df, "taint_kind", "payload") or "payload"
+    if kind != "payload":
+        return None
     return PromptInjectionRisk(
         type="prompt_injection",
         severity="low" if df.sanitized else ("high" if df.risk == "high" else "medium"),
         sanitized=df.sanitized,
-        source_file=df.file,
+        source_file=df.source_file or df.file,
         sink_file=df.file,
         evidence=f"{df.source} → {df.sink}" + (" (mitigated by sanitization)" if df.sanitized else ""),
         file=df.file,
@@ -425,6 +436,8 @@ def analyze_prompt_injection(
     if dataflow_analysis is not None and hasattr(dataflow_analysis, "data_flows"):
         for df in dataflow_analysis.data_flows:
             risk = _dataflow_to_risk(df)
+            if risk is None:
+                continue
             key = (risk.source_file, risk.sink_file, risk.evidence, risk.line, risk.sanitized)
             if key not in seen:
                 seen.add(key)
@@ -434,6 +447,8 @@ def analyze_prompt_injection(
         dataflow_result = analyze_dataflows(repo_root)
         for df in dataflow_result.data_flows:
             risk = _dataflow_to_risk(df)
+            if risk is None:
+                continue
             key = (risk.source_file, risk.sink_file, risk.evidence, risk.line, risk.sanitized)
             if key not in seen:
                 seen.add(key)

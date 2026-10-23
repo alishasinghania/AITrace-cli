@@ -11,7 +11,7 @@ import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..utils.ast_utils import walk_python_files, should_skip_path, get_call_chain, get_attr_chain
 
@@ -118,10 +118,16 @@ SINK_PATTERNS: List[Tuple[List[str], str]] = [
     (["retrieval_chain", "invoke"], "LangChain RetrievalChain"),
     (["qa_chain", "invoke"], "LangChain QA chain"),
     (["agent_executor", "invoke"], "LangChain AgentExecutor"),
+    (["llm", "ainvoke"], "LangChain LLM ainvoke"),
+    (["chain", "ainvoke"], "LangChain chain.ainvoke"),
+    (["agent", "ainvoke"], "LangChain Agent ainvoke"),
     (["query_engine", "query"], "LlamaIndex query engine"),
     (["index", "query"], "LlamaIndex index query"),
     (["as_query_engine"], "LlamaIndex query engine"),
     (["invoke"], "LangChain LLM invoke"),
+    (["ainvoke"], "LangChain LLM ainvoke"),
+    (["arun"], "LangChain LLM arun"),
+    (["astream"], "LangChain LLM astream"),
     (["generate"], "LLM generate"),
     (["pipeline"], "transformers pipeline"),
 ]
@@ -130,6 +136,7 @@ SINK_PATTERNS: List[Tuple[List[str], str]] = [
 SINK_PROVIDER_INDICATORS = {
     "openai", "anthropic", "cohere", "vertexai", "bedrock", "mistral",
     "litellm", "llm", "langchain", "llamaindex", "llama_index",
+    "langchain_openai", "langchain_core", "langchain_community",
     "completion", "completions", "chat_model", "transformers", "diffusers",
 }
 
@@ -171,7 +178,7 @@ def _chain_contains_any(chain: List[str], keywords: Set[str]) -> bool:
 
 @dataclass
 class DataFlow:
-    """Single source-to-sink data flow."""
+    """Single source-to-sink data flow (intra- or inter-procedural)."""
 
     source: str
     sink: str
@@ -180,6 +187,17 @@ class DataFlow:
     risk: str
     source_line: Optional[int] = None
     sanitized: bool = False  # True when input passed through sanitization before sink
+    source_file: str = ""
+    source_function: str = ""
+    sink_function: str = ""
+    sink_category: str = ""  # llm | sql | rce
+    hops: List[str] = field(default_factory=list)
+    confidence: str = "high"
+    # payload = request/user value; identifier = lookup key derived from input;
+    # lookup_result = value produced by an external fetch (not request payload).
+    taint_kind: str = "payload"
+    # HTTP argument role: url | query | body | headers | unresolved | ""
+    sink_arg_role: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -190,32 +208,72 @@ class DataFlow:
             "line": self.line,
             "risk": self.risk,
             "sanitized": self.sanitized,
+            "source_file": self.source_file or self.file,
+            "source_function": self.source_function,
+            "sink_function": self.sink_function,
+            "sink_category": self.sink_category,
+            "hops": list(self.hops),
+            "confidence": self.confidence,
+            "taint_kind": self.taint_kind,
+            "sink_arg_role": self.sink_arg_role,
+            "source_line": self.source_line,
         }
 
 
 @dataclass
 class DataFlowAnalysisResult:
-    """Result of data flow analysis."""
+    """Result of data flow analysis.
+
+    ``incomplete`` is False when the worklist reached a fixpoint under the
+    configured iteration and per-function context caps. True means at least
+    one cap truncated the analysis; missing flows must not be treated as
+    absence of taint.
+    """
 
     data_flows: List[DataFlow] = field(default_factory=list)
+    incomplete: bool = False
+    incomplete_reasons: List[str] = field(default_factory=list)
+    # Coverage limitations (unresolved/unsupported calls). Not findings.
+    coverage: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "data_flows": [df.to_dict() for df in self.data_flows],
+            "incomplete": self.incomplete,
+            "incomplete_reasons": list(self.incomplete_reasons),
+            "coverage": dict(self.coverage) if self.coverage else {
+                "unresolved_calls": {"count": 0, "samples": []},
+                "unsupported_call_forms": {"count": 0, "samples": []},
+            },
         }
 
 
 
+def _attr_taint_key(node: ast.expr) -> Optional[str]:
+    """Instance/module attribute as a taint key, e.g. self.prompt."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
 def _get_assign_targets(node: ast.Assign) -> List[str]:
-    """Get assigned variable names from Assign node."""
+    """Get assigned variable names (and simple obj.attr keys) from Assign."""
     names: List[str] = []
     for t in node.targets:
         if isinstance(t, ast.Name):
             names.append(t.id)
-        elif isinstance(t, ast.Tuple):
-            for e in t.elts:
-                if isinstance(e, ast.Name):
-                    names.append(e.id)
+        else:
+            attr = _attr_taint_key(t)
+            if attr:
+                names.append(attr)
+            elif isinstance(t, ast.Tuple):
+                for e in t.elts:
+                    if isinstance(e, ast.Name):
+                        names.append(e.id)
+                    else:
+                        nested = _attr_taint_key(e)
+                        if nested:
+                            names.append(nested)
     return names
 
 
@@ -225,40 +283,68 @@ def _get_source_risk(source_type: str) -> str:
     return SOURCE_RISK.get(source_type, "medium")
 
 
+_REQUEST_DATA_ATTRS = {"json", "args", "form", "data", "files", "get_json", "get_data", "body"}
+_BODY_FIELD_ATTRS = {
+    "message", "query", "prompt", "input", "text",
+    "content", "user_query", "user_input", "user_message",
+}
+
+
+def _source_call_matches(chain: List[str], pattern: List[str]) -> bool:
+    """Exact one-token match, or contiguous multi-token chain match. No substrings."""
+    if not pattern:
+        return False
+    if len(pattern) == 1:
+        return len(chain) == 1 and chain[0].lower() == pattern[0].lower()
+    return _chain_matches(chain, pattern)
+
+
 def _is_source_call(node: ast.Call) -> Optional[Tuple[str, str]]:
     """Return (source_type, risk) if node is a source call."""
     chain = get_call_chain(node)
-    chain_str = ".".join(chain).lower()
+    hits: List[Tuple[int, str]] = []
     for pattern, source_type in SOURCE_PATTERNS:
-        pat_str = ".".join(pattern).lower()
-        if pat_str in chain_str or _chain_matches(chain, pattern):
-            return (source_type, _get_source_risk(source_type))
-    return None
+        if _source_call_matches(chain, pattern):
+            hits.append((len(pattern), source_type))
+    if not hits:
+        return None
+    hits.sort(key=lambda h: -h[0])
+    source_type = hits[0][1]
+    return (source_type, _get_source_risk(source_type))
 
 
 def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
-    """Check if expression is a source (call or attribute like request.json). Returns (source_type, risk)."""
+    """Check if expression is a source (call or request/body attribute)."""
     if isinstance(node, ast.Call):
         return _is_source_call(node)
     if isinstance(node, ast.Attribute):
         chain = get_attr_chain(node)
+        chain_l = [c.lower() for c in chain]
         for pattern, source_type in SOURCE_PATTERNS:
-            if len(pattern) <= len(chain) and pattern == [c.lower() for c in chain[-len(pattern):]]:
+            if len(pattern) < 2:
+                continue
+            pat_l = [p.lower() for p in pattern]
+            if len(pat_l) <= len(chain_l) and chain_l[-len(pat_l):] == pat_l:
                 return (source_type, _get_source_risk(source_type))
-        if chain and chain[-1].lower() in ("json", "args", "form", "data"):
-            if len(chain) >= 2 and chain[0].lower() in ("request", "req"):
-                return ("user_input", _get_source_risk("user_input"))
-        # FastAPI Pydantic attrs — checked independently (not nested inside json/args/form check)
-        _FASTAPI_ATTRS = {
-            "message", "query", "prompt", "input", "text",
-            "content", "user_query", "user_input", "user_message",
-        }
-        if len(chain) >= 2 and chain[-1].lower() in _FASTAPI_ATTRS:
+        if (
+            len(chain_l) >= 2
+            and chain_l[0] in {"request", "req"}
+            and chain_l[-1] in _REQUEST_DATA_ATTRS
+        ):
+            return ("user_input", _get_source_risk("user_input"))
+        if (
+            len(chain_l) >= 2
+            and chain_l[0] == "body"
+            and chain_l[-1] in _BODY_FIELD_ATTRS
+        ):
             return ("user_input", _get_source_risk("user_input"))
     if isinstance(node, ast.Subscript):
+        inner = _is_source_value(node.value)
+        if inner:
+            return inner
         if isinstance(node.value, ast.Attribute):
             chain = get_attr_chain(node.value)
-            if chain and chain[0].lower() in ("request", "req") and chain[-1].lower() in ("args", "form"):
+            if chain and chain[0].lower() in ("request", "req") and chain[-1].lower() in ("args", "form", "json", "data"):
                 return ("user_input", _get_source_risk("user_input"))
         if isinstance(node.value, ast.Name) and node.value.id.lower() == "sys":
             return ("user_input", _get_source_risk("user_input"))
@@ -278,7 +364,29 @@ def _is_sanitization_call(node: ast.Call) -> bool:
     return False
 
 
-_GENERIC_SINK_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
+_GENERIC_SINK_PATTERNS = {
+    ("invoke",), ("ainvoke",), ("arun",), ("astream",),
+    ("generate",), ("pipeline",),
+}
+
+
+def _canonicalize_sink_chain(
+    chain: List[str],
+    import_modules: Optional[Dict[str, str]] = None,
+) -> Tuple[List[str], Set[str]]:
+    """Rewrite aliased import heads (import openai as o) into module tokens."""
+    rewritten = list(chain)
+    extra: Set[str] = set()
+    if chain and import_modules:
+        mod = import_modules.get(chain[0])
+        if mod:
+            prefix = [p for p in mod.split(".") if p]
+            rewritten = prefix + chain[1:]
+            for part in mod.replace("-", "_").replace(".", "_").split("_"):
+                if part:
+                    extra.add(part.lower())
+    chain_set = {c.lower() for c in rewritten} | extra
+    return rewritten, chain_set
 
 _MCP_HANDLER_EXACT = {"call_tool", "handle_tool_call", "dispatch_tool"}
 _MCP_ARG_NAMES = {"arguments", "args", "params"}
@@ -334,10 +442,18 @@ def _mcp_arg_source(node: ast.expr) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _is_sink_call(node: ast.Call) -> Optional[str]:
-    """Return sink label if node is an LLM sink."""
-    chain = get_call_chain(node)
-    chain_set = set(c.lower() for c in chain)
+def _is_sink_call(
+    node: ast.Call,
+    import_modules: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Return sink label if node is an LLM sink.
+
+    import_modules maps local names to imported module paths so
+    ``import openai as o; o.chat.completions.create()`` resolves as OpenAI.
+    Generic method names (invoke/ainvoke/chat) still require a provider token.
+    """
+    raw = get_call_chain(node)
+    chain, chain_set = _canonicalize_sink_chain(raw, import_modules)
     for pattern, label in SINK_PATTERNS:
         if not _chain_matches(chain, pattern):
             continue
@@ -353,11 +469,15 @@ def _is_sink_call(node: ast.Call) -> Optional[str]:
 
 
 def _names_in_expr(node: ast.expr) -> Set[str]:
-    """Extract all Name ids referenced in expression."""
+    """Extract Name ids and simple obj.attr keys referenced in expression."""
     names: Set[str] = set()
     for n in ast.walk(node):
         if isinstance(n, ast.Name):
             names.add(n.id)
+        else:
+            attr = _attr_taint_key(n)
+            if attr:
+                names.add(attr)
     return names
 
 
@@ -483,33 +603,28 @@ class _TaintVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def analyze_dataflows(repo_root: Path) -> DataFlowAnalysisResult:
+def analyze_dataflows(
+    repo_root: Path,
+    *,
+    max_iters: Optional[int] = None,
+    max_contexts_per_func: Optional[int] = None,
+) -> DataFlowAnalysisResult:
     """
-    Analyze Python files for sensitive data flows into LLM sinks.
+    Analyze Python files for source-to-sink data flows.
 
-    Returns DataFlowAnalysisResult with data_flows list.
+    Runs interprocedural (cross-function / cross-file) taint propagation
+    for arguments, parameters, and return values. Falls back to empty
+    results on failure rather than raising.
+
+    max_iters / max_contexts_per_func override worklist safety caps (tests).
     """
-    repo_root = Path(repo_root).resolve()
-    all_flows: List[DataFlow] = []
-    seen: Set[Tuple[str, str, str, Optional[int]]] = set()
+    try:
+        from .interproc_taint import analyze_interproc_dataflows
 
-    for path in repo_root.rglob("*.py"):
-        if path.suffix != ".py" or should_skip_path(path, repo_root):
-            continue
-        try:
-            source_text = path.read_text(encoding="utf-8", errors="ignore")
-            tree = ast.parse(source_text)
-        except (SyntaxError, OSError):
-            continue
-
-        rel_path = str(path.relative_to(repo_root))
-        visitor = _TaintVisitor(rel_path, source_text)
-        visitor.visit(tree)
-
-        for df in visitor.flows:
-            key = (df.source, df.sink, df.file, df.line)
-            if key not in seen:
-                seen.add(key)
-                all_flows.append(df)
-
-    return DataFlowAnalysisResult(data_flows=all_flows)
+        return analyze_interproc_dataflows(
+            Path(repo_root).resolve(),
+            max_iters=max_iters,
+            max_contexts_per_func=max_contexts_per_func,
+        )
+    except Exception:
+        return DataFlowAnalysisResult(data_flows=[])

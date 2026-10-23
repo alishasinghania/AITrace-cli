@@ -323,34 +323,53 @@ def _build_call_graph(repo_root: Path) -> Dict[str, FunctionNode]:
     return graph
 
 
-def _build_called_by_index(graph: Dict[str, FunctionNode]) -> None:
-    """Populate called_by for each node via reverse lookup."""
-    # Build name → [keys] index for fuzzy matching
+def _name_index(graph: Dict[str, FunctionNode]) -> Dict[str, List[str]]:
     name_to_keys: Dict[str, List[str]] = {}
     for key, node in graph.items():
-        fn = node.function_name.lower()
-        name_to_keys.setdefault(fn, []).append(key)
+        name_to_keys.setdefault(node.function_name.lower(), []).append(key)
         qn = node.qualified_name.lower()
-        if qn != fn:
+        if qn != node.function_name.lower():
             name_to_keys.setdefault(qn, []).append(key)
+    return name_to_keys
 
+
+def _callee_keys_for_call(
+    call_name: str,
+    caller_key: str,
+    graph: Dict[str, FunctionNode],
+    name_to_keys: Dict[str, List[str]],
+) -> List[str]:
+    """Resolve callees without global short-name matching."""
+    if call_name in graph:
+        return [call_name]
+    caller = graph[caller_key]
+    name = call_name.lower()
+    out: List[str] = []
+    if "." in name:
+        parts = name.split(".")
+        fn, obj = parts[-1], parts[0]
+        for k in name_to_keys.get(fn, []):
+            node = graph[k]
+            stem = Path(node.file).stem.lower().replace("-", "_")
+            if node.function_name.lower() != fn:
+                continue
+            if obj == stem or obj in node.qualified_name.lower():
+                out.append(k)
+        return list(dict.fromkeys(out))
+    for k in name_to_keys.get(name, []):
+        if graph[k].file == caller.file and k != caller_key:
+            out.append(k)
+    return out
+
+
+def _build_called_by_index(graph: Dict[str, FunctionNode]) -> None:
+    """Populate called_by using precise name/file resolution (not global run() matching)."""
+    name_to_keys = _name_index(graph)
     for caller_key, caller in graph.items():
         for call_name in caller.calls:
-            # Direct match
-            if call_name in name_to_keys:
-                for callee_key in name_to_keys[call_name]:
-                    if callee_key != caller_key and caller_key not in graph[callee_key].called_by:
-                        graph[callee_key].called_by.append(caller_key)
-            # Fuzzy: "rag_chain.run" → look for file with "rag_chain" and function "run"
-            if "." in call_name:
-                parts = call_name.split(".")
-                fn_part = parts[-1]
-                obj_part = parts[0] if len(parts) == 2 else parts[-2]
-                if fn_part in name_to_keys:
-                    for callee_key in name_to_keys[fn_part]:
-                        if obj_part in callee_key.lower() or obj_part in graph[callee_key].file.lower():
-                            if callee_key != caller_key and caller_key not in graph[callee_key].called_by:
-                                graph[callee_key].called_by.append(caller_key)
+            for callee_key in _callee_keys_for_call(call_name, caller_key, graph, name_to_keys):
+                if callee_key != caller_key and caller_key not in graph[callee_key].called_by:
+                    graph[callee_key].called_by.append(caller_key)
 
 
 # ---------------------------------------------------------------------------
@@ -371,13 +390,7 @@ def _forward_bfs(
             visited[key] = [key]
             queue.append((key, [key]))
 
-    name_to_keys: Dict[str, List[str]] = {}
-    for key, node in graph.items():
-        fn = node.function_name.lower()
-        name_to_keys.setdefault(fn, []).append(key)
-        qn = node.qualified_name.lower()
-        if qn != fn:
-            name_to_keys.setdefault(qn, []).append(key)
+    name_to_keys = _name_index(graph)
 
     while queue:
         current_key, path = queue.popleft()
@@ -388,16 +401,7 @@ def _forward_bfs(
             continue
 
         for call_name in current.calls:
-            # Find matching callees
-            candidates: List[str] = name_to_keys.get(call_name, [])
-            if "." in call_name:
-                parts = call_name.split(".")
-                fn_part = parts[-1]
-                obj_part = parts[0] if len(parts) >= 2 else ""
-                for ckey in name_to_keys.get(fn_part, []):
-                    if not obj_part or obj_part in ckey.lower() or obj_part in graph[ckey].file.lower():
-                        if ckey not in candidates:
-                            candidates.append(ckey)
+            candidates = _callee_keys_for_call(call_name, current_key, graph, name_to_keys)
 
             for callee_key in candidates:
                 if callee_key == current_key:
@@ -493,8 +497,8 @@ def _find_taint_paths(
             sink_type=sink_type,
             hops=full_path,
             hop_count=len(full_path),
-            confirmed=True,
-            partial=False,
+            confirmed=False,
+            partial=True,
             vulnerability_type=vtype,
         ))
 
@@ -543,25 +547,9 @@ def _upgrade_findings(
     paths: List[TaintPath],
     confirmed_ids: List[str],
     partial_ids: List[str],
+    data_flows: Optional[List[Any]] = None,
 ) -> None:
-    """Mutates PatternFindings with taint confirmation info."""
-    # Build index: file → confirmed paths that pass through it
-    confirmed_by_file: Dict[str, List[TaintPath]] = {}
-    for tp in paths:
-        if not tp.confirmed:
-            continue
-        for hop in tp.hops:
-            file_part = hop.split("::")[0] if "::" in hop else hop
-            confirmed_by_file.setdefault(file_part, []).append(tp)
-
-    partial_by_file: Dict[str, List[TaintPath]] = {}
-    for tp in paths:
-        if not tp.partial:
-            continue
-        for hop in tp.hops:
-            file_part = hop.split("::")[0] if "::" in hop else hop
-            partial_by_file.setdefault(file_part, []).append(tp)
-
+    """Confirm PAT findings only from value-taint DataFlow hits, not call-graph overlap."""
     _SINK_COMPAT: Dict[str, Set[str]] = {
         "PAT-001": {"llm", "retrieval"},
         "PAT-002": {"rce", "llm"},
@@ -582,105 +570,156 @@ def _upgrade_findings(
         "PAT-028": {"llm", "retrieval"},
         "FLOW-RCE": {"rce"},
         "FLOW-SQL": {"sql"},
+        "FLOW-LLM": {"llm"},
         "FLOW-HTTP": {"http"},
         "FLOW-EMAIL": {"email"},
         "FLOW-RAG": {"rag_ingest", "retrieval"},
     }
 
+    flows = data_flows or []
     for finding in pattern_findings:
-        compatible_sinks = _SINK_COMPAT.get(finding.vulnerability_id, {"llm", "sql", "rce", "retrieval"})
+        compatible = _SINK_COMPAT.get(finding.vulnerability_id, {"llm", "sql", "rce", "retrieval"})
+        for df in flows:
+            if getattr(df, "sanitized", False):
+                continue
+            cat = getattr(df, "sink_category", "") or ""
+            if cat and cat not in compatible:
+                continue
+            if df.file != finding.file:
+                continue
+            if finding.line and df.line and abs(int(df.line) - int(finding.line)) > 3:
+                continue
+            finding.confirmed_by_taint = True
+            finding.taint_path = list(getattr(df, "hops", None) or [])
+            finding.severity = _SEV_UPGRADE.get(finding.severity, finding.severity)
+            finding.confidence = "high"
+            if finding.vulnerability_id not in confirmed_ids:
+                confirmed_ids.append(finding.vulnerability_id)
+            break
 
-        # Check confirmed paths through the finding's file
-        for tp in confirmed_by_file.get(finding.file, []):
-            if tp.sink_type in compatible_sinks:
-                finding.confirmed_by_taint = True
-                finding.taint_path = tp.hops
-                finding.severity = _SEV_UPGRADE.get(finding.severity, finding.severity)
-                finding.confidence = "high"
-                if finding.vulnerability_id not in confirmed_ids:
-                    confirmed_ids.append(finding.vulnerability_id)
-                tp.confirms_pattern_ids.append(finding.vulnerability_id)
-                break
+        if finding.confirmed_by_taint:
+            continue
+        partial_by_file: Dict[str, List[TaintPath]] = {}
+        for tp in paths:
+            if not tp.partial:
+                continue
+            for hop in tp.hops:
+                file_part = hop.split("::")[0] if "::" in hop else hop
+                partial_by_file.setdefault(file_part, []).append(tp)
+        for tp in partial_by_file.get(finding.file, []):
+            old_conf_rank = {"high": 2, "medium": 1, "low": 0}
+            if old_conf_rank.get(finding.confidence, 0) < old_conf_rank["medium"]:
+                finding.confidence = "medium"
+            finding.taint_path = tp.hops
+            if finding.vulnerability_id not in partial_ids:
+                partial_ids.append(finding.vulnerability_id)
+            break
 
-        if not finding.confirmed_by_taint:
-            # Check partial paths
-            for tp in partial_by_file.get(finding.file, []):
-                old_conf_rank = {"high": 2, "medium": 1, "low": 0}
-                if old_conf_rank.get(finding.confidence, 0) < old_conf_rank["medium"]:
-                    finding.confidence = "medium"
-                finding.taint_path = tp.hops
-                if finding.vulnerability_id not in partial_ids:
-                    partial_ids.append(finding.vulnerability_id)
-                break
+
+# Pattern IDs that describe the *same* issue as a FLOW-* row at the same sink.
+# PAT-001 (RAG shape) is not equivalent to FLOW-LLM (payload in a prompt).
+_FLOW_COVERED_BY: Dict[str, Set[str]] = {
+    "sql": {"PAT-003", "FLOW-SQL"},
+    "rce": {"PAT-002", "PAT-004", "PAT-025", "FLOW-RCE"},
+    "llm": {"FLOW-LLM"},
+    "http": {"FLOW-HTTP"},
+    "email": {"FLOW-EMAIL"},
+    "rag_ingest": {"FLOW-RAG", "PAT-026"},
+}
+
+
+def _same_sink_location(finding: PatternFinding, df: Any, slop: int = 0) -> bool:
+    """True when a pattern finding and a DataFlow name the same sink site.
+
+    Default slop is 0 so two execute/invoke calls on consecutive lines stay
+    distinct. PAT confirmation uses a wider window in ``_upgrade_findings``.
+    """
+    if finding.file != getattr(df, "file", None):
+        return False
+    fl = finding.line
+    dl = getattr(df, "line", None)
+    if not fl or not dl:
+        return False
+    return abs(int(fl) - int(dl)) <= slop
+
+
+def _finding_covers_flow(finding: PatternFinding, df: Any, cat: str) -> bool:
+    """True when an existing finding already records this flow's issue."""
+    if finding.vulnerability_id not in _FLOW_COVERED_BY.get(cat, set()):
+        return False
+    return _same_sink_location(finding, df)
 
 
 def _emit_flow_findings(
     pattern_findings: List[PatternFinding],
     paths: List[TaintPath],
     graph: Dict[str, FunctionNode],
+    data_flows: Optional[List[Any]] = None,
 ) -> None:
     """
-    Discover findings from confirmed high-impact taint paths even when no PAT-* matched.
+    Emit FLOW-* findings from value-taint DataFlows, not call-graph reachability.
 
-    Only rce/sql/http/email/rag_ingest — not every user→LLM chat path.
+    Dedup is by (rule, file, line), not by filename. A PAT-* row covers a FLOW
+    row only when it is the same sink location and the same issue class.
     """
-    covered_files: Dict[str, Set[str]] = {}
-    for f in pattern_findings:
-        covered_files.setdefault(f.file, set()).add(f.vulnerability_id)
-
     seen: Set[Tuple[str, str, str]] = set()
-    for tp in paths:
-        if not tp.confirmed or tp.sink_type not in HIGH_IMPACT_SINKS:
+    for df in data_flows or []:
+        if getattr(df, "sanitized", False):
             continue
-        meta = FLOW_META.get(tp.sink_type)
+        kind = getattr(df, "taint_kind", "payload") or "payload"
+        if kind != "payload":
+            continue
+        cat = getattr(df, "sink_category", "") or ""
+        if cat not in HIGH_IMPACT_SINKS:
+            continue
+        # FLOW-HTTP is destination control (CWE-918), not every tainted HTTP argument.
+        if cat == "http" and getattr(df, "sink_arg_role", "") != "url":
+            continue
+        meta = FLOW_META.get(cat)
         if not meta:
             continue
         vid, title, severity, category, cwe = meta
-        sink_node = graph.get(tp.sink_key)
-        file_name = sink_node.file if sink_node else tp.sink_key.split("::")[0]
-        key = (vid, file_name, tp.sink_key)
+        file_name = df.file
+        key = (vid, file_name, str(df.line))
         if key in seen:
             continue
-        # Skip if a more specific PAT already covers this file+sink class
-        existing = covered_files.get(file_name, set())
-        if vid in existing:
-            continue
-        if tp.sink_type == "rce" and {"PAT-002", "PAT-004", "PAT-025"} & existing:
-            continue
-        if tp.sink_type == "rag_ingest" and "PAT-026" in existing:
-            continue
-        if tp.sink_type in {"http", "email"} and "PAT-027" in existing:
+        if any(_finding_covers_flow(f, df, cat) for f in pattern_findings):
             continue
         seen.add(key)
-        hop_short = " → ".join(
-            h.split("::")[-1] for h in tp.hops[:6] if "(sink not reached)" not in h
-        )
+        hop_short = " → ".join(getattr(df, "hops", None) or [])
+        confidence = getattr(df, "confidence", None) or "high"
+        owasp = "LLM01" if cat == "llm" else ("LLM03" if cat == "rag_ingest" else ("LLM02" if cat == "sql" else "LLM08"))
         pattern_findings.append(PatternFinding(
             vulnerability_id=vid,
             title=title,
             severity=severity,
-            confidence="high",
+            confidence=confidence,
             category=category,
-            owasp_id="LLM08" if tp.sink_type != "rag_ingest" else "LLM03",
+            owasp_id=owasp,
             cwe=cwe,
             file=file_name,
-            line=sink_node.line_start if sink_node else None,
-            function_name=sink_node.function_name if sink_node else None,
-            pattern_matched=f"taint path to {tp.sink_type} sink",
+            line=df.line,
+            function_name=getattr(df, "sink_function", None),
+            pattern_matched=f"value taint to {cat} sink",
             evidence=[
-                f"Confirmed path ({tp.hop_count} hops): {hop_short}",
-                f"Sink type: {tp.sink_type} at {tp.sink_key}",
+                f"Confirmed value path: {hop_short}",
+                f"Sink type: {cat} at {df.file}:{df.line}",
+                f"taint_kind={kind}",
+                f"argument role: {getattr(df, 'sink_arg_role', '') or 'n/a'}",
             ],
             framework="taint",
-            confirmed_by_taint=True,
-            taint_path=tp.hops,
+            confirmed_by_taint=confidence != "may",
+            taint_path=list(getattr(df, "hops", None) or []),
             remediation=(
                 "Block or sanitize untrusted data before this sink. "
                 "Prefer allowlists, parameterized APIs, and shell=False with argv lists."
             ),
             cvss_estimate=9.0 if severity == "critical" else 7.5,
+            taint_kind=kind,
+            source_file=getattr(df, "source_file", "") or "",
+            source_line=getattr(df, "source_line", None),
+            sink_arg_role=getattr(df, "sink_arg_role", "") or "",
         ))
-        tp.confirms_pattern_ids.append(vid)
 
 
 # ---------------------------------------------------------------------------
@@ -691,8 +730,9 @@ def analyze_crossfile_taint(
     repo_root: Path,
     pattern_findings: List[PatternFinding],
     max_hops: int = 6,
+    data_flows: Optional[List[Any]] = None,
 ) -> CrossFileTaintResult:
-    """Build call graph, run BFS, upgrade PatternFindings with taint info."""
+    """Build call graph, run BFS for reachability, confirm PAT from value-taint DataFlows."""
     repo_root = Path(repo_root).resolve()
 
     try:
@@ -714,12 +754,12 @@ def analyze_crossfile_taint(
     partial_ids: List[str] = []
 
     try:
-        _upgrade_findings(pattern_findings, paths, confirmed_ids, partial_ids)
+        _upgrade_findings(pattern_findings, paths, confirmed_ids, partial_ids, data_flows=data_flows)
     except Exception:
         pass
 
     try:
-        _emit_flow_findings(pattern_findings, paths, graph)
+        _emit_flow_findings(pattern_findings, paths, graph, data_flows=data_flows)
     except Exception:
         pass
 

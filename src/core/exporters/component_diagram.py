@@ -9,9 +9,10 @@ Follows AI SBOM tool conventions (ProtectAI, Endor Labs):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from ..models import AIBOM, Component, ComponentType
+from .taint_diagram import mermaid_node_id, parse_taint_hop
 
 if TYPE_CHECKING:
     from ..architecture_inference import ArchitectureResult
@@ -37,10 +38,11 @@ LLM_PROVIDERS = frozenset({
     "mistralai", "litellm", "ollama", "replicate", "together", "fireworks",
     "fireworks-ai", "groq", "ai21", "aleph-alpha-client", "aleph_alpha",
     "vllm", "perplexity",
+    "moonshot", "kimi", "copilot",
 })
 
 # Local ML (transformers, diffusers — load model artifacts)
-LOCAL_ML = frozenset({"transformers", "accelerate", "diffusers", "vllm"})
+LOCAL_ML = frozenset({"transformers", "accelerate", "diffusers", "vllm", "torch", "pytorch"})
 
 # Agent / Orchestration frameworks
 AGENT_FRAMEWORKS = frozenset({
@@ -118,6 +120,9 @@ DISPLAY_NAMES: dict[str, str] = {
     "fireworks-ai": "Fireworks AI",
     "groq": "Groq",
     "vllm": "vLLM",
+    "torch": "PyTorch",
+    "moonshot": "Moonshot (Kimi)",
+    "copilot": "GitHub Copilot",
     "transformers": "Hugging Face Transformers",
     "langchain": "LangChain",
     "langchain-community": "LangChain Community",
@@ -209,9 +214,74 @@ def _assign_layer(c: Component) -> Optional[str]:
     return None
 
 
+def _in_repo_architecture(
+    dataflow_analysis: Optional[Any],
+) -> Dict[str, Any]:
+    """Group in-repo functions from taint hops into architecture layers.
+
+    Used to place application nodes (HTTP handlers, agents, backends,
+    databases) and ``uses``/``calls`` edges that follow hop adjacency.
+    Those edges are structural, not value-taint (the taint diagram owns taint).
+    """
+    layers: Dict[str, Dict[str, Tuple[str, str, str]]] = {
+        "http": {},
+        "agents": {},
+        "llm_backend": {},
+        "database": {},
+        "execution": {},
+    }
+    uses: Set[Tuple[str, str, str]] = set()
+    flows = list(getattr(dataflow_analysis, "data_flows", None) or []) if dataflow_analysis else []
+    agent_hints = ("agent", "assistant", "llm", "native", "loop")
+
+    def put(layer: str, file: str, func: str, role: str) -> str:
+        nid = mermaid_node_id(file, func)
+        label = f"{file.split('/')[-1]}::{func}"
+        layers[layer][nid] = (nid, label, role)
+        return nid
+
+    for df in flows:
+        cat = str(getattr(df, "sink_category", "") or "")
+        hops = [str(h) for h in (getattr(df, "hops", None) or []) if str(h).strip()]
+        recs = [r for r in (parse_taint_hop(h) for h in hops) if r]
+        if not recs:
+            continue
+        first = recs[0]
+        last = recs[-1]
+        http_id = ""
+        sink_id = ""
+        if first.get("kind") == "source":
+            http_id = put("http", first["file"], first["func"], "http")
+        if last.get("kind") == "sink":
+            if cat == "llm":
+                sink_id = put("llm_backend", last["file"], last["func"], "llm")
+            elif cat == "sql":
+                sink_id = put("database", last["file"], last["func"], "db")
+            elif cat == "rce":
+                sink_id = put("execution", last["file"], last["func"], "exec")
+        agent_ids: List[str] = []
+        for rec in recs:
+            file = rec.get("file") or rec.get("tfile") or rec.get("sfile") or ""
+            func = rec.get("func") or rec.get("tfunc") or rec.get("sfunc") or ""
+            blob = f"{file}/{func}".lower()
+            if any(h in blob for h in agent_hints) and rec.get("kind") != "sink":
+                agent_ids.append(put("agents", file, func, "agent"))
+        if http_id and agent_ids:
+            uses.add((http_id, agent_ids[0], "uses"))
+        if agent_ids and sink_id:
+            uses.add((agent_ids[-1], sink_id, "calls"))
+        elif http_id and sink_id:
+            uses.add((http_id, sink_id, "reaches"))
+    return {
+        "layers": {k: list(v.values()) for k, v in layers.items() if v},
+        "uses": uses,
+    }
+
+
 def to_ai_component_mermaid(
     aibom: AIBOM,
     architecture_result: Optional["ArchitectureResult"] = None,
+    dataflow_analysis: Optional[Any] = None,
 ) -> str:
     """
     Generate a left-to-right color-coded Mermaid flowchart for AI architecture.
@@ -247,6 +317,10 @@ def to_ai_component_mermaid(
         "    classDef extCls    fill:#1e1b4b,stroke:#818cf8,color:#a5b4fc,rx:6",
         "    classDef cloudCls  fill:#1e293b,stroke:#64748b,color:#94a3b8,rx:6",
         "    classDef modelCls  fill:#1e1a2e,stroke:#a855f7,color:#d8b4fe,rx:6",
+        "    classDef httpCls   fill:#422006,stroke:#f59e0b,color:#fde68a,rx:6",
+        "    classDef dbCls     fill:#164e63,stroke:#22d3ee,color:#a5f3fc,rx:6",
+        "    classDef execCls   fill:#7f1d1d,stroke:#fb7185,color:#fecaca,rx:6",
+        "    classDef inAgentCls fill:#312e81,stroke:#818cf8,color:#c7d2fe,rx:6",
     ]
 
     # Categorize components by layer
@@ -372,6 +446,8 @@ def to_ai_component_mermaid(
         "fireworks": "Fireworks API",
         "fireworks_ai": "Fireworks API",
         "groq": "Groq API",
+        "ollama": "Ollama /api/chat",
+        "moonshot": "Moonshot API",
     }
     api_keys_norm = {k.replace("-", "_") for k in api_map}
     api_sdks_present = [
@@ -418,6 +494,60 @@ def to_ai_component_mermaid(
         for c in by_layer["tools"]:
             nid = _sanitize_id(c.name)
             label = _display_name(c)
+            lines.append(f"        {nid}[{_quote_label(label)}]")
+        lines.append("    end")
+
+    # ── 11. In-repo application (from architecture inference + taint locations)
+    in_repo = _in_repo_architecture(dataflow_analysis)
+    arch_types: List[str] = []
+    if architecture_result is not None:
+        arch_types = [
+            t for t in (getattr(architecture_result, "architecture_types", None) or [])
+            if t and t != "Unknown"
+        ]
+        for name in getattr(aibom, "agent_frameworks", None) or []:
+            if name and name not in {c.name for c in agents}:
+                arch_types.append(f"framework:{name}")
+    if arch_types:
+        lines.append("")
+        lines.append('    subgraph INFERRED["Detected AI patterns"]')
+        seen_t: Set[str] = set()
+        for t in arch_types[:12]:
+            tid = _sanitize_id("pat_" + str(t))
+            if tid in seen_t:
+                continue
+            seen_t.add(tid)
+            lines.append(f"        {tid}[{_quote_label(str(t))}]")
+        lines.append("    end")
+    in_layers = in_repo.get("layers") or {}
+    if in_layers.get("http"):
+        lines.append("")
+        lines.append('    subgraph HTTP["HTTP / API handlers"]')
+        for nid, label, _role in in_layers["http"][:14]:
+            lines.append(f"        {nid}[{_quote_label(label)}]")
+        lines.append("    end")
+    if in_layers.get("agents"):
+        lines.append("")
+        lines.append('    subgraph INREPO["In-repo agents / LLM wrappers"]')
+        for nid, label, _role in in_layers["agents"][:14]:
+            lines.append(f"        {nid}[{_quote_label(label)}]")
+        lines.append("    end")
+    if in_layers.get("llm_backend"):
+        lines.append("")
+        lines.append('    subgraph BACKEND["In-repo LLM backends"]')
+        for nid, label, _role in in_layers["llm_backend"][:8]:
+            lines.append(f"        {nid}[{_quote_label(label)}]")
+        lines.append("    end")
+    if in_layers.get("database"):
+        lines.append("")
+        lines.append('    subgraph DB["SQL execution"]')
+        for nid, label, _role in in_layers["database"][:8]:
+            lines.append(f"        {nid}[{_quote_label(label)}]")
+        lines.append("    end")
+    if in_layers.get("execution"):
+        lines.append("")
+        lines.append('    subgraph EXEC["Code execution sinks"]')
+        for nid, label, _role in in_layers["execution"][:8]:
             lines.append(f"        {nid}[{_quote_label(label)}]")
         lines.append("    end")
 
@@ -469,6 +599,22 @@ def to_ai_component_mermaid(
             for c in by_layer["mcp"][:2]:
                 mid = _sanitize_id(c.name)
                 lines.append(f"    {aid} -.->|uses| {mid}")
+
+    # In-repo adjacency from hop order (structural, not a taint claim)
+    known_ids = {
+        n[0]
+        for layer in in_layers.values()
+        for n in layer
+    }
+    for src, tgt, lbl in sorted(in_repo.get("uses") or []):
+        if src in known_ids and tgt in known_ids:
+            safe = str(lbl).replace("|", "/")
+            lines.append(f"    {src} -.->|{safe}| {tgt}")
+    if in_layers.get("llm_backend") and llm:
+        for bid, _bl, _ in in_layers["llm_backend"][:3]:
+            for lc in llm[:3]:
+                lid = _sanitize_id(lc.name)
+                lines.append(f"    {bid} -.->|provider| {lid}")
 
     # LLM Providers → External APIs
     for c in api_sdks_present:
@@ -534,5 +680,24 @@ def to_ai_component_mermaid(
     if aibom.models:
         ids = ",".join(_sanitize_id(m.id) for m in aibom.models[:8])
         lines.append(f"    class {ids} modelCls")
+    if in_layers.get("http"):
+        ids = ",".join(n[0] for n in in_layers["http"][:14])
+        lines.append(f"    class {ids} httpCls")
+    if in_layers.get("agents"):
+        ids = ",".join(n[0] for n in in_layers["agents"][:14])
+        lines.append(f"    class {ids} inAgentCls")
+    if in_layers.get("llm_backend"):
+        ids = ",".join(n[0] for n in in_layers["llm_backend"][:8])
+        lines.append(f"    class {ids} llmCls")
+    if in_layers.get("database"):
+        ids = ",".join(n[0] for n in in_layers["database"][:8])
+        lines.append(f"    class {ids} dbCls")
+    if in_layers.get("execution"):
+        ids = ",".join(n[0] for n in in_layers["execution"][:8])
+        lines.append(f"    class {ids} execCls")
+    if arch_types:
+        ids = ",".join(_sanitize_id("pat_" + str(t)) for t in arch_types[:12])
+        if ids:
+            lines.append(f"    class {ids} agentCls")
 
     return "\n".join(lines)

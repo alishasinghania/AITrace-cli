@@ -1,6 +1,8 @@
 _ref_discovery/
 _ref_metadata/
 .DS_Store
+benchmarks/last_report.json
+evaluation/raw-scan/
 aitrace-out/
 aitrace-out-test/
 aitrace-out-baseline/

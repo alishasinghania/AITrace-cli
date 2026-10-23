@@ -113,6 +113,7 @@ class AITraceEngine:
                     self.repo_root,
                     pattern_analysis.findings,
                     max_hops=6,
+                    data_flows=getattr(dataflow_analysis, "data_flows", None),
                 )
         except Exception:
             pass
@@ -155,8 +156,26 @@ class AITraceEngine:
             }
             for pf in pattern_analysis.findings:
                 sev = _sev_map.get(pf.severity, Severity.MEDIUM)
+                src_line = getattr(pf, "source_line", None)
+                try:
+                    src_line = int(src_line) if src_line is not None else None
+                    if src_line is not None and src_line <= 0:
+                        src_line = None
+                except (TypeError, ValueError):
+                    src_line = None
                 evidence_objs = [
-                    Evidence(description=e, file=pf.file, line=pf.line)
+                    Evidence(
+                        description=e,
+                        file=pf.file,
+                        line=pf.line,
+                        extra={
+                            "role": "sink",
+                            "source_file": getattr(pf, "source_file", "") or "",
+                            "source_line": src_line,
+                            "taint_kind": getattr(pf, "taint_kind", "") or "",
+                            "sink_arg_role": getattr(pf, "sink_arg_role", "") or "",
+                        },
+                    )
                     for e in pf.evidence
                 ]
                 # Assign category based on confirmation state
@@ -181,6 +200,12 @@ class AITraceEngine:
                         "confirmed_by_taint": pf.confirmed_by_taint,
                         "confirmed_by_llm": pf.confirmed_by_llm,
                         "remediation": pf.remediation,
+                        "taint_kind": getattr(pf, "taint_kind", "") or "",
+                        "sink_arg_role": getattr(pf, "sink_arg_role", "") or "",
+                        "source_file": getattr(pf, "source_file", "") or "",
+                        "source_line": src_line,
+                        "sink_file": pf.file,
+                        "sink_line": pf.line,
                     },
                 )
                 all_findings.append(finding)

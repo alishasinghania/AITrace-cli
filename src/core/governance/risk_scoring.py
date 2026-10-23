@@ -284,7 +284,7 @@ def compute_risk_score(
 
         if confirmed_pats:
             exec_factors.append(
-                f"Cross-file taint confirmed {len(confirmed_pats)} attack path(s)"
+                f"Value-taint DataFlows confirmed {len(confirmed_pats)} pattern finding(s)"
             )
 
     dimensions.append(

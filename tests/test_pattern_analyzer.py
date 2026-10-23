@@ -153,6 +153,126 @@ def run_query(user_id):
     assert not findings
 
 
+def test_pat003_does_not_fire_on_parameterized_query_when_llm_also_present():
+    src = """
+def run_query(tag):
+    _hint = llm.invoke("unused")
+    query = "SELECT * FROM t WHERE tags = :tag"
+    cursor.execute(query, {"tag": tag})
+"""
+    findings = detect_pat003(_parse(src), "app.py", src, _imap(src))
+    assert not findings
+
+
+def test_pat003_does_not_fire_on_sqlalchemy_text_bound_value():
+    """Bound :name plus a params dict is parameterized, even via text()."""
+    src = '''
+from sqlalchemy import text
+
+def lookup(user_value):
+    query = text("SELECT id FROM items WHERE name = :name")
+    db.session.execute(query, {"name": user_value})
+'''
+    findings = detect_pat003(_parse(src), "app.py", src, _imap(src))
+    assert not findings
+
+
+def test_pat003_does_not_fire_on_allowlisted_identifier_with_bound_value():
+    """Identifier interpolation plus a bound value is not PAT-003 by text() alone."""
+    src = '''
+from sqlalchemy import text
+
+_ALLOWED = {"name", "owner_id", "tags"}
+
+def filter_items(question):
+    column, value = question.split("=", 1)
+    if column not in _ALLOWED:
+        return []
+    query = text(f"SELECT id FROM items WHERE {column} = :value")
+    return db.session.execute(query, {"value": value}).mappings().all()
+'''
+    findings = detect_pat003(_parse(src), "app.py", src, _imap(src))
+    assert not findings
+
+
+def test_pat003_fires_on_text_wrapper_around_interpolated_value():
+    src = '''
+from sqlalchemy import text
+
+def lookup(user_value):
+    db.session.execute(text(f"SELECT id FROM items WHERE name='{user_value}'"))
+'''
+    findings = detect_pat003(_parse(src), "app.py", src, _imap(src))
+    assert any(f.vulnerability_id == "PAT-003" for f in findings)
+    assert any("interpolat" in f.title.lower() for f in findings)
+
+
+def test_pat003_does_not_fire_on_constant_text_query():
+    src = '''
+from sqlalchemy import text
+
+def count_items():
+    db.session.execute(text("SELECT COUNT(*) FROM items"))
+'''
+    findings = detect_pat003(_parse(src), "app.py", src, _imap(src))
+    assert not findings
+
+
+def test_pat003_via_analyze_patterns_entry_point(tmp_path: Path):
+    """Five synthetic cases through analyze_patterns, not just detect_pat003."""
+    (tmp_path / "queries.py").write_text(
+        '''
+from sqlalchemy import text
+
+def bound_lookup(user_value):
+    query = text("SELECT id FROM items WHERE name = :name")
+    db.session.execute(query, {"name": user_value})
+
+_ALLOWED = {"name", "tags"}
+
+def allowlisted_filter(question):
+    column, value = question.split("=", 1)
+    if column not in _ALLOWED:
+        return []
+    query = text(f"SELECT id FROM items WHERE {column} = :value")
+    return db.session.execute(query, {"value": value})
+
+def interpolated_lookup(user_value):
+    db.session.execute(text(f"SELECT id FROM items WHERE name='{user_value}'"))
+
+def llm_authored():
+    response = llm.invoke("write a select")
+    sql = response.content
+    cursor.execute(sql)
+
+def constant_count():
+    db.session.execute(text("SELECT COUNT(*) FROM items"))
+''',
+        encoding="utf-8",
+    )
+    result = analyze_patterns(tmp_path)
+    assert result is not None
+    pat003 = [f for f in result.findings if f.vulnerability_id == "PAT-003"]
+
+    src = (tmp_path / "queries.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    spans = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            spans[node.name] = (node.lineno, getattr(node, "end_lineno", node.lineno) or node.lineno)
+
+    def hits(name: str) -> list:
+        start, end = spans[name]
+        return [f for f in pat003 if start <= int(f.line or 0) <= end]
+
+    assert hits("bound_lookup") == []
+    assert hits("allowlisted_filter") == []
+    assert hits("interpolated_lookup")
+    assert hits("llm_authored")
+    assert any("LLM" in f.title for f in hits("llm_authored"))
+    assert hits("constant_count") == []
+
+
 # ---------------------------------------------------------------------------
 # PAT-004
 # ---------------------------------------------------------------------------

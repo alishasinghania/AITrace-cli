@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -169,37 +170,35 @@ def run_query(sql):
 # ---------------------------------------------------------------------------
 
 def test_bfs_finds_direct_path_one_hop():
-    """source → sink in one hop should be confirmed."""
-    source = _fn("app.py::handler", "app.py", "handler", is_source=True, calls=["llm_call"])
+    """Call-graph reachability is recorded as partial, not value-confirmed taint."""
+    source = _fn("app.py::handler", "app.py", "handler", is_source=True, calls=["llm.py::llm_call"])
     sink = _fn("llm.py::llm_call", "llm.py", "llm_call", is_sink=True, sink_types=["llm"],
                called_by=["app.py::handler"])
     graph = _make_graph([source, sink])
     _build_called_by_index(graph)
     paths = _find_taint_paths(graph, max_hops=6)
-    confirmed = [p for p in paths if p.confirmed]
-    assert len(confirmed) >= 1
-    assert any("app.py::handler" in p.hops for p in confirmed)
+    assert any("app.py::handler" in p.hops for p in paths)
+    assert all(not p.confirmed for p in paths)
 
 
 def test_bfs_finds_multihop_path_three_hops():
     """source → middle → sink across 3 hops."""
-    source = _fn("a.py::handler", "a.py", "handler", is_source=True, calls=["orchestrate"])
-    middle = _fn("b.py::orchestrate", "b.py", "orchestrate", calls=["call_llm"],
+    source = _fn("a.py::handler", "a.py", "handler", is_source=True, calls=["b.py::orchestrate"])
+    middle = _fn("b.py::orchestrate", "b.py", "orchestrate", calls=["c.py::call_llm"],
                  called_by=["a.py::handler"])
     sink = _fn("c.py::call_llm", "c.py", "call_llm", is_sink=True, sink_types=["llm"],
                called_by=["b.py::orchestrate"])
     graph = _make_graph([source, middle, sink])
     _build_called_by_index(graph)
     paths = _find_taint_paths(graph, max_hops=6)
-    confirmed = [p for p in paths if p.confirmed]
-    assert any(p.hop_count >= 3 for p in confirmed)
+    assert any(p.hop_count >= 3 for p in paths)
 
 
 def test_bidirectional_bfs_finds_path():
     """Bidirectional BFS should find confirmed path from source to sink."""
     source = _fn("s.py::src", "s.py", "src", is_source=True, source_type="fastapi_route",
-                 calls=["mid"])
-    middle = _fn("m.py::mid", "m.py", "mid", calls=["snk"],
+                 calls=["m.py::mid"])
+    middle = _fn("m.py::mid", "m.py", "mid", calls=["e.py::snk"],
                  called_by=["s.py::src"])
     sink = _fn("e.py::snk", "e.py", "snk", is_sink=True, sink_types=["llm"],
                called_by=["m.py::mid"])
@@ -215,8 +214,8 @@ def test_bidirectional_bfs_finds_path():
 
 def test_cycle_detection_prevents_infinite_loop():
     """A cycle should not cause infinite BFS loop."""
-    a = _fn("a.py::f", "a.py", "f", is_source=True, calls=["g"])
-    b = _fn("b.py::g", "b.py", "g", calls=["f"], called_by=["a.py::f"])  # cycle back
+    a = _fn("a.py::f", "a.py", "f", is_source=True, calls=["b.py::g"])
+    b = _fn("b.py::g", "b.py", "g", calls=["a.py::f"], called_by=["a.py::f"])  # cycle back
     graph = _make_graph([a, b])
     _build_called_by_index(graph)
     # Should complete without hanging
@@ -226,8 +225,8 @@ def test_cycle_detection_prevents_infinite_loop():
 
 def test_partial_path_recorded_at_three_hops():
     """A 3-hop path that doesn't reach a sink should be recorded as partial."""
-    a = _fn("a.py::h", "a.py", "h", is_source=True, calls=["b"])
-    b = _fn("b.py::b", "b.py", "b", calls=["c"], called_by=["a.py::h"])
+    a = _fn("a.py::h", "a.py", "h", is_source=True, calls=["b.py::b"])
+    b = _fn("b.py::b", "b.py", "b", calls=["c.py::c"], called_by=["a.py::h"])
     c = _fn("c.py::c", "c.py", "c", called_by=["b.py::b"])  # not a sink
     graph = _make_graph([a, b, c])
     _build_called_by_index(graph)
@@ -238,7 +237,7 @@ def test_partial_path_recorded_at_three_hops():
 
 
 def test_severity_upgrader_high_to_critical():
-    """A high-severity finding upgraded to critical when taint confirmed."""
+    """Upgrade only when a value-taint DataFlow hits the same file/line."""
     finding = PatternFinding(
         vulnerability_id="PAT-001", title="T", severity="high", confidence="medium",
         category="", owasp_id="", cwe="", file="app.py", line=5, function_name="chat",
@@ -247,14 +246,32 @@ def test_severity_upgrader_high_to_critical():
     tp = TaintPath(
         source_key="app.py::handler", sink_key="llm.py::call",
         sink_type="llm", hops=["app.py::handler", "app.py::chat", "llm.py::call"],
-        hop_count=3, confirmed=True, partial=False, vulnerability_type="prompt_injection",
+        hop_count=3, confirmed=False, partial=True, vulnerability_type="prompt_injection",
+    )
+    df = SimpleNamespace(
+        file="app.py", line=5, sanitized=False, sink_category="llm", hops=["hop"],
     )
     confirmed_ids: list = []
     partial_ids: list = []
-    _upgrade_findings([finding], [tp], confirmed_ids, partial_ids)
+    _upgrade_findings([finding], [tp], confirmed_ids, partial_ids, data_flows=[df])
     assert finding.severity == "critical"
     assert finding.confirmed_by_taint is True
     assert "PAT-001" in confirmed_ids
+
+
+def test_call_graph_overlap_does_not_confirm_taint():
+    finding = PatternFinding(
+        vulnerability_id="PAT-001", title="T", severity="high", confidence="medium",
+        category="", owasp_id="", cwe="", file="app.py", line=5, function_name="chat",
+        pattern_matched="", evidence=[], framework="",
+    )
+    tp = TaintPath(
+        source_key="app.py::handler", sink_key="llm.py::call",
+        sink_type="llm", hops=["app.py::handler", "llm.py::call"],
+        hop_count=2, confirmed=False, partial=True, vulnerability_type="prompt_injection",
+    )
+    _upgrade_findings([finding], [tp], [], [])
+    assert finding.confirmed_by_taint is False
 
 
 def test_fuzzy_function_matching():
