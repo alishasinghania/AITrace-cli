@@ -1437,11 +1437,23 @@ def to_html_report(
     MCP findings, analyzers, policy, architecture Mermaid, optional exploits,
     and optional Langfail evaluation / API inventory tables.
     """
-    from core.evaluation.html_sections import (
-        EVAL_JS,
-        render_api_inventory_section,
-        render_evaluation_section,
-    )
+    eval_js = ""
+    eval_section = ""
+    api_section = ""
+    try:
+        from core.evaluation.html_sections import (
+            EVAL_JS,
+            render_api_inventory_section,
+            render_evaluation_section,
+        )
+
+        eval_js = EVAL_JS
+        if evaluation:
+            eval_section = render_evaluation_section(evaluation)
+        if api_inventory:
+            api_section = render_api_inventory_section(api_inventory)
+    except ImportError:
+        eval_js = ""
     from core.exporters.component_diagram import to_ai_component_mermaid
     from core.exporters.taint_graph import build_taint_flow_graph
 
@@ -1500,8 +1512,8 @@ def to_html_report(
             n_exposures,
         ),
         _ai_components_section(aibom.components, aibom.mcp_servers),
-        render_evaluation_section(evaluation) if evaluation else "",
-        render_api_inventory_section(api_inventory) if api_inventory else "",
+        eval_section,
+        api_section,
         _architecture_graph_section(getattr(result, "architecture_graph", None)),
         _findings_section(security_findings, result.crossfile_taint),
         _sensitive_section(result.sensitive_exposures),
@@ -1521,7 +1533,7 @@ def to_html_report(
         _downloads_section(out_path),
         _mermaid_script(),
         _GRAPH_JS,
-        EVAL_JS,
+        eval_js,
         "</body></html>",
     ]
     return "".join(parts)
