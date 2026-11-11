@@ -1055,3 +1055,212 @@ def test_unresolved_transform_is_not_confirmed_value_taint(tmp_path: Path):
         ),
     })
     assert not any(f.sink_category == "llm" and f.source == "user_input" for f in flows)
+
+
+def test_fastapi_request_message_to_llm(tmp_path: Path):
+    """Pydantic body parameter ``request.message`` is user input into an LLM sink."""
+    flows = _flows(tmp_path, {
+        "app.py": (
+            "from pydantic import BaseModel\n"
+            "class ChatRequest(BaseModel):\n"
+            "    message: str\n"
+            "async def chat(request: ChatRequest):\n"
+            "    return llm.invoke(request.message)\n"
+        ),
+    })
+    hits = [f for f in flows if f.sink_category == "llm" and f.source == "user_input"]
+    assert hits
+    assert any("request.message" in " ".join(f.hops) or f.source == "user_input" for f in hits)
+
+
+def test_nested_import_inside_handler_resolves_cross_file(tmp_path: Path):
+    """Function-scoped ``from x import y`` must still resolve the callee."""
+    flows = _flows(tmp_path, {
+        "pkg/service.py": (
+            "def process(text):\n"
+            "    return llm.invoke(text)\n"
+        ),
+        "app.py": (
+            "async def chat(request):\n"
+            "    from pkg.service import process\n"
+            "    return process(request.message)\n"
+        ),
+    })
+    hits = [
+        f for f in flows
+        if f.sink_category == "llm" and f.source == "user_input" and f.file == "pkg/service.py"
+    ]
+    assert hits
+    assert any("pkg/service.py::process" in h for f in hits for h in f.hops)
+
+
+def test_asyncio_to_thread_preserves_argument_taint(tmp_path: Path):
+    """``asyncio.to_thread(fn, tainted)`` must bind taint onto ``fn``'s parameter."""
+    flows = _flows(tmp_path, {
+        "worker.py": (
+            "def process(user_text):\n"
+            "    return llm.invoke(user_text)\n"
+        ),
+        "app.py": (
+            "import asyncio\n"
+            "async def chat(request):\n"
+            "    from worker import process\n"
+            "    return await asyncio.to_thread(process, request.message)\n"
+        ),
+    })
+    hits = [
+        f for f in flows
+        if f.sink_category == "llm" and f.source == "user_input" and f.file == "worker.py"
+    ]
+    assert hits
+    assert any("worker.py::process" in h for f in hits for h in f.hops)
+
+
+def test_httpx_chat_completions_is_llm_sink(tmp_path: Path):
+    """OpenAI-compatible ``/chat/completions`` HTTP posts are LLM sinks."""
+    flows = _flows(tmp_path, {
+        "app.py": (
+            "import httpx\n"
+            "def send(user_text):\n"
+            "    base = 'https://openrouter.ai/api/v1'\n"
+            "    return httpx.post(\n"
+            "        base + '/chat/completions',\n"
+            "        json={'messages': [{'role': 'user', 'content': user_text}]},\n"
+            "    )\n"
+            "def handler(request):\n"
+            "    return send(request.json['message'])\n"
+        ),
+    })
+    hits = [f for f in flows if f.sink_category == "llm" and f.source == "user_input"]
+    assert hits
+    assert any("chat/completions" in (f.sink or "").lower() for f in hits)
+
+
+def test_httpx_client_context_manager_url_and_payload_locals(tmp_path: Path):
+    """``with httpx.Client() as client; client.post(url, json=payload)`` is an LLM sink.
+
+    URL and body are locals, not literals on the call — the usual OpenAI-compatible
+    client wrapper shape.
+    """
+    flows = _flows(tmp_path, {
+        "llm.py": (
+            "import httpx\n"
+            "BASE = 'https://openrouter.ai/api/v1'\n"
+            "def chat(messages):\n"
+            "    payload = {'model': 'x', 'messages': messages, 'max_tokens': 64}\n"
+            "    url = f\"{BASE}/chat/completions\"\n"
+            "    with httpx.Client(timeout=120.0) as client:\n"
+            "        return client.post(url, json=payload)\n"
+            "def handler(request):\n"
+            "    return chat([{'role': 'user', 'content': request.json['message']}])\n"
+        ),
+    })
+    hits = [f for f in flows if f.sink_category == "llm" and f.source == "user_input"]
+    assert hits
+    assert any("chat/completions" in (f.sink or "").lower() for f in hits)
+    assert any(f.file == "llm.py" and f.sink_function == "chat" for f in hits)
+
+
+def test_factory_return_invoke_reaches_httpx_chat_completions(tmp_path: Path):
+    """``llm = get_client(); llm.invoke(x)`` must follow the factory into httpx."""
+    flows = _flows(tmp_path, {
+        "llm.py": (
+            "import httpx\n"
+            "class ChatClient:\n"
+            "    def invoke(self, prompt):\n"
+            "        return complete(prompt)\n"
+            "def complete(prompt):\n"
+            "    return chat([{'role': 'user', 'content': prompt}])\n"
+            "def chat(messages):\n"
+            "    payload = {'model': 'x', 'messages': messages}\n"
+            "    url = f'{BASE}/chat/completions'\n"
+            "    with httpx.Client() as client:\n"
+            "        return client.post(url, json=payload)\n"
+            "def get_client():\n"
+            "    return ChatClient()\n"
+        ),
+        "app.py": (
+            "from llm import get_client\n"
+            "def handler(request):\n"
+            "    llm = get_client()\n"
+            "    return llm.invoke(request.json['message'])\n"
+        ),
+    })
+    hits = [
+        f for f in flows
+        if f.sink_category == "llm"
+        and f.source == "user_input"
+        and "chat/completions" in (f.sink or "").lower()
+    ]
+    assert hits
+    assert any(f.file == "llm.py" and f.sink_function == "chat" for f in hits)
+
+
+def test_httpx_chat_wrapper_rebuilds_messages_list(tmp_path: Path):
+    """Taint survives ``for m in messages: msgs.append(...)`` into json=payload."""
+    flows = _flows(tmp_path, {
+        "llm.py": (
+            "import httpx\n"
+            "def chat(messages, system=None):\n"
+            "    msgs = []\n"
+            "    if system:\n"
+            "        msgs.append({'role': 'system', 'content': system})\n"
+            "    for m in messages:\n"
+            "        msgs.append({'role': m.get('role', 'user'), 'content': str(m.get('content', ''))})\n"
+            "    payload = {'model': 'x', 'messages': msgs, 'max_tokens': 64}\n"
+            "    url = f\"{BASE}/chat/completions\"\n"
+            "    with httpx.Client() as client:\n"
+            "        return client.post(url, json=payload)\n"
+            "def handler(request):\n"
+            "    return chat([{'role': 'user', 'content': request.json['message']}])\n"
+        ),
+    })
+    hits = [f for f in flows if f.sink_category == "llm" and f.source == "user_input"]
+    assert hits
+    assert any("chat/completions" in (f.sink or "").lower() for f in hits)
+
+
+def test_pipeline_package_name_is_not_transformers_sink(tmp_path: Path):
+    """A module path segment ``pipeline`` must not be labeled transformers pipeline."""
+    flows = _flows(tmp_path, {
+        "app/pipeline/llm.py": (
+            "def generate(text):\n"
+            "    return text\n"
+        ),
+        "app.py": (
+            "from app.pipeline.llm import generate\n"
+            "def handler(request):\n"
+            "    return generate(request.message)\n"
+        ),
+    })
+    assert not any("pipeline" in (f.sink or "").lower() for f in flows)
+    assert not any(f.sink_category == "llm" for f in flows)
+
+
+def test_classic_three_file_llm_invoke_still_works(tmp_path: Path):
+    """Regression: user_input → helper → llm.invoke across three files."""
+    flows = _flows(tmp_path, {
+        "a.py": (
+            "from b import first\n"
+            "def handler(request):\n"
+            "    return first(request.json['message'])\n"
+        ),
+        "b.py": (
+            "from c import second\n"
+            "def first(value):\n"
+            "    return second(value)\n"
+        ),
+        "c.py": (
+            "def second(prompt):\n"
+            "    return llm.invoke(prompt)\n"
+        ),
+    })
+    hits = [
+        f for f in flows
+        if f.sink_category == "llm" and f.source == "user_input" and f.file == "c.py"
+    ]
+    assert hits
+    assert hits[0].sink_function == "second"
+    assert len(hits[0].hops) >= 3
+    hop_text = " ".join(hits[0].hops)
+    assert "a.py" in hop_text and "b.py" in hop_text and "c.py" in hop_text

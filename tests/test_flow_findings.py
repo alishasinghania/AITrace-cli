@@ -57,6 +57,17 @@ def test_llm_invoke_is_llm_sink():
     assert "llm" in classify_sink(node)
 
 
+def test_pipeline_package_call_is_not_llm_sink():
+    node = ast.parse("generate(text)").body[0].value
+    assert "llm" not in classify_sink(node)
+
+
+def test_transformers_pipeline_is_llm_sink():
+    node = ast.parse("transformers.pipeline(prompt)").body[0].value
+    from core.analyzers.taint_catalog import is_transformers_pipeline_call
+    assert is_transformers_pipeline_call(node) is True
+
+
 # ---------------------------------------------------------------------------
 # FLOW-LLM promotion
 # ---------------------------------------------------------------------------

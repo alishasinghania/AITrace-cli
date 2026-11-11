@@ -43,8 +43,8 @@ def test_generated_html_graphs_and_offline_svg(tmp_path: Path):
     html = to_html_report(result, tmp_path)
     html_path.write_text(html, encoding="utf-8")
     text = html_path.read_text(encoding="utf-8")
-    assert "AI application architecture" in text
-    assert "Taint-flow graph" in text
+    assert "AI Application Overview" in text
+    assert "Taint paths" in text
     assert "cdn.jsdelivr.net/npm/mermaid" in text
     assert "cytoscape" not in text.lower()
     arch = _extract_json(text, "aitrace-arch-data")
@@ -105,7 +105,7 @@ def test_findings_without_architecture_edges_in_html(tmp_path: Path):
     html = to_html_report(result, tmp_path)
     arch = result.architecture_graph or {"edges": []}
     assert (arch.get("stats") or {}).get("edge_count", len(arch.get("edges") or [])) == 0
-    assert "AI application architecture" in html
+    assert "AI Application Overview" in html
 
 
 def test_large_graph_cap_not_unbounded():

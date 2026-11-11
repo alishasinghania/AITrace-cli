@@ -13,7 +13,9 @@ from core.exporters.html_report import (
     _count_dataflows,
     _dataflow_section,
     _dataflow_table_row,
+    _taint_graph_section,
 )
+from core.exporters.taint_graph import build_taint_flow_graph
 from core.exporters.taint_diagram import taint_flows_to_mermaid
 from core.exporters.risk_report import to_risk_report_json, to_risk_report_markdown
 from core.models import AIBOM
@@ -102,13 +104,15 @@ def test_html_and_markdown_show_real_multifile_hops(tmp_path: Path):
     assert any("service.py::process" in h for h in flow.hops)
 
     html = _dataflow_section(result, [])
-    assert "service.py" in html
-    assert "app.py" in html
-    assert "user_input" in html
-    assert "llm" in html.lower()
-    html_plain = html.replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
-    for hop in flow.hops:
-        assert hop in html_plain
+    assert html == ""
+
+    taint_html = _taint_graph_section(build_taint_flow_graph(result))
+    assert "service.py" in taint_html
+    assert "app.py" in taint_html
+    assert "user_input" in taint_html
+    assert "process" in taint_html
+    assert "Combined hop" not in taint_html
+    assert "class='mermaid'" not in taint_html
 
     md = to_risk_report_markdown(AIBOM(repo_path=tmp_path), None, dataflow_analysis=result)
     assert "## AI Data Flow Analysis" in md
@@ -124,8 +128,7 @@ def test_html_and_markdown_show_real_multifile_hops(tmp_path: Path):
     )
     html2 = _dataflow_section(result, [graph])
     assert "fabricated.py" not in html2
-    assert "class='mermaid'" in html
-    assert "service.py::process" in html_plain or "process" in html
+    assert html2 == ""
 
 
 def test_incomplete_analysis_visible_in_html():
@@ -259,5 +262,74 @@ def test_architecture_diagram_includes_in_repo_and_ollama(tmp_path: Path):
     assert "Ollama /api/chat" in diagram
     assert "PyTorch" in diagram
     html = _dataflow_section(result, [])
-    assert "mermaid" in html
-    assert "value-taint" in html.lower() or "Value-taint" in html
+    assert html == ""
+    taint_html = _taint_graph_section(build_taint_flow_graph(result))
+    assert "taint-flow-panel" in taint_html or "No confirmed value-taint" in taint_html
+
+
+def test_sensitive_exposures_do_not_claim_no_sensitive_llm_flows():
+    """Listing sensitive→LLM rows must not also claim there are none."""
+    md = to_risk_report_markdown(
+        AIBOM(repo_path=Path(".")),
+        None,
+        dataflow_analysis=SimpleNamespace(
+            data_flows=[],
+            incomplete=False,
+            incomplete_reasons=[],
+        ),
+        sensitive_exposures=SimpleNamespace(
+            sensitive_exposures=[
+                SimpleNamespace(
+                    variable="api_key",
+                    sink="llm.invoke",
+                    file="app.py",
+                    line=4,
+                    risk="critical",
+                )
+            ]
+        ),
+    )
+    assert "No sensitive data flows from tracked sources to LLM sinks" not in md
+    assert "Sensitive Data Exposures" in md
+    assert "api_key" in md
+    assert "llm.invoke" in md
+
+
+def test_empty_dataflow_wording_is_not_sensitive_llm_claim():
+    md = to_risk_report_markdown(
+        AIBOM(repo_path=Path(".")),
+        None,
+        dataflow_analysis=SimpleNamespace(
+            data_flows=[],
+            incomplete=False,
+            incomplete_reasons=[],
+        ),
+    )
+    assert "No sensitive data flows from tracked sources to LLM sinks" not in md
+    assert "No value-taint flows from tracked sources to sinks were detected." in md
+
+
+def test_dataflow_hops_render_source_mid_sink():
+    df = SimpleNamespace(
+        source="user_input",
+        sink="LangChain LLM invoke",
+        file="service.py",
+        line=4,
+        risk="high",
+        source_file="app.py",
+        source_line=3,
+        sink_category="llm",
+        hops=[
+            "app.py::handler:3 source user_input",
+            "app.py::handler arg -> service.py::process param text",
+            "service.py::process:4 sink LangChain LLM invoke",
+        ],
+        sanitized=False,
+        confidence="high",
+    )
+    trace = _dataflow_table_row(df)[5]
+    assert "hop-src" in trace
+    assert "hop-mid" in trace
+    assert "hop-sink" in trace
+    assert "app.py::handler:3 source user_input" in trace
+    assert "service.py::process:4 sink LangChain LLM invoke" in trace

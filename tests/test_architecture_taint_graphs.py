@@ -40,7 +40,19 @@ def test_api_agent_llm_architecture(tmp_path: Path):
     ids = {n["id"] for n in g["nodes"]}
     for e in g["edges"]:
         assert e["source"] in ids and e["target"] in ids
-        assert e.get("evidence_status") == "observed"
+        cls = e.get("classification")
+        assert cls in {"DIRECT_CALL", "FRAMEWORK_CALL", "STRUCTURAL", "INFERRED"}
+        if cls in {"DIRECT_CALL", "FRAMEWORK_CALL"}:
+            assert e.get("evidence_status") == "observed"
+            assert e.get("file")
+            assert e.get("line")
+        else:
+            assert e.get("evidence_status") in {"structural", "inferred"}
+    # create_react_agent is construction, not an observed invocation.
+    structural = [e for e in g["edges"] if e.get("classification") == "STRUCTURAL"]
+    assert structural
+    for e in structural:
+        assert e.get("evidence_status") != "observed"
 
 
 def test_prompt_builder_distinct_from_llm(tmp_path: Path):
@@ -343,12 +355,15 @@ def test_html_contains_both_graphs_and_fallback(tmp_path: Path):
     )
     result = AITraceEngine(tmp_path).analyze()
     html = to_html_report(result, tmp_path)
-    assert "AI application architecture" in html
-    assert "Taint-flow graph" in html
+    assert "AI Application Overview" in html
+    assert "Taint paths" in html
     assert "aitrace-arch-data" in html
     assert "aitrace-taint-data" in html
     assert "graph-fallback" in html
-    assert "aitrace-arch-svg" in html
+    assert "aitrace-wf-app" in html or "wf-svg" in html
+    assert "How requests reach AI and data sinks" in html
+    assert "trust-boundary sinks" in html.lower()
+    assert "Combined hop diagram" not in html
     assert "Security findings" in html
 
 

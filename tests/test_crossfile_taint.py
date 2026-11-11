@@ -250,6 +250,7 @@ def test_severity_upgrader_high_to_critical():
     )
     df = SimpleNamespace(
         file="app.py", line=5, sanitized=False, sink_category="llm", hops=["hop"],
+        source="user_input", taint_kind="payload", confidence="high",
     )
     confirmed_ids: list = []
     partial_ids: list = []
@@ -271,6 +272,21 @@ def test_call_graph_overlap_does_not_confirm_taint():
         hop_count=2, confirmed=False, partial=True, vulnerability_type="prompt_injection",
     )
     _upgrade_findings([finding], [tp], [], [])
+    assert finding.confirmed_by_taint is False
+
+
+def test_file_read_dataflow_does_not_confirm_pat025():
+    """A file_read / lookup_result DataFlow is not attacker-control proof."""
+    finding = PatternFinding(
+        vulnerability_id="PAT-025", title="T", severity="critical", confidence="high",
+        category="", owasp_id="", cwe="", file="retain.py", line=15, function_name="purge",
+        pattern_matched="", evidence=[], framework="",
+    )
+    df = SimpleNamespace(
+        file="retain.py", line=15, sanitized=False, sink_category="rce", hops=["hop"],
+        source="file_read", taint_kind="lookup_result", confidence="high",
+    )
+    _upgrade_findings([finding], [], [], [], data_flows=[df])
     assert finding.confirmed_by_taint is False
 
 
