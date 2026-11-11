@@ -121,28 +121,30 @@ Example GitHub Actions step:
 
 ---
 
-## Acknowledgments
+## Standards and References
 
-Attempts to follow [CycloneDX](https://cyclonedx.org/) 1.7 and [SPDX](https://spdx.dev/) 3.0.1 for optional AI BOM export (`-f cyclonedx`, `-f spdx`) — not a claim of full compliance.
+AITrace provides best-effort support for [CycloneDX](https://cyclonedx.org/) 1.7 and [SPDX](https://spdx.dev/) 3.0.1 for optional AI BOM exports (`-f cyclonedx`, `-f spdx`). This does not imply full specification compliance or certification.
 
-Inspired by the need for AI transparency in software supply chains, and by existing SBOM work that still underspecifies LLM SDKs, agents, RAG pipelines, and MCP servers.
+The project is motivated by the need for greater transparency in software supply chains, particularly around AI components that traditional SBOM approaches may not adequately describe, including LLM SDKs, agents, RAG pipelines, and MCP servers.
 
-OWASP LLM Top 10 and CWE identifiers on findings are for orientation, not a certified mapping.
+OWASP LLM Top 10 and CWE identifiers associated with findings are provided as contextual references, not as certified or authoritative vulnerability mappings.
 
 ---
 
 ## Disclaimer
 
-This tool is for security auditing and analysis of systems **you own or have explicit permission** to analyze. Do not run it against repositories or deployments you are not authorized to assess. The authors are not responsible for misuse.
+AITrace is intended for security auditing and analysis of systems you own or have explicit permission to assess. Do not use it to analyze repositories or deployments without authorization. The authors are not responsible for unauthorized or improper use.
 
-`--exploit` produces proof-of-concept material for confirmed paths in that authorized target. Treat generated payloads as sensitive; do not use them against systems you do not control.
+The `--exploit` option generates candidate proof-of-concept material to help investigate selected findings and potential attack paths. Generated payloads are not proof of exploitability and must be validated separately in a controlled environment. Treat them as sensitive security artifacts and do not use them against systems you do not own or have permission to test.
 
 ---
 
-## Experimental
+## Experimental Status
 
-This is experimental code. The focus is analyzing AI/LLM application source — attack paths, components, MCP configs — while BOM and AI-SBOM formats are still moving. Optional CycloneDX/SPDX output is a best-effort export, not a guaranteed conformant document.
+AITrace is experimental software focused on analyzing AI/LLM application source code, including attack paths, AI components, and MCP configurations. Its AI BOM export capabilities are also evolving alongside the underlying CycloneDX and SPDX specifications.
 
-There is no promise of stable CLI flags, finding IDs, report layout, or complete rule coverage. Formats and detectors will change. If a mature AI BOM generator or scanner later covers this ground, this repo may fold into that work or be archived.
+Optional CycloneDX and SPDX exports are best-effort outputs and are not guaranteed to be fully specification-compliant.
 
-Use it as a research / audit aid, not as a compliance certificate.
+CLI flags, finding IDs, report layouts, and detection rules may change between releases. Detection coverage is not exhaustive, and findings require review and validation.
+
+AITrace is intended as a research and security auditing aid, not as a compliance certificate or a replacement for manual security assessment.
