@@ -3554,7 +3554,7 @@ def _deduplicate(findings: List[PatternFinding]) -> List[PatternFinding]:
 
     best: Dict[Tuple, PatternFinding] = {}
     for f in findings:
-        key = (f.function_name or "", f.line or 0, f.vulnerability_id)
+        key = (f.file or "", f.function_name or "", f.line or 0, f.vulnerability_id)
         existing = best.get(key)
         if existing is None:
             best[key] = f

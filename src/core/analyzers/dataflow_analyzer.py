@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..utils.ast_utils import walk_python_files, should_skip_path, get_call_chain, get_attr_chain
+from .taint_catalog import is_transformers_pipeline_call
 
 # Extend path filter to skip dataflow_analyzer itself when used from discovery
 
@@ -25,6 +26,7 @@ from ..utils.ast_utils import walk_python_files, should_skip_path, get_call_chai
 SOURCE_RISK: Dict[str, str] = {
     "user_input": "high",
     "mcp_tool_arg": "high",
+    "llm_output": "high",
     "external_api": "medium",
     "environment": "medium",
     "file_read": "low",
@@ -55,6 +57,14 @@ SOURCE_PATTERNS: List[Tuple[List[str], str]] = [
     (["body", "input"], "user_input"),
     (["body", "text"], "user_input"),
     (["body", "content"], "user_input"),
+    # FastAPI — same fields when the Pydantic model parameter is named request
+    (["request", "message"], "user_input"),
+    (["request", "prompt"], "user_input"),
+    (["request", "text"], "user_input"),
+    (["request", "content"], "user_input"),
+    (["request", "input"], "user_input"),
+    (["req", "message"], "user_input"),
+    (["req", "prompt"], "user_input"),
     # FastAPI — common Pydantic schema field names used directly as params
     (["message"], "user_input"),
     (["query"], "user_input"),
@@ -129,7 +139,8 @@ SINK_PATTERNS: List[Tuple[List[str], str]] = [
     (["arun"], "LangChain LLM arun"),
     (["astream"], "LangChain LLM astream"),
     (["generate"], "LLM generate"),
-    (["pipeline"], "transformers pipeline"),
+    (["transformers", "pipeline"], "transformers pipeline"),
+    (["huggingface", "pipeline"], "transformers pipeline"),
 ]
 
 # Provider names that confirm a generic single-token sink is an LLM call.
@@ -284,6 +295,7 @@ def _get_source_risk(source_type: str) -> str:
 
 
 _REQUEST_DATA_ATTRS = {"json", "args", "form", "data", "files", "get_json", "get_data", "body"}
+_REQUEST_MODEL_ROOTS = {"request", "req", "body"}
 _BODY_FIELD_ATTRS = {
     "message", "query", "prompt", "input", "text",
     "content", "user_query", "user_input", "user_message",
@@ -313,11 +325,171 @@ def _is_source_call(node: ast.Call) -> Optional[Tuple[str, str]]:
     return (source_type, _get_source_risk(source_type))
 
 
+# Explicit SQL/code generators. Last-token match so vendor.generate_sql() counts.
+# Not a closed list of product names — only generation verbs that produce a payload.
+_LLM_GENERATION_FUNCS = {
+    "generate_sql",
+    "generate_query",
+    "generate_code",
+    "generate_script",
+    "generate_expr",
+    "generate_expression",
+}
+
+
+def _is_llm_output_source(node: ast.expr) -> Optional[Tuple[str, str]]:
+    """True for the value produced by an LLM/tool generation call.
+
+    This is the generation result itself, not every name that appears in a
+    function that also called a model.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    chain = get_call_chain(node)
+    if chain and chain[-1].lower() in _LLM_GENERATION_FUNCS:
+        return ("llm_output", _get_source_risk("llm_output"))
+    if _is_sink_call(node):
+        return ("llm_output", _get_source_risk("llm_output"))
+    return None
+
+
+_TOOL_CALL_TOKENS = frozenset({"tool_calls", "tool_call", "function_call"})
+_TOOL_ARG_KEYS = frozenset({"arguments", "args"})
+
+
+def _literal_str(expr: ast.expr) -> Optional[str]:
+    """Return a string constant, if ``expr`` is one."""
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value
+    return None
+
+
+def _subscript_key_str(node: ast.Subscript) -> Optional[str]:
+    """String key of a subscript, if it is a constant."""
+    sl: ast.expr = node.slice
+    if hasattr(ast, "Index") and isinstance(sl, ast.Index):  # type: ignore[attr-defined]
+        sl = sl.value  # type: ignore[attr-defined]
+    return _literal_str(sl)
+
+
+def _walk_expr_tokens(expr: ast.expr) -> List[str]:
+    """Attribute, name, and constant-key tokens, walking through subscripts/get."""
+    tokens: List[str] = []
+    n: Optional[ast.expr] = expr
+    while n is not None:
+        if isinstance(n, ast.Attribute):
+            tokens.append(n.attr)
+            n = n.value
+        elif isinstance(n, ast.Subscript):
+            key = _subscript_key_str(n)
+            if key:
+                tokens.append(key)
+            n = n.value
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr == "get" and n.args:
+                key = _literal_str(n.args[0])
+                if key:
+                    tokens.append(key)
+            tokens.append(n.func.attr)
+            n = n.func.value
+        elif isinstance(n, ast.Name):
+            tokens.append(n.id)
+            n = None
+        else:
+            n = None
+    return list(reversed(tokens))
+
+
+def _is_tool_calls_collection(expr: ast.expr) -> bool:
+    """True when ``expr`` is a ``tool_calls`` list (attribute, key, or .get)."""
+    if isinstance(expr, ast.BoolOp):
+        return any(_is_tool_calls_collection(v) for v in expr.values)
+    tokens = [t.lower() for t in _walk_expr_tokens(expr)]
+    if tokens and tokens[-1] in _TOOL_ARG_KEYS:
+        return False
+    if "tool_calls" in tokens:
+        return True
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "get"
+        and expr.args
+    ):
+        key = _literal_str(expr.args[0])
+        if key and key.lower() == "tool_calls":
+            return True
+    if isinstance(expr, ast.Subscript):
+        key = _subscript_key_str(expr)
+        if key and key.lower() == "tool_calls":
+            return True
+    return False
+
+
+def _is_tool_argument_source(node: ast.expr) -> Optional[Tuple[str, str]]:
+    """True for an explicit model tool-call argument payload.
+
+    Requires a ``tool_call(s)`` / ``function_call`` token plus an
+    ``arguments`` / ``args`` extraction. Ordinary parameters are not sources.
+    """
+    tokens = {t.lower() for t in _walk_expr_tokens(node)}
+    if not (tokens & _TOOL_CALL_TOKENS):
+        return None
+    hit = ("llm_output", _get_source_risk("llm_output"))
+    if isinstance(node, ast.Attribute) and node.attr.lower() in _TOOL_ARG_KEYS:
+        return hit
+    if isinstance(node, ast.Subscript):
+        key = _subscript_key_str(node)
+        if key and key.lower() in _TOOL_ARG_KEYS:
+            return hit
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and node.args
+    ):
+        key = _literal_str(node.args[0])
+        if key and key.lower() in _TOOL_ARG_KEYS:
+            return hit
+    return None
+
+
+def _is_bound_tool_argument(node: ast.expr, tool_call_names: Set[str]) -> bool:
+    """True when ``name.arguments`` / ``name.get('arguments')`` uses a bound call object."""
+    if not tool_call_names:
+        return False
+    if isinstance(node, ast.Attribute) and node.attr.lower() in _TOOL_ARG_KEYS:
+        return isinstance(node.value, ast.Name) and node.value.id in tool_call_names
+    if isinstance(node, ast.Subscript):
+        key = _subscript_key_str(node)
+        if key and key.lower() in _TOOL_ARG_KEYS:
+            return isinstance(node.value, ast.Name) and node.value.id in tool_call_names
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and node.args
+    ):
+        key = _literal_str(node.args[0])
+        if key and key.lower() in _TOOL_ARG_KEYS:
+            return (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id in tool_call_names
+            )
+    return False
+
+
 def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
     """Check if expression is a source (call or request/body attribute)."""
     if isinstance(node, ast.Call):
-        return _is_source_call(node)
+        return (
+            _is_source_call(node)
+            or _is_llm_output_source(node)
+            or _is_tool_argument_source(node)
+        )
     if isinstance(node, ast.Attribute):
+        tool = _is_tool_argument_source(node)
+        if tool:
+            return tool
         chain = get_attr_chain(node)
         chain_l = [c.lower() for c in chain]
         for pattern, source_type in SOURCE_PATTERNS:
@@ -334,7 +506,7 @@ def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
             return ("user_input", _get_source_risk("user_input"))
         if (
             len(chain_l) >= 2
-            and chain_l[0] == "body"
+            and chain_l[0] in _REQUEST_MODEL_ROOTS
             and chain_l[-1] in _BODY_FIELD_ATTRS
         ):
             return ("user_input", _get_source_risk("user_input"))
@@ -342,6 +514,9 @@ def _is_source_value(node: ast.expr) -> Optional[Tuple[str, str]]:
         inner = _is_source_value(node.value)
         if inner:
             return inner
+        tool = _is_tool_argument_source(node)
+        if tool:
+            return tool
         if isinstance(node.value, ast.Attribute):
             chain = get_attr_chain(node.value)
             if chain and chain[0].lower() in ("request", "req") and chain[-1].lower() in ("args", "form", "json", "data"):
@@ -366,7 +541,7 @@ def _is_sanitization_call(node: ast.Call) -> bool:
 
 _GENERIC_SINK_PATTERNS = {
     ("invoke",), ("ainvoke",), ("arun",), ("astream",),
-    ("generate",), ("pipeline",),
+    ("generate",),
 }
 
 
@@ -465,6 +640,8 @@ def _is_sink_call(
     # Catch-all for .create() — only when an explicit LLM provider is in the chain
     if "create" in chain_set and chain_set & {"openai", "anthropic", "cohere", "completions", "messages"}:
         return "LLM API create"
+    if is_transformers_pipeline_call(node, import_modules):
+        return "transformers pipeline"
     return None
 
 

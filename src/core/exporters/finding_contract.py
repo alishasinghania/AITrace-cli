@@ -82,7 +82,7 @@ def honest_line(line: Any) -> Optional[int]:
 
 
 def sink_location(finding: Any) -> Tuple[Optional[str], Optional[int]]:
-    """Sink file and line from evidence, then metadata."""
+    """Sink file and line from evidence, metadata, then PatternFinding fields."""
     md = getattr(finding, "metadata", None) or {}
     if not isinstance(md, dict):
         md = {}
@@ -90,12 +90,33 @@ def sink_location(finding: Any) -> Tuple[Optional[str], Optional[int]]:
     file = None
     line = None
     if ev:
-        file = getattr(ev[0], "file", None)
-        line = getattr(ev[0], "line", None)
-    file = md.get("sink_file") or file
+        first = ev[0]
+        file = getattr(first, "file", None)
+        line = getattr(first, "line", None)
+    file = md.get("sink_file") or file or getattr(finding, "file", None)
     if md.get("sink_line") is not None:
         line = md.get("sink_line")
+    elif line is None:
+        line = getattr(finding, "line", None)
     return (file or None, honest_line(line))
+
+
+def finding_identity(finding: Any) -> Tuple[str, str, Optional[int]]:
+    """Stable identity shared by HTML, JSON, and LLM verification.
+
+    Distinct sinks are ``(rule id, sink file, sink line)``. Multiple evidence
+    hops on one finding do not create a second identity.
+    """
+    vid = str(getattr(finding, "vulnerability_id", None) or getattr(finding, "id", "") or "")
+    file, line = sink_location(finding)
+    return (vid, file or "", line)
+
+
+def identity_key(finding: Any) -> str:
+    """Pipe-joined identity string for overlays, selection, and tests."""
+    vid, file, line = finding_identity(finding)
+    line_s = "" if line is None else str(line)
+    return f"{vid}|{file}|{line_s}"
 
 
 def serialize_finding(finding: Any) -> Dict[str, Any]:

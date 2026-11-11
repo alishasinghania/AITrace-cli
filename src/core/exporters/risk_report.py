@@ -503,41 +503,83 @@ def _crossfile_taint_section(crossfile_taint: Any) -> str:
 
 
 def _llm_verification_section(llm_verification: Any) -> str:
-    """Render LLM verification section."""
+    """Render LLM verification overlay (static findings are unchanged)."""
     if not llm_verification:
         return ""
-    verifications = getattr(llm_verification, "verifications", [])
-    if not verifications:
+    verifications = getattr(llm_verification, "verifications", []) or []
+    top_errors = [str(e) for e in (getattr(llm_verification, "errors", None) or []) if e]
+    if not verifications and not top_errors:
         return ""
 
     lines = ["", "## LLM Verification", ""]
     lines.append(
-        f"**{llm_verification.findings_verified}** verified · "
-        f"**{llm_verification.findings_dismissed}** false positives · "
-        f"**{llm_verification.findings_skipped}** skipped · "
-        f"**{llm_verification.api_calls_made}** API calls · "
-        f"**{llm_verification.total_tokens_used}** tokens"
+        f"**{getattr(llm_verification, 'findings_verified', 0)}** verified · "
+        f"**{getattr(llm_verification, 'findings_dismissed', 0)}** false positives · "
+        f"**{getattr(llm_verification, 'findings_inconclusive', 0)}** inconclusive · "
+        f"**{getattr(llm_verification, 'findings_skipped', 0)}** skipped · "
+        f"**{getattr(llm_verification, 'findings_errored', 0)}** errors · "
+        f"**{getattr(llm_verification, 'api_calls_made', 0)}** API calls · "
+        f"**{getattr(llm_verification, 'total_tokens_used', 0)}** tokens"
     )
     lines.append("")
 
-    verified = [v for v in verifications if v.verified and not v.false_positive]
-    dismissed = [v for v in verifications if v.false_positive]
+    def _verdict_of(v: Any) -> str:
+        explicit = getattr(v, "verdict", "") or ""
+        if explicit:
+            return str(explicit).upper()
+        if getattr(v, "error", None):
+            return "ERROR"
+        if getattr(v, "verified", False) and not getattr(v, "false_positive", False):
+            return "VERIFIED"
+        if getattr(v, "false_positive", False):
+            return "FALSE_POSITIVE"
+        return "INCONCLUSIVE"
 
-    if verified:
-        lines.append("### Verified findings")
+    grouped: Dict[str, List[Any]] = {}
+    for v in verifications:
+        grouped.setdefault(_verdict_of(v), []).append(v)
+
+    headings = (
+        ("VERIFIED", "Verified findings"),
+        ("FALSE_POSITIVE", "False positives"),
+        ("INCONCLUSIVE", "Inconclusive"),
+        ("ERROR", "Errors"),
+    )
+    for key, heading in headings:
+        items = grouped.get(key) or []
+        if not items:
+            continue
+        lines.append(f"### {heading}")
         lines.append("")
-        for v in verified:
-            lines.append(f"**{v.finding_id}**: VERIFIED ({v.cvss_estimate}/10 CVSS · {v.exploit_complexity} complexity)")
-            lines.append(f"> {v.attack_scenario}")
-            if v.remediation:
+        for v in items:
+            reason = getattr(v, "reasoning", "") or getattr(v, "false_positive_reason", "") or ""
+            model = getattr(v, "model_used", "") or ""
+            extra = f" ({v.cvss_estimate}/10 CVSS · {v.exploit_complexity} complexity)" if key == "VERIFIED" else ""
+            lines.append(f"**{v.finding_id}**: {key}{extra}")
+            if model:
+                lines.append(f"> Model: {model}")
+            if key == "VERIFIED" and getattr(v, "attack_scenario", ""):
+                lines.append(f"> {v.attack_scenario}")
+            if reason:
+                lines.append(f"> {reason}")
+            if key == "VERIFIED" and getattr(v, "remediation", ""):
                 lines.append(f"> **Fix:** {v.remediation}")
+            if key == "ERROR" and getattr(v, "error", ""):
+                lines.append(f"> {v.error}")
+            refs = getattr(v, "evidence_refs", None) or []
+            if refs:
+                lines.append(f"> Evidence: {', '.join(str(r) for r in refs[:6])}")
             lines.append("")
 
-    if dismissed:
-        lines.append("### False positives")
+    leftover_errors = [
+        e for e in top_errors
+        if not any(getattr(v, "error", "") == e for v in verifications)
+    ]
+    if leftover_errors:
+        lines.append("### Errors")
         lines.append("")
-        for v in dismissed:
-            lines.append(f"**{v.finding_id}**: FALSE POSITIVE — {v.false_positive_reason}")
+        for err in leftover_errors:
+            lines.append(f"- {err}")
         lines.append("")
 
     return "\n".join(lines)
@@ -823,7 +865,20 @@ def to_risk_report_markdown(
                 "No flows were recorded before truncation; this is not a complete negative result."
             )
         else:
-            lines.append("No sensitive data flows from tracked sources to LLM sinks were detected.")
+            has_sensitive = bool(
+                sensitive_exposures
+                and getattr(sensitive_exposures, "sensitive_exposures", None)
+            )
+            if has_sensitive:
+                lines.append(
+                    "No additional value-taint flows were recorded in this section. "
+                    "Sensitive variables that reach LLM sinks are listed under "
+                    "Sensitive Data Exposures."
+                )
+            else:
+                lines.append(
+                    "No value-taint flows from tracked sources to sinks were detected."
+                )
         lines.append("")
         lines.append("---")
         lines.append("")

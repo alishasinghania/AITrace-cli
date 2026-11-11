@@ -99,6 +99,7 @@ def build_taint_flow_graph(
                         "function": rec["func"],
                         "line": honest_line(rec.get("line")),
                         "detail": rec.get("rest") or "",
+                        "value": rec.get("rest") or "",
                     })
                     if last and last != nid:
                         edges.append({
@@ -135,6 +136,10 @@ def build_taint_flow_graph(
                         "function": rec["sfunc"],
                         "line": None,
                         "detail": f"arg -> {rec['tfunc']} param {rec.get('param', '')}",
+                        "param": rec.get("param") or "",
+                        "callee": rec.get("tfunc") or "",
+                        "callee_file": rec.get("tfile") or "",
+                        "value": rec.get("param") or "arg",
                     })
                     edges.append({
                         "source": sid,

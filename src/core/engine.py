@@ -118,19 +118,6 @@ class AITraceEngine:
         except Exception:
             pass
 
-        # LLM verification (only when verify_with_llm=True)
-        if getattr(self, "verify_with_llm", False) and pattern_analysis is not None:
-            try:
-                from core.features.llm_verifier import verify_findings
-                llm_verification = verify_findings(
-                    self.repo_root,
-                    pattern_analysis.findings,
-                    crossfile_taint,
-                    provider_config=getattr(self, "provider_config", None),
-                )
-            except Exception:
-                pass
-
         # Policy evaluation — runs AFTER pattern analysis so ai_controls rules have access
         policy_report: Optional[PolicyReport] = None
         if policy_path is not None and policy_path.exists():
@@ -178,10 +165,8 @@ class AITraceEngine:
                     )
                     for e in pf.evidence
                 ]
-                # Assign category based on confirmation state
-                if getattr(pf, "confirmed_by_llm", False) and not getattr(pf, "dismissed_as_fp", False):
-                    cat = FindingCategory.LLM_VERIFIED
-                elif getattr(pf, "confirmed_by_taint", False):
+                # Static category only. LLM_VERIFIED is applied later as overlay.
+                if getattr(pf, "confirmed_by_taint", False):
                     cat = FindingCategory.TAINT_CONFIRMED
                 else:
                     cat = FindingCategory.PATTERN
@@ -198,7 +183,10 @@ class AITraceEngine:
                         "confidence": pf.confidence,
                         "cvss_estimate": pf.cvss_estimate,
                         "confirmed_by_taint": pf.confirmed_by_taint,
-                        "confirmed_by_llm": pf.confirmed_by_llm,
+                        "confirmed_by_llm": False,
+                        "llm_verdict": "",
+                        "dismissed_as_fp": bool(getattr(pf, "dismissed_as_fp", False)),
+                        "function_name": getattr(pf, "function_name", None) or "",
                         "remediation": pf.remediation,
                         "taint_kind": getattr(pf, "taint_kind", "") or "",
                         "sink_arg_role": getattr(pf, "sink_arg_role", "") or "",
@@ -206,9 +194,34 @@ class AITraceEngine:
                         "source_line": src_line,
                         "sink_file": pf.file,
                         "sink_line": pf.line,
+                        "taint_path": list(getattr(pf, "taint_path", None) or []),
                     },
                 )
                 all_findings.append(finding)
+
+        # LLM verification selects from the same Security Findings HTML shows.
+        if getattr(self, "verify_with_llm", False):
+            from core.exporters.finding_contract import filter_security_findings
+            security_findings = filter_security_findings(all_findings)
+            try:
+                from core.features.llm_verifier import apply_overlay_to_findings, verify_findings
+                llm_verification = verify_findings(
+                    self.repo_root,
+                    security_findings,
+                    crossfile_taint,
+                    provider_config=getattr(self, "provider_config", None),
+                )
+            except Exception as exc:
+                from core.features.llm_verifier import verifier_failure_result
+                llm_verification = verifier_failure_result(
+                    security_findings,
+                    f"verifier_exception: {type(exc).__name__}: {exc}",
+                )
+            try:
+                from core.features.llm_verifier import apply_overlay_to_findings
+                apply_overlay_to_findings(all_findings, llm_verification)
+            except Exception:
+                pass
 
         return AnalysisResult(
             aibom=aibom,

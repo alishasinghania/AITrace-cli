@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from ..utils.ast_utils import should_skip_path, get_call_chain
+from .taint_catalog import is_transformers_pipeline_call
 
 # Sensitive keywords in variable names -> risk level
 SENSITIVE_KEYWORDS: Dict[str, str] = {
@@ -69,7 +70,8 @@ SINK_PATTERNS: List[tuple] = [
     (["messages", "create"], "LLM API"),
     (["chat", "completions", "create"], "LLM API"),
     (["generate"], "LLM generate"),
-    (["pipeline"], "Transformers pipeline"),
+    (["transformers", "pipeline"], "Transformers pipeline"),
+    (["huggingface", "pipeline"], "Transformers pipeline"),
 ]
 # Provider-specific names that confirm a generic call is an LLM sink.
 # Removed "chain" and "index" — too common in non-LLM code (method chains, DB indexes, etc.)
@@ -146,7 +148,7 @@ def _is_llm_sink(node: ast.Call) -> Optional[str]:
     chain = get_call_chain(node)
     chain_set = set(c.lower() for c in chain)
     # Single-token generic patterns that require a provider indicator in the chain
-    _GENERIC_PATTERNS = {("invoke",), ("generate",), ("pipeline",)}
+    _GENERIC_PATTERNS = {("invoke",), ("generate",)}
     for pattern, label in SINK_PATTERNS:
         if not _chain_matches(chain, pattern):
             continue
@@ -158,6 +160,8 @@ def _is_llm_sink(node: ast.Call) -> Optional[str]:
     # Catch-all: .create() with explicit LLM provider in chain
     if "create" in chain_set and chain_set & {"openai", "anthropic", "cohere", "completions", "messages"}:
         return "LLM API"
+    if is_transformers_pipeline_call(node):
+        return "Transformers pipeline"
     return None
 
 

@@ -481,21 +481,31 @@ ai_controls:
 
 def _dry_run_verify(result: Any, repo_root: Path) -> None:
     """Print which findings would be sent for LLM verification and their redacted context."""
-    from core.features.llm_verifier import _select_findings, build_verification_context, _build_user_prompt
+    from core.features.llm_verifier import (
+        _build_user_prompt,
+        build_verification_context,
+        select_verification_candidates,
+    )
     from core.features.credentials.redactor import is_safe_to_send, count_redactions, redact_code_context
+    from core.exporters.finding_contract import filter_security_findings
 
-    pattern_analysis = getattr(result, "pattern_analysis", None)
     crossfile_taint = getattr(result, "crossfile_taint", None)
+    findings = filter_security_findings(getattr(result, "findings", None) or [])
+    selected, records = select_verification_candidates(findings, 10)
 
-    if pattern_analysis is None:
-        typer.echo("No pattern analysis results to verify.")
-        return
-
-    findings = getattr(pattern_analysis, "findings", [])
-    selected = _select_findings(findings, 10)
+    overflow = [r for r in records if r.action == "overflow"]
+    skipped = [r for r in records if r.action in ("skipped", "duplicate")]
+    if overflow:
+        typer.echo(f"Overflow (not sent, review_limit): {len(overflow)}")
+        for rec in overflow:
+            typer.echo(f"  - {rec.identity_key}")
+    if skipped:
+        typer.echo(f"Skipped: {len(skipped)}")
+        for rec in skipped:
+            typer.echo(f"  - {rec.identity_key} ({rec.reason})")
 
     if not selected:
-        typer.echo("No findings selected for verification (all confirmed/dismissed/low).")
+        typer.echo("No findings selected for verification.")
         return
 
     typer.echo(f"\n{'=' * 70}")
@@ -512,8 +522,16 @@ def _dry_run_verify(result: Any, repo_root: Path) -> None:
         prompt = _build_user_prompt(f, context)
         safe, fired = is_safe_to_send(prompt)
         n_redacted = count_redactions(prompt, redact_code_context(prompt))
-        typer.echo(f"[{i}] {f.vulnerability_id} — {f.title}")
-        typer.echo(f"     File: {f.file}:{f.line or '?'}  Severity: {f.severity}")
+        fid = getattr(f, "vulnerability_id", None) or getattr(f, "id", "")
+        md = getattr(f, "metadata", None) or {}
+        loc_file = getattr(f, "file", None) or (md.get("sink_file") if isinstance(md, dict) else None) or "?"
+        loc_line = getattr(f, "line", None)
+        if loc_line is None and isinstance(md, dict):
+            loc_line = md.get("sink_line")
+        sev = getattr(f, "severity", "")
+        sev = getattr(sev, "value", sev)
+        typer.echo(f"[{i}] {fid} — {getattr(f, 'title', '')}")
+        typer.echo(f"     File: {loc_file}:{loc_line or '?'}  Severity: {sev}")
         typer.echo(f"     Prompt size: ~{len(prompt) // 4} tokens")
         typer.echo(f"     Redactions applied: {n_redacted}")
         if not safe:

@@ -542,6 +542,40 @@ _CONF_UPGRADE: Dict[str, str] = {
 }
 
 
+# Sources that prove an attacker-controlled value, not merely a resolved callee.
+_ATTACKER_TAINT_SOURCES = frozenset({"user_input", "llm_output", "mcp_tool_arg"})
+# Labels that exist without that proof. file_read includes json.loads().
+_WEAK_TAINT_SOURCES = frozenset({
+    "function_param",
+    "file_read",
+    "external_api",
+    "config",
+    "internal_variable",
+    "environment",
+})
+
+
+def _dataflow_proves_attacker_control(df: Any) -> bool:
+    """True when a DataFlow is confirmed attacker-controlled value taint.
+
+    Call-target resolution can create a path from a weak label (file_read,
+    function_param) to a sink. That is not proof the value is attacker-controlled.
+    """
+    if getattr(df, "sanitized", False):
+        return False
+    kind = getattr(df, "taint_kind", "payload") or "payload"
+    if kind != "payload":
+        return False
+    if (getattr(df, "confidence", "") or "") == "may":
+        return False
+    source = getattr(df, "source", "") or ""
+    if source in _WEAK_TAINT_SOURCES:
+        return False
+    if source and source not in _ATTACKER_TAINT_SOURCES:
+        return False
+    return True
+
+
 def _upgrade_findings(
     pattern_findings: List[PatternFinding],
     paths: List[TaintPath],
@@ -549,7 +583,7 @@ def _upgrade_findings(
     partial_ids: List[str],
     data_flows: Optional[List[Any]] = None,
 ) -> None:
-    """Confirm PAT findings only from value-taint DataFlow hits, not call-graph overlap."""
+    """Confirm PAT findings only from attacker-controlled value-taint DataFlows."""
     _SINK_COMPAT: Dict[str, Set[str]] = {
         "PAT-001": {"llm", "retrieval"},
         "PAT-002": {"rce", "llm"},
@@ -580,7 +614,7 @@ def _upgrade_findings(
     for finding in pattern_findings:
         compatible = _SINK_COMPAT.get(finding.vulnerability_id, {"llm", "sql", "rce", "retrieval"})
         for df in flows:
-            if getattr(df, "sanitized", False):
+            if not _dataflow_proves_attacker_control(df):
                 continue
             cat = getattr(df, "sink_category", "") or ""
             if cat and cat not in compatible:
@@ -663,7 +697,24 @@ def _emit_flow_findings(
     row only when it is the same sink location and the same issue class.
     """
     seen: Set[Tuple[str, str, str]] = set()
-    for df in data_flows or []:
+    # Prefer attacker payload over env/config/function_param at the same sink.
+    _attacker = {"user_input", "mcp_tool_arg", "llm_output"}
+
+    def _emit_rank(df: Any) -> Tuple[int, int]:
+        src = getattr(df, "source", "") or ""
+        conf = str(getattr(df, "confidence", "") or "")
+        if src == "user_input" and conf != "may":
+            return (0, 0)
+        if src in _attacker and conf != "may":
+            return (1, 0)
+        if src in _attacker:
+            return (2, 0)
+        if src == "function_param":
+            return (4, 0)
+        return (3, 0)
+
+    ordered_flows = sorted(data_flows or [], key=_emit_rank)
+    for df in ordered_flows:
         if getattr(df, "sanitized", False):
             continue
         kind = getattr(df, "taint_kind", "payload") or "payload"
@@ -687,8 +738,23 @@ def _emit_flow_findings(
             continue
         seen.add(key)
         hop_short = " → ".join(getattr(df, "hops", None) or [])
+        source = getattr(df, "source", "") or ""
         confidence = getattr(df, "confidence", None) or "high"
+        if source == "function_param":
+            confidence = "may"
         owasp = "LLM01" if cat == "llm" else ("LLM03" if cat == "rag_ingest" else ("LLM02" if cat == "sql" else "LLM08"))
+        evidence = [
+            f"Confirmed value path: {hop_short}",
+            f"Sink type: {cat} at {df.file}:{df.line}",
+            f"taint_kind={kind}",
+            f"argument role: {getattr(df, 'sink_arg_role', '') or 'n/a'}",
+        ]
+        if source == "function_param":
+            evidence.append(
+                "Parameter-origin taint: a function parameter reaches an HTTP "
+                "URL argument. This is a potential destination-control finding, "
+                "not proof that a caller supplied attacker-controlled data."
+            )
         pattern_findings.append(PatternFinding(
             vulnerability_id=vid,
             title=title,
@@ -701,12 +767,7 @@ def _emit_flow_findings(
             line=df.line,
             function_name=getattr(df, "sink_function", None),
             pattern_matched=f"value taint to {cat} sink",
-            evidence=[
-                f"Confirmed value path: {hop_short}",
-                f"Sink type: {cat} at {df.file}:{df.line}",
-                f"taint_kind={kind}",
-                f"argument role: {getattr(df, 'sink_arg_role', '') or 'n/a'}",
-            ],
+            evidence=evidence,
             framework="taint",
             confirmed_by_taint=confidence != "may",
             taint_path=list(getattr(df, "hops", None) or []),
