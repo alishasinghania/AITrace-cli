@@ -24,7 +24,6 @@ Supports LangChain · LangGraph · AutoGen · CrewAI · Semantic Kernel · Llama
 - **Confirms reachability** — Value-taint analysis marks which paths actually reach LLM, agent, `exec`, SQL, HTTP, email, or RAG ingest sinks
 - **Classifies findings** — `pattern` (shape only) vs `taint_confirmed` (traced hops) vs `llm_verified` (optional `--verify`)
 - **Maps the AI stack** — LLM SDKs, agents, RAG, vector stores, MCP servers (including poisoned tool descriptions and hardcoded MCP secrets)
-- **Hybrid architecture overview** — Call vs construct edges, trust-boundary sinks, omitted unused APIs; SVG in the HTML report
 - **Risk score** — Execution / data / external exposure dimensions, including pattern and taint findings
 - **Policy gate** — Licenses, models, severity, plus AI controls (`no_code_execution_tools`, `no_shadow_ai`, `mcp_trust_score_minimum`, `no_user_data_to_external_llm`, `no_hardcoded_credentials`)
 - **Synthesizes exploits** — `--exploit` emits codebase-specific PoCs for confirmed sinks (CONFIRMED / LIKELY / UNCERTAIN)
@@ -83,20 +82,8 @@ aitrace configure --provider anthropic
 aitrace scan ./my-app --verify
 aitrace scan ./my-app --dry-run-verify   # show what would be sent, no API call
 
-# Headless / CI — no browser
-aitrace scan ./my-app --no-open
-
-# Write to a specific directory
-aitrace scan ./my-app -o ./results
-
 # Optional machine-readable outputs
 aitrace scan ./my-app -f cyclonedx -f spdx -f mermaid -f risk-md
-
-# Policy gate — exits code 1 on violation (use in CI)
-aitrace scan ./my-app --policy policy.yaml --no-open
-
-# Write findings JSON + architecture graph
-aitrace scan ./my-app --verbose
 ```
 
 ---
